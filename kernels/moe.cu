@@ -15,6 +15,9 @@
 /// the k (sum clamped at 6.103515625e-5). One warp: each lane holds n/32 logits.
 /// info: [0] logits, [1] n, [2] k, [3] ids (i32 x k), [4] weights (f32 x k). One block of 32 threads per token:
 /// token t reads logits row t and writes ids and weights at t * k.
+/// Cache-aware routing (opt-in, lossy) when [7] J > 0: the top J are kept, the other k - J picks prefer the experts
+/// among the top M (<= 32) that the VRAM cache holds (table [5] at entry [6] + id, nonzero: resident), in rank
+/// order, then the best of the rest; ids in rank order, weights renormalised over the picks.
 extern "C" __global__ void qx_moe_route(const u64* info) {
     const u32 n = U(1), k = U(2), l = threadIdx.x, tk = blockIdx.x;
     const float* lg = CF(0) + (u64)tk * n;
@@ -36,7 +39,8 @@ extern "C" __global__ void qx_moe_route(const u64* info) {
     z = warp_sum(z);
     float sel = 0.f, tot = 0.f;
     i32 myid = 0;
-    for (u32 r = 0; r < k; ++r) {
+    const u32 J = U(7), M = J ? min(max(U(8), k), 32u) : k;
+    for (u32 r = 0; r < M; ++r) {
         float bv = -1.f;
         i32 bi = 0x7fffffff;
         for (u32 i = 0; i < per; ++i) {
@@ -49,15 +53,37 @@ extern "C" __global__ void qx_moe_route(const u64* info) {
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         const float p = bv / z;
-        tot += p;
+        if (r < k) tot += p;
         if (l == r) { sel = p; myid = bi; }
         // bi stays at the sentinel when no lane had a candidate (NaN logits): never index with it
         if (bi != 0x7fffffff && (u32)(bi % 32) == l) v[bi / 32] = -2.f;
     }
-    tot = fmaxf(tot, 6.103515625e-5f);
-    if (l < k) {
-        reinterpret_cast<i32*>(info[3])[(u64)tk * k + l] = myid;
-        F(4)[(u64)tk * k + l] = sel / tot;
+    if (J == 0) {
+        tot = fmaxf(tot, 6.103515625e-5f);
+        if (l < k) {
+            reinterpret_cast<i32*>(info[3])[(u64)tk * k + l] = myid;
+            F(4)[(u64)tk * k + l] = sel / tot;
+        }
+        return;
+    }
+    // lane r holds rank r's candidate: the first J, then resident ones in rank order, then the rest
+    const u64* table = reinterpret_cast<const u64*>(info[5]) + info[6];
+    const bool valid = l < M && myid != 0x7fffffff;
+    const bool res = valid && *reinterpret_cast<const volatile u64*>(&table[myid]) != 0;
+    const u32 want = valid && (l < J || res), lt = (1u << l) - 1;
+    const u32 S = __ballot_sync(0xffffffffu, want), R = __ballot_sync(0xffffffffu, valid) & ~S;
+    // the first k of S, then the first k - |S| of R
+    auto first = [](u32 m, u32 n) { u32 o = 0; for (u32 i = 0; i < n && m; ++i) { const u32 b = m & (0u - m); o |= b; m ^= b; } return o; };
+    const u32 ns = __popc(S);
+    const u32 chosen = ns >= k ? first(S, k) : S | first(R, k - ns);
+    const bool mine = (chosen >> l) & 1u;
+    float sum = mine ? sel : 0.f;
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    sum = fmaxf(sum, 6.103515625e-5f);
+    if (mine) {
+        const u32 at = __popc(chosen & lt);
+        reinterpret_cast<i32*>(info[3])[(u64)tk * k + at] = myid;
+        F(4)[(u64)tk * k + at] = sel / sum;
     }
 }
 

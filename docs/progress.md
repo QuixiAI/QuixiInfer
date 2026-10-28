@@ -495,6 +495,25 @@ Decode right after a 1k-token prefill: 95 tok/s (token-by-token prompt: 103), 90
   (the indexer's key pool for the full context, f32, plus graph headroom), so the cache fell 6,370 -> 4,226 experts
   and c=4 / c=8 to 62.6 / 62.8 tok/s.
 
+- **Cache-aware routing, opt-in (2026-10-27).** `QX_ROUTE_CACHE=J,M` (`qx_moe_route`): each token keeps its top J
+  experts and fills the other 10 - J picks from its top M, the ones the VRAM cache holds first (in rank order), then
+  the best of the rest; weights renormalised over the picks. Off by default; the off path is the old kernel's bits.
+  Prompted by colibri's `route_select`. Hit-rate context first: on a 4,096-token routing trace, a simulation of the
+  swapper gives 86.4% at 6,370 experts against 86.3% for a per-layer LRU of the same size and 87.9% for a global LRU
+  (colibri's ~90% reproduces), so the live 70-80% comes from short requests on fresh topics, not the policy.
+  - Quality (`qx-ppl`, 4 texts x 512 tokens through the decode path, cache as in production, against exact routing):
+
+| `QX_ROUTE_CACHE` | ppl | hit rate | KL from exact | same top-1 |
+|---|---|---|---|---|
+| off | 4.670 | 69.4% | | |
+| 4,12 | 4.792 (+2.6%) | 77.3% | 5.3e-2 | 91.5% |
+| 2,12 | 4.799 (+2.8%) | 77.7% | 6.0e-2 | 92.3% |
+| 2,16 | 4.989 (+6.8%) | 86.1% | 1.25e-1 | 87.8% |
+
+  - Throughput (`qx-batch-bench`, B 1 / 4 / 8 / 16, tok/s): off 59.8 / 136.9 / 149.6 / 140.2; 2,12 72.0 / 137.1 /
+    186.2 / 208.6; 2,16 79.8 / 145.9 / 214.1 / 298.7. Misses per step at B=16: 2,055 -> 1,383 -> 743.
+  - Not in production: it trades accuracy for speed, a decision for the operator.
+
 ## Not yet
 
 - Admission without a GPU sync (`begin_seq`'s reset and uploads wait for the queued step: about 6% at c=16);

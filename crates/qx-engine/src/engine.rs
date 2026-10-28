@@ -141,6 +141,22 @@ fn split_min() -> usize {
     *U.get_or_init(|| std::env::var("QX_SPLIT").ok().and_then(|s| s.parse().ok()).map_or(4, |v: usize| if v == 0 { usize::MAX } else { v.max(2) }))
 }
 
+/// Cache-aware routing (`QX_ROUTE_CACHE=J,M`, off by default; lossy): each token keeps its top J experts and fills
+/// the other picks from its top M preferring the ones the VRAM cache holds (kernels/moe.cu `qx_moe_route`).
+/// (0, 0): exact routing.
+fn route_cache() -> (usize, usize) {
+    static U: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *U.get_or_init(|| {
+        let v = std::env::var("QX_ROUTE_CACHE").unwrap_or_default();
+        let mut it = v.split(',').map(|x| x.trim().parse::<usize>().ok());
+        match (it.next().flatten(), it.next().flatten()) {
+            (Some(j), Some(m)) if j > 0 => (j, m.min(32)),
+            (Some(j), None) if j > 0 => (j, 12),
+            _ => (0, 0),
+        }
+    })
+}
+
 /// One attention layer's FP8 KV cache for every sequence slot: E4M3 K and V with `SCALE_GROUPS` f32 scales per
 /// (cell, kv head), one per 32 dims.
 /// A slot's host pages (`KvPages`) hold every cell; its VRAM ring holds the most recent `window` cells at slot
@@ -947,10 +963,11 @@ impl<'a> Engine<'a> {
         let g = self.grp(l);
         let a = (t * k) as u32;
         g.moe_in.run_t(&self.gpu, s.x.ptr, 0, 0, tpad(t), E);
-        self.gpu.run(MOE.kernel("qx_moe_route", CubeDim::new_1d(32)), (t as u32, 1, 1), &[s.router.ptr, c.n_expert as u64, k as u64, s.ids.ptr, s.wts.ptr]);
         let le = &w.experts;
         let tab = self.cache.table.ptr;
         let base = (l * c.n_expert) as u64;
+        let (rj, rm) = route_cache();
+        self.gpu.run(MOE.kernel("qx_moe_route", CubeDim::new_1d(32)), (t as u32, 1, 1), &[s.router.ptr, c.n_expert as u64, k as u64, s.ids.ptr, s.wts.ptr, tab, base, rj as u64, rm as u64]);
         let (mb, words) = self.mailbox();
         // Hand the misses to the CPU first, so the pool works while the GPU computes the resident experts.
         self.gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (t as u32, 1, 1), &[mb.dptr, tab, base, s.ids.ptr, s.wts.ptr, s.x.ptr, words, l as u64, k as u64, E as u64, s.slots.ptr, s.xq.ptr, s.xd.ptr, t as u64]);

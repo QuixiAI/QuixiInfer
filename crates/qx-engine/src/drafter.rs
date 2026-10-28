@@ -236,7 +236,7 @@ impl<'a> Engine<'a> {
         let (ff, k) = (c.ff_exp, c.n_expert_used);
         let a = (t * k) as u32;
         d.groups.moe_in.run_t(&self.gpu, s.x.ptr, 0, 0, tpad(t), E);
-        self.gpu.run(MOE.kernel("qx_moe_route", CubeDim::new_1d(32)), (t as u32, 1, 1), &[s.router.ptr, c.n_expert as u64, k as u64, s.ids.ptr, s.wts.ptr]);
+        self.gpu.run(MOE.kernel("qx_moe_route", CubeDim::new_1d(32)), (t as u32, 1, 1), &[s.router.ptr, c.n_expert as u64, k as u64, s.ids.ptr, s.wts.ptr, 0, 0, 0, 0]);
         self.gpu.run(MOE.kernel("qx_moe_slots_all", CubeDim::new_1d(128)), (a.div_ceil(128), 1, 1), &[s.ids.ptr, s.slots.ptr, d.experts.ptr, d.rec_stride as u64, a as u64]);
         self.gpu.run(MOE.kernel("qx_moe_gateup_iq4_nl", CubeDim::new_1d(256)), (((2 * ff) as u32).div_ceil(8), a, 1), &[s.slots.ptr, k as u64, 0, s.x.ptr, s.gu.ptr, ff as u64, E as u64, d.gate_row as u64]);
         self.gpu.run(MOE.kernel("qx_moe_down_iq4_nl", CubeDim::new_1d(256)), ((E as u32).div_ceil(8), a, 1), &[s.slots.ptr, 0, 0, 0, s.gu.ptr, s.yk.ptr, ff as u64, E as u64, 2 * d.gate_bytes as u64, d.down_row as u64]);
