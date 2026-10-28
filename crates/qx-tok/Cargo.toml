@@ -1,0 +1,12 @@
+[package]
+name = "qx-tok"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+qx-pack = { path = "../qx-pack" }
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+anyhow = { workspace = true }
+ahash = "0.8"

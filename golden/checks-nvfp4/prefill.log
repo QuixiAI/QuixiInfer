@@ -1,0 +1,18 @@
+kv pages: 1025 of 3.38 MiB (3.38 GiB pinned), 1 per sequence
+host experts: 63.4 GiB pinned in 7.1s
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.41 GiB in VRAM)
+expert cache: 940 of 24576 experts in 2.59 GiB of VRAM
+prefill: chunks of 256 tokens, 0.57 GiB of buffers lent from the expert cache's tail
+prefix cache: 2.00 GiB; entries of 112.7 MiB plus 1536.0 KiB per 1k tokens (113.0 MiB at the full context)
+expert cache: 940 experts, 2.59 GiB
+prefill 47 tokens in 1.311s: 36 tok/s
+pos 47: KL 1.29e-3 top1 same (271 vs 271)
+pos 48: KL 4.16e-3 top1 same (727 vs 727)
+pos 49: KL 3.13e-3 top1 same (925 vs 925)
+pos 50: KL 1.42e-4 top1 same (72758 vs 72758)
+pos 51: KL 4.49e-5 top1 same (38044 vs 38044)
+pos 52: KL 2.30e-4 top1 same (1889 vs 1889)
+pos 53: KL 4.37e-5 top1 same (8 vs 8)
+pos 54: KL 8.02e-5 top1 same (364 vs 364)
+pos 55: KL 9.60e-6 top1 same (585 vs 585)
+top-1 agreement 9/9, KL mean 1.01e-3 max 4.16e-3

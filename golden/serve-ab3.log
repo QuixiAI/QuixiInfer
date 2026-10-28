@@ -1,0 +1,300 @@
+expert cache: starting from the saved routing profile
+quixiinfer: loading (context 262144 per sequence)
+kv pages: 4854 of 3.38 MiB (16.00 GiB pinned), 1024 per sequence
+host experts: 63.4 GiB pinned in 7.2s
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.45 GiB in VRAM)
+expert cache: 6371 of 24576 experts in 16.57 GiB of VRAM
+prefill: chunks of 2048 tokens, 2.67 GiB of buffers lent from the expert cache's tail
+prefix cache: 4.00 GiB; entries of 112.7 MiB plus 1536.0 KiB per 1k tokens (496.7 MiB at the full context)
+quixiinfer: listening on http://127.0.0.1:8001/v1
+sched: 200 steps (1 speculative), 10.8 window tokens/step, 79.63 ms/step (67.64 waiting for samples), admitting 0.94s
+  by width: 8:175x3.0ms 13:1x0.1ms 32:23x80.7ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 0 entries, 0 hits, 0 tokens restored, 0 snapshots, 0 evictions
+  last 200: 74.2% hits, 1383.8 misses/step, 33.7 swaps/step, 59.14 ms/step in the CPU pool
+req: 91 prompt tokens, queued 955 ms, first token 933 ms after admission, 195 tokens in 16.06s, stop
+req: 91 prompt tokens, queued 0 ms, first token 955 ms after admission, 234 tokens in 20.03s, stop
+req: 94 prompt tokens, queued 956 ms, first token 1609 ms after admission, 256 tokens in 21.60s, length
+req: 93 prompt tokens, queued 958 ms, first token 2487 ms after admission, 256 tokens in 22.28s, length
+req: 95 prompt tokens, queued 959 ms, first token 3109 ms after admission, 256 tokens in 22.88s, length
+req: 94 prompt tokens, queued 961 ms, first token 3695 ms after admission, 256 tokens in 23.45s, length
+req: 96 prompt tokens, queued 962 ms, first token 4453 ms after admission, 256 tokens in 24.19s, length
+req: 93 prompt tokens, queued 963 ms, first token 5020 ms after admission, 256 tokens in 24.92s, length
+sched: 400 steps (1 speculative), 11.2 window tokens/step, 78.25 ms/step (67.85 waiting for samples), admitting 0.96s
+  by width: 7:3x0.2ms 8:341x1.8ms 13:1x0.1ms 15:1x0.1ms 25:1x0.1ms 26:2x0.1ms 32:50x70.6ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 8 entries, 0 hits, 0 tokens restored, 8 snapshots, 0 evictions
+  last 200: 77.2% hits, 1258.9 misses/step, 31.8 swaps/step, 56.79 ms/step in the CPU pool
+req: 95 prompt tokens, queued 17075 ms, first token 1095 ms after admission, 256 tokens in 20.75s, length
+req: 95 prompt tokens, queued 20090 ms, first token 920 ms after admission, 256 tokens in 20.95s, length
+req: 95 prompt tokens, queued 22631 ms, first token 1001 ms after admission, 256 tokens in 21.06s, length
+req: 96 prompt tokens, queued 23419 ms, first token 990 ms after admission, 256 tokens in 20.98s, length
+req: 95 prompt tokens, queued 24009 ms, first token 1143 ms after admission, 256 tokens in 21.16s, length
+req: 94 prompt tokens, queued 24596 ms, first token 1114 ms after admission, 256 tokens in 21.20s, length
+req: 91 prompt tokens, queued 25325 ms, first token 1053 ms after admission, 256 tokens in 21.22s, length
+req: 96 prompt tokens, queued 26045 ms, first token 829 ms after admission, 256 tokens in 21.26s, length
+sched: 600 steps (1 speculative), 11.3 window tokens/step, 80.36 ms/step (69.48 waiting for samples), admitting 0.97s
+  by width: 7:6x0.2ms 8:507x2.3ms 13:1x0.1ms 15:1x0.1ms 20:1x0.1ms 25:2x0.1ms 26:2x0.1ms 27:1x0.1ms 28:1x0.1ms 32:77x69.4ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 16 entries, 0 hits, 0 tokens restored, 16 snapshots, 0 evictions
+  last 200: 73.9% hits, 1448.4 misses/step, 32.0 swaps/step, 64.72 ms/step in the CPU pool
+req: 89 prompt tokens, queued 20876 ms, first token 1082 ms after admission, 256 tokens in 21.72s, length
+req: 95 prompt tokens, queued 21539 ms, first token 984 ms after admission, 218 tokens in 17.29s, stop
+req: 94 prompt tokens, queued 21076 ms, first token 962 ms after admission, 256 tokens in 21.63s, length
+req: 94 prompt tokens, queued 21608 ms, first token 815 ms after admission, 215 tokens in 16.90s, stop
+req: 97 prompt tokens, queued 21333 ms, first token 1021 ms after admission, 244 tokens in 21.25s, stop
+req: 98 prompt tokens, queued 21203 ms, first token 1026 ms after admission, 256 tokens in 23.02s, length
+sched: 800 steps (1 speculative), 11.2 window tokens/step, 80.20 ms/step (70.00 waiting for samples), admitting 0.98s
+  by width: 7:11x0.2ms 8:678x2.5ms 13:1x0.1ms 15:1x0.1ms 20:1x0.1ms 21:1x0.1ms 25:2x0.1ms 26:2x0.1ms 27:1x0.1ms 28:1x0.1ms 29:1x0.1ms 30:2x0.1ms 32:97x66.2ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 22 entries, 0 hits, 0 tokens restored, 22 snapshots, 0 evictions
+  last 200: 75.4% hits, 1272.4 misses/step, 31.9 swaps/step, 57.84 ms/step in the CPU pool
+req: 98 prompt tokens, queued 21551 ms, first token 1173 ms after admission, 256 tokens in 22.00s, length
+req: 99 prompt tokens, queued 21585 ms, first token 1115 ms after admission, 256 tokens in 21.80s, length
+req: 102 prompt tokens, queued 21832 ms, first token 1166 ms after admission, 256 tokens in 20.96s, length
+sched: 1000 steps (1 speculative), 10.8 window tokens/step, 78.10 ms/step (68.77 waiting for samples), admitting 0.98s
+  by width: 7:13x0.2ms 8:864x2.6ms 13:1x0.1ms 15:1x0.1ms 20:1x0.1ms 21:1x0.1ms 23:1x0.1ms 25:2x0.1ms 26:2x0.1ms 27:1x0.1ms 28:1x0.1ms 29:2x0.1ms 30:2x0.1ms 32:107x66.0ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 25 entries, 0 hits, 0 tokens restored, 25 snapshots, 0 evictions
+  last 200: 78.0% hits, 989.6 misses/step, 31.3 swaps/step, 47.77 ms/step in the CPU pool
+req: 93 prompt tokens, queued 21489 ms, first token 818 ms after admission, 214 tokens in 15.60s, stop
+req: 98 prompt tokens, queued 21693 ms, first token 1088 ms after admission, 256 tokens in 20.96s, length
+req: 97 prompt tokens, queued 19274 ms, first token 1494 ms after admission, 256 tokens in 21.40s, length
+req: 99 prompt tokens, queued 20063 ms, first token 848 ms after admission, 256 tokens in 20.98s, length
+req: 99 prompt tokens, queued 20717 ms, first token 814 ms after admission, 256 tokens in 21.24s, length
+req: 98 prompt tokens, queued 21055 ms, first token 745 ms after admission, 256 tokens in 21.23s, length
+req: 102 prompt tokens, queued 21371 ms, first token 749 ms after admission, 256 tokens in 21.01s, length
+sched: 1200 steps (1 speculative), 10.8 window tokens/step, 78.25 ms/step (69.19 waiting for samples), admitting 0.99s
+  by width: 6:1x0.4ms 7:16x0.2ms 8:1033x2.4ms 13:2x0.1ms 15:1x0.1ms 20:1x0.1ms 21:1x0.1ms 23:1x0.1ms 24:1x0.1ms 25:2x0.1ms 26:2x0.1ms 27:2x0.1ms 28:1x0.1ms 29:2x0.1ms 30:3x0.1ms 32:130x64.2ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 32 entries, 0 hits, 0 tokens restored, 32 snapshots, 0 evictions
+  last 200: 76.1% hits, 1266.8 misses/step, 32.0 swaps/step, 57.73 ms/step in the CPU pool
+req: 98 prompt tokens, queued 21058 ms, first token 1153 ms after admission, 256 tokens in 20.87s, length
+req: 93 prompt tokens, queued 21222 ms, first token 742 ms after admission, 204 tokens in 14.49s, stop
+req: 91 prompt tokens, queued 21026 ms, first token 1108 ms after admission, 256 tokens in 21.49s, length
+req: 96 prompt tokens, queued 20959 ms, first token 1951 ms after admission, 256 tokens in 22.20s, length
+req: 93 prompt tokens, queued 20240 ms, first token 1611 ms after admission, 256 tokens in 21.91s, length
+req: 92 prompt tokens, queued 19825 ms, first token 1155 ms after admission, 256 tokens in 21.71s, length
+req: 99 prompt tokens, queued 20417 ms, first token 810 ms after admission, 256 tokens in 21.59s, length
+req: 96 prompt tokens, queued 20178 ms, first token 801 ms after admission, 256 tokens in 21.56s, length
+sched: 1400 steps (1 speculative), 11.0 window tokens/step, 78.38 ms/step (69.18 waiting for samples), admitting 1.01s
+  by width: 6:1x0.4ms 7:21x0.1ms 8:1196x2.3ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 20:1x0.1ms 21:1x0.1ms 23:1x0.1ms 24:1x0.1ms 25:2x0.1ms 26:4x0.1ms 27:2x0.1ms 28:2x0.1ms 29:2x0.1ms 30:5x0.1ms 32:156x64.9ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 40 snapshots, 5 evictions
+  last 200: 76.4% hits, 1320.4 misses/step, 30.8 swaps/step, 58.00 ms/step in the CPU pool
+req: 95 prompt tokens, queued 21292 ms, first token 1204 ms after admission, 184 tokens in 14.08s, stop
+req: 97 prompt tokens, queued 20988 ms, first token 1205 ms after admission, 256 tokens in 21.91s, length
+req: 95 prompt tokens, queued 20682 ms, first token 939 ms after admission, 256 tokens in 21.91s, length
+req: 100 prompt tokens, queued 21563 ms, first token 1064 ms after admission, 256 tokens in 21.84s, length
+req: 95 prompt tokens, queued 21722 ms, first token 1047 ms after admission, 256 tokens in 21.66s, length
+req: 101 prompt tokens, queued 20409 ms, first token 965 ms after admission, 256 tokens in 21.35s, length
+req: 95 prompt tokens, queued 20782 ms, first token 765 ms after admission, 255 tokens in 21.20s, stop
+req: 99 prompt tokens, queued 20080 ms, first token 706 ms after admission, 256 tokens in 21.24s, length
+sched: 1600 steps (1 speculative), 11.0 window tokens/step, 79.25 ms/step (69.81 waiting for samples), admitting 1.02s
+  by width: 6:1x0.4ms 7:28x0.1ms 8:1357x2.4ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 20:2x0.1ms 21:2x0.1ms 22:1x0.0ms 23:1x0.1ms 24:1x0.1ms 25:3x0.1ms 26:6x0.1ms 27:4x0.1ms 28:2x0.1ms 29:2x0.1ms 30:5x0.1ms 32:180x65.9ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 48 snapshots, 13 evictions
+  last 200: 75.0% hits, 1381.9 misses/step, 31.9 swaps/step, 62.69 ms/step in the CPU pool
+req: 96 prompt tokens, queued 19332 ms, first token 1118 ms after admission, 256 tokens in 21.27s, length
+req: 95 prompt tokens, queued 19335 ms, first token 1020 ms after admission, 256 tokens in 21.34s, length
+sched: 1800 steps (1 speculative), 10.8 window tokens/step, 78.30 ms/step (69.30 waiting for samples), admitting 1.02s
+  by width: 6:1x0.4ms 7:30x0.2ms 8:1547x2.5ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 20:2x0.1ms 21:2x0.1ms 22:1x0.0ms 23:1x0.1ms 24:2x0.1ms 25:3x0.1ms 26:6x0.1ms 27:4x0.1ms 28:2x0.1ms 29:2x0.1ms 30:5x0.1ms 31:1x0.1ms 32:186x66.4ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 50 snapshots, 15 evictions
+  last 200: 76.7% hits, 997.3 misses/step, 31.5 swaps/step, 48.52 ms/step in the CPU pool
+req: 90 prompt tokens, queued 21098 ms, first token 886 ms after admission, 256 tokens in 21.40s, length
+req: 97 prompt tokens, queued 21274 ms, first token 982 ms after admission, 256 tokens in 21.33s, length
+req: 91 prompt tokens, queued 21403 ms, first token 819 ms after admission, 256 tokens in 21.23s, length
+req: 89 prompt tokens, queued 21613 ms, first token 788 ms after admission, 256 tokens in 21.29s, length
+req: 95 prompt tokens, queued 21330 ms, first token 797 ms after admission, 256 tokens in 21.25s, length
+req: 94 prompt tokens, queued 21377 ms, first token 767 ms after admission, 256 tokens in 21.13s, length
+sched: 2000 steps (1 speculative), 10.8 window tokens/step, 78.49 ms/step (69.51 waiting for samples), admitting 1.03s
+  by width: 6:1x0.4ms 7:35x0.1ms 8:1718x2.5ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 20:3x0.1ms 21:3x0.1ms 22:1x0.0ms 23:1x0.1ms 24:2x0.1ms 25:4x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:2x0.1ms 30:6x0.1ms 31:1x0.1ms 32:204x66.6ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 56 snapshots, 21 evictions
+  last 200: 76.9% hits, 1182.2 misses/step, 31.9 swaps/step, 57.92 ms/step in the CPU pool
+req: 93 prompt tokens, queued 21387 ms, first token 1010 ms after admission, 256 tokens in 22.46s, length
+req: 100 prompt tokens, queued 21494 ms, first token 938 ms after admission, 256 tokens in 21.95s, length
+req: 89 prompt tokens, queued 21535 ms, first token 817 ms after admission, 256 tokens in 20.86s, length
+req: 98 prompt tokens, queued 21484 ms, first token 969 ms after admission, 256 tokens in 20.30s, length
+req: 94 prompt tokens, queued 21581 ms, first token 777 ms after admission, 256 tokens in 19.68s, length
+req: 96 prompt tokens, queued 21423 ms, first token 792 ms after admission, 256 tokens in 18.95s, length
+req: 90 prompt tokens, queued 21366 ms, first token 716 ms after admission, 256 tokens in 18.07s, length
+req: 99 prompt tokens, queued 21258 ms, first token 663 ms after admission, 256 tokens in 17.34s, length
+sched: 2200 steps (102 speculative), 10.5 window tokens/step, 75.04 ms/step (65.46 waiting for samples), admitting 1.98s
+  by width: 1:7x0.1ms 2:10x0.1ms 3:8x0.2ms 4:4x0.1ms 5:5x0.1ms 6:29x0.2ms 7:65x0.2ms 8:1724x2.7ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 20:3x0.1ms 21:3x0.1ms 22:1x0.0ms 23:1x0.1ms 24:2x0.1ms 25:4x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:2x0.1ms 30:6x0.1ms 31:1x0.1ms 32:204x66.6ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 64 snapshots, 29 evictions
+  last 200: 69.7% hits, 636.7 misses/step, 25.2 swaps/step, 30.34 ms/step in the CPU pool
+req: 92 prompt tokens, queued 2 ms, first token 967 ms after admission, 256 tokens in 4.75s, length
+req: 100 prompt tokens, queued 3 ms, first token 1083 ms after admission, 256 tokens in 5.44s, length
+sched: 2400 steps (302 speculative), 10.5 window tokens/step, 71.75 ms/step (60.01 waiting for samples), admitting 4.11s
+  by width: 1:7x0.1ms 2:10x0.1ms 3:8x0.2ms 4:4x0.1ms 5:5x0.1ms 6:29x0.2ms 7:65x0.2ms 8:1724x2.7ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 20:3x0.1ms 21:3x0.1ms 22:1x0.0ms 23:1x0.1ms 24:2x0.1ms 25:4x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:2x0.1ms 30:6x0.1ms 31:1x0.1ms 32:204x66.6ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 68 snapshots, 32 evictions
+  last 200: 68.2% hits, 492.6 misses/step, 27.8 swaps/step, 21.62 ms/step in the CPU pool
+req: 97 prompt tokens, queued 2 ms, first token 1093 ms after admission, 256 tokens in 5.18s, length
+sched: 2600 steps (357 speculative), 10.2 window tokens/step, 70.09 ms/step (57.89 waiting for samples), admitting 4.12s
+  by width: 1:7x0.1ms 2:10x0.1ms 3:8x0.2ms 4:136x0.1ms 5:5x0.1ms 6:29x0.2ms 7:65x0.2ms 8:1724x2.7ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 18:1x0.0ms 20:3x0.1ms 21:3x0.1ms 22:1x0.0ms 23:1x0.1ms 24:2x0.1ms 25:4x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:2x0.1ms 30:6x0.1ms 31:1x0.1ms 32:216x67.1ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 69 snapshots, 33 evictions
+  last 200: 70.0% hits, 823.4 misses/step, 29.4 swaps/step, 36.46 ms/step in the CPU pool
+req: 94 prompt tokens, queued 2 ms, first token 951 ms after admission, 256 tokens in 12.88s, length
+req: 98 prompt tokens, queued 3 ms, first token 1739 ms after admission, 256 tokens in 13.72s, length
+req: 99 prompt tokens, queued 5 ms, first token 2328 ms after admission, 256 tokens in 14.34s, length
+req: 96 prompt tokens, queued 6 ms, first token 2647 ms after admission, 256 tokens in 15.08s, length
+sched: 2800 steps (357 speculative), 9.9 window tokens/step, 68.74 ms/step (56.97 waiting for samples), admitting 4.12s
+  by width: 1:7x0.1ms 2:10x0.1ms 3:9x0.2ms 4:321x0.8ms 5:5x0.1ms 6:29x0.2ms 7:65x0.2ms 8:1724x2.7ms 12:1x0.0ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 17:1x0.1ms 18:1x0.0ms 20:3x0.1ms 21:3x0.1ms 22:1x0.0ms 23:1x0.1ms 24:2x0.1ms 25:4x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:2x0.1ms 30:6x0.1ms 31:1x0.1ms 32:228x68.0ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 73 snapshots, 37 evictions
+  last 200: 66.4% hits, 933.5 misses/step, 27.0 swaps/step, 41.55 ms/step in the CPU pool
+req: 90 prompt tokens, queued 278 ms, first token 1157 ms after admission, 221 tokens in 9.55s, stop
+req: 98 prompt tokens, queued 35 ms, first token 1184 ms after admission, 256 tokens in 12.92s, length
+req: 96 prompt tokens, queued 120 ms, first token 1239 ms after admission, 256 tokens in 12.67s, length
+req: 96 prompt tokens, queued 250 ms, first token 828 ms after admission, 256 tokens in 11.97s, length
+sched: 3000 steps (357 speculative), 9.6 window tokens/step, 67.29 ms/step (55.96 waiting for samples), admitting 4.13s
+  by width: 1:7x0.1ms 2:10x0.1ms 3:12x0.2ms 4:502x0.8ms 5:5x0.1ms 6:29x0.2ms 7:67x0.2ms 8:1724x2.7ms 12:3x0.1ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 17:1x0.1ms 18:1x0.0ms 20:3x0.1ms 21:3x0.1ms 22:1x0.0ms 23:1x0.1ms 24:2x0.1ms 25:4x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:2x0.1ms 30:6x0.1ms 31:1x0.1ms 32:240x68.1ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 77 snapshots, 42 evictions
+  last 200: 72.9% hits, 750.9 misses/step, 25.1 swaps/step, 34.79 ms/step in the CPU pool
+sched: 3200 steps (357 speculative), 9.2 window tokens/step, 65.47 ms/step (54.79 waiting for samples), admitting 4.13s
+  by width: 1:7x0.1ms 2:10x0.1ms 3:12x0.2ms 4:702x0.9ms 5:5x0.1ms 6:29x0.2ms 7:67x0.2ms 8:1724x2.7ms 12:3x0.1ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 17:1x0.1ms 18:1x0.0ms 20:3x0.1ms 21:3x0.1ms 22:1x0.0ms 23:1x0.1ms 24:2x0.1ms 25:4x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:2x0.1ms 30:6x0.1ms 31:1x0.1ms 32:240x68.1ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 77 snapshots, 42 evictions
+  last 200: 73.0% hits, 518.6 misses/step, 25.8 swaps/step, 27.35 ms/step in the CPU pool
+req: 97 prompt tokens, queued 32 ms, first token 885 ms after admission, 256 tokens in 12.11s, length
+req: 98 prompt tokens, queued 30 ms, first token 957 ms after admission, 256 tokens in 11.27s, length
+req: 92 prompt tokens, queued 106 ms, first token 681 ms after admission, 256 tokens in 10.60s, length
+req: 92 prompt tokens, queued 30 ms, first token 643 ms after admission, 256 tokens in 9.98s, length
+sched: 3400 steps (357 speculative), 9.2 window tokens/step, 66.58 ms/step (55.94 waiting for samples), admitting 4.14s
+  by width: 1:13x0.1ms 2:14x0.1ms 3:39x0.1ms 4:714x0.8ms 5:5x0.1ms 6:29x0.2ms 7:67x0.2ms 8:1847x2.5ms 12:3x0.1ms 13:2x0.1ms 15:1x0.1ms 16:1x0.1ms 17:1x0.1ms 18:1x0.0ms 20:3x0.1ms 21:3x0.1ms 22:1x0.0ms 23:1x0.1ms 24:2x0.1ms 25:5x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:2x0.1ms 30:6x0.1ms 31:1x0.1ms 32:266x68.9ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 81 snapshots, 46 evictions
+  last 200: 68.5% hits, 1497.5 misses/step, 27.1 swaps/step, 62.84 ms/step in the CPU pool
+req: 99 prompt tokens, queued 2 ms, first token 1376 ms after admission, 256 tokens in 24.90s, length
+req: 95 prompt tokens, queued 3 ms, first token 2112 ms after admission, 256 tokens in 25.57s, length
+req: 98 prompt tokens, queued 4 ms, first token 2831 ms after admission, 256 tokens in 26.48s, length
+req: 95 prompt tokens, queued 5 ms, first token 3512 ms after admission, 256 tokens in 27.38s, length
+req: 93 prompt tokens, queued 7 ms, first token 4157 ms after admission, 256 tokens in 28.17s, length
+req: 94 prompt tokens, queued 8 ms, first token 5036 ms after admission, 256 tokens in 29.18s, length
+req: 97 prompt tokens, queued 9 ms, first token 5649 ms after admission, 256 tokens in 29.87s, length
+req: 98 prompt tokens, queued 11 ms, first token 6269 ms after admission, 256 tokens in 30.83s, length
+sched: 3600 steps (357 speculative), 9.4 window tokens/step, 68.27 ms/step (57.46 waiting for samples), admitting 4.15s
+  by width: 1:13x0.1ms 2:14x0.1ms 3:39x0.1ms 4:714x0.8ms 5:5x0.1ms 6:29x0.2ms 7:68x0.2ms 8:2016x2.5ms 12:3x0.1ms 13:2x0.1ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:1x0.0ms 20:3x0.1ms 21:3x0.1ms 22:1x0.0ms 23:1x0.1ms 24:2x0.1ms 25:5x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:2x0.1ms 30:6x0.1ms 31:1x0.1ms 32:295x69.7ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 89 snapshots, 54 evictions
+  last 200: 65.8% hits, 1887.9 misses/step, 32.0 swaps/step, 80.79 ms/step in the CPU pool
+req: 92 prompt tokens, queued 88 ms, first token 1491 ms after admission, 233 tokens in 24.00s, stop
+req: 97 prompt tokens, queued 202 ms, first token 1661 ms after admission, 224 tokens in 21.22s, stop
+req: 99 prompt tokens, queued 369 ms, first token 1641 ms after admission, 256 tokens in 26.87s, length
+req: 91 prompt tokens, queued 311 ms, first token 1606 ms after admission, 256 tokens in 26.57s, length
+req: 92 prompt tokens, queued 205 ms, first token 1808 ms after admission, 256 tokens in 26.73s, length
+req: 95 prompt tokens, queued 221 ms, first token 1717 ms after admission, 256 tokens in 26.57s, length
+req: 100 prompt tokens, queued 232 ms, first token 1822 ms after admission, 256 tokens in 26.34s, length
+sched: 3800 steps (357 speculative), 9.5 window tokens/step, 69.76 ms/step (58.90 waiting for samples), admitting 4.16s
+  by width: 1:13x0.1ms 2:14x0.1ms 3:39x0.1ms 4:714x0.8ms 5:5x0.1ms 6:29x0.2ms 7:72x0.2ms 8:2184x2.6ms 12:4x0.1ms 13:2x0.1ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:1x0.0ms 20:3x0.1ms 21:3x0.1ms 22:3x0.1ms 23:1x0.1ms 24:3x0.1ms 25:5x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:2x0.1ms 30:6x0.1ms 31:1x0.1ms 32:319x69.8ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 96 snapshots, 60 evictions
+  last 200: 68.5% hits, 1668.0 misses/step, 31.8 swaps/step, 76.47 ms/step in the CPU pool
+req: 98 prompt tokens, queued 207 ms, first token 1528 ms after admission, 256 tokens in 26.01s, length
+req: 94 prompt tokens, queued 71 ms, first token 894 ms after admission, 186 tokens in 15.20s, stop
+sched: 4000 steps (357 speculative), 9.4 window tokens/step, 70.06 ms/step (59.56 waiting for samples), admitting 4.17s
+  by width: 1:13x0.1ms 2:14x0.1ms 3:39x0.1ms 4:714x0.8ms 5:5x0.1ms 6:29x0.2ms 7:84x0.2ms 8:2368x2.7ms 12:4x0.1ms 13:2x0.1ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:1x0.0ms 20:3x0.1ms 21:3x0.1ms 22:3x0.1ms 23:1x0.1ms 24:3x0.1ms 25:5x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:3x0.1ms 30:6x0.1ms 31:1x0.1ms 32:322x69.8ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 98 snapshots, 62 evictions
+  last 200: 73.6% hits, 1074.1 misses/step, 32.0 swaps/step, 54.55 ms/step in the CPU pool
+req: 91 prompt tokens, queued 93 ms, first token 1246 ms after admission, 256 tokens in 24.42s, length
+req: 91 prompt tokens, queued 77 ms, first token 1111 ms after admission, 256 tokens in 23.34s, length
+req: 99 prompt tokens, queued 75 ms, first token 1187 ms after admission, 256 tokens in 22.12s, length
+req: 95 prompt tokens, queued 251 ms, first token 1353 ms after admission, 256 tokens in 21.58s, length
+req: 95 prompt tokens, queued 221 ms, first token 1293 ms after admission, 256 tokens in 20.79s, length
+req: 102 prompt tokens, queued 209 ms, first token 1271 ms after admission, 256 tokens in 20.24s, length
+req: 98 prompt tokens, queued 160 ms, first token 745 ms after admission, 256 tokens in 18.36s, length
+sched: 4200 steps (357 speculative), 9.4 window tokens/step, 71.10 ms/step (60.55 waiting for samples), admitting 4.18s
+  by width: 1:23x0.1ms 2:18x0.1ms 3:43x0.1ms 4:718x0.8ms 5:22x0.2ms 6:38x0.2ms 7:97x0.2ms 8:2479x2.5ms 12:4x0.1ms 13:2x0.1ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:2x0.1ms 20:3x0.1ms 21:3x0.1ms 22:3x0.1ms 23:1x0.1ms 24:3x0.1ms 25:5x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:3x0.1ms 30:6x0.1ms 31:1x0.1ms 32:348x71.1ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 105 snapshots, 70 evictions
+  last 200: 63.8% hits, 1749.0 misses/step, 28.7 swaps/step, 69.73 ms/step in the CPU pool
+req: 97 prompt tokens, queued 2 ms, first token 1287 ms after admission, 256 tokens in 26.48s, length
+req: 99 prompt tokens, queued 4 ms, first token 2463 ms after admission, 256 tokens in 27.48s, length
+req: 96 prompt tokens, queued 5 ms, first token 3281 ms after admission, 256 tokens in 28.20s, length
+req: 96 prompt tokens, queued 6 ms, first token 4065 ms after admission, 256 tokens in 29.02s, length
+req: 93 prompt tokens, queued 7 ms, first token 4830 ms after admission, 256 tokens in 29.85s, length
+req: 95 prompt tokens, queued 8 ms, first token 5784 ms after admission, 256 tokens in 30.85s, length
+req: 88 prompt tokens, queued 10 ms, first token 6476 ms after admission, 256 tokens in 31.60s, length
+req: 97 prompt tokens, queued 11 ms, first token 7182 ms after admission, 256 tokens in 32.49s, length
+sched: 4400 steps (357 speculative), 9.5 window tokens/step, 72.47 ms/step (61.78 waiting for samples), admitting 4.19s
+  by width: 1:23x0.1ms 2:18x0.1ms 3:43x0.1ms 4:718x0.8ms 5:22x0.2ms 6:38x0.2ms 7:98x0.2ms 8:2648x2.7ms 12:4x0.1ms 13:2x0.1ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:3x0.1ms 20:4x0.1ms 21:3x0.1ms 22:3x0.1ms 23:1x0.1ms 24:3x0.1ms 25:5x0.1ms 26:6x0.1ms 27:5x0.1ms 28:3x0.1ms 29:3x0.1ms 30:6x0.1ms 31:1x0.1ms 32:376x70.7ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 35 entries, 0 hits, 0 tokens restored, 113 snapshots, 78 evictions
+  last 200: 64.8% hits, 1935.3 misses/step, 32.0 swaps/step, 84.43 ms/step in the CPU pool
+req: 95 prompt tokens, queued 31091 ms, first token 1619 ms after admission, 223 tokens in 19.56s, stop
+req: 88 prompt tokens, queued 26550 ms, first token 1382 ms after admission, 256 tokens in 25.97s, length
+req: 90 prompt tokens, queued 27648 ms, first token 1374 ms after admission, 256 tokens in 25.77s, length
+req: 93 prompt tokens, queued 28524 ms, first token 1572 ms after admission, 256 tokens in 25.86s, length
+req: 97 prompt tokens, queued 31806 ms, first token 1549 ms after admission, 242 tokens in 22.79s, stop
+req: 99 prompt tokens, queued 29300 ms, first token 1555 ms after admission, 256 tokens in 25.77s, length
+sched: 4600 steps (357 speculative), 9.6 window tokens/step, 73.10 ms/step (62.49 waiting for samples), admitting 4.20s
+  by width: 1:23x0.1ms 2:18x0.1ms 3:43x0.1ms 4:718x0.8ms 5:22x0.2ms 6:38x0.2ms 7:100x0.2ms 8:2827x2.8ms 12:4x0.1ms 13:2x0.1ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:3x0.1ms 20:4x0.1ms 21:3x0.1ms 22:3x0.1ms 23:1x0.1ms 24:3x0.1ms 25:6x0.1ms 26:6x0.1ms 27:7x0.1ms 28:3x0.1ms 29:3x0.1ms 30:6x0.1ms 31:1x0.1ms 32:392x70.6ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 119 snapshots, 83 evictions
+  last 200: 68.8% hits, 1507.1 misses/step, 31.9 swaps/step, 68.18 ms/step in the CPU pool
+req: 93 prompt tokens, queued 30093 ms, first token 1715 ms after admission, 256 tokens in 25.86s, length
+req: 96 prompt tokens, queued 32708 ms, first token 1311 ms after admission, 256 tokens in 25.23s, length
+req: 95 prompt tokens, queued 25110 ms, first token 1291 ms after admission, 200 tokens in 20.14s, stop
+sched: 4800 steps (357 speculative), 9.6 window tokens/step, 73.78 ms/step (63.20 waiting for samples), admitting 4.20s
+  by width: 1:23x0.1ms 2:18x0.1ms 3:43x0.1ms 4:718x0.8ms 5:22x0.2ms 6:38x0.2ms 7:102x0.2ms 8:3009x3.0ms 12:4x0.1ms 13:2x0.1ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:4x0.1ms 20:4x0.1ms 21:3x0.1ms 22:3x0.1ms 23:1x0.1ms 24:3x0.1ms 25:7x0.1ms 26:6x0.1ms 27:7x0.1ms 28:3x0.1ms 29:3x0.1ms 30:7x0.1ms 31:1x0.1ms 32:405x70.7ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 122 snapshots, 86 evictions
+  last 200: 69.7% hits, 1442.3 misses/step, 32.0 swaps/step, 67.25 ms/step in the CPU pool
+req: 96 prompt tokens, queued 24238 ms, first token 1225 ms after admission, 256 tokens in 26.60s, length
+req: 97 prompt tokens, queued 24990 ms, first token 1762 ms after admission, 243 tokens in 24.37s, stop
+req: 97 prompt tokens, queued 25428 ms, first token 1219 ms after admission, 256 tokens in 26.39s, length
+req: 95 prompt tokens, queued 25574 ms, first token 1153 ms after admission, 256 tokens in 26.23s, length
+req: 91 prompt tokens, queued 24445 ms, first token 1931 ms after admission, 256 tokens in 26.66s, length
+req: 97 prompt tokens, queued 24560 ms, first token 1689 ms after admission, 256 tokens in 26.51s, length
+req: 99 prompt tokens, queued 25501 ms, first token 872 ms after admission, 256 tokens in 25.77s, length
+sched: 5000 steps (357 speculative), 9.6 window tokens/step, 74.57 ms/step (64.07 waiting for samples), admitting 4.22s
+  by width: 1:23x0.1ms 2:18x0.1ms 3:43x0.1ms 4:718x0.8ms 5:22x0.2ms 6:38x0.2ms 7:106x0.2ms 8:3177x2.9ms 12:4x0.1ms 13:2x0.1ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:4x0.1ms 19:1x0.1ms 20:5x0.1ms 21:3x0.1ms 22:3x0.1ms 23:2x0.1ms 24:5x0.1ms 25:8x0.1ms 26:6x0.1ms 27:7x0.1ms 28:4x0.1ms 29:3x0.1ms 30:7x0.1ms 31:1x0.1ms 32:426x70.9ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 129 snapshots, 93 evictions
+  last 200: 71.1% hits, 1531.1 misses/step, 32.0 swaps/step, 72.30 ms/step in the CPU pool
+req: 94 prompt tokens, queued 22163 ms, first token 1238 ms after admission, 256 tokens in 25.75s, length
+req: 97 prompt tokens, queued 24904 ms, first token 1153 ms after admission, 256 tokens in 25.82s, length
+req: 89 prompt tokens, queued 25881 ms, first token 1126 ms after admission, 256 tokens in 25.74s, length
+req: 94 prompt tokens, queued 26902 ms, first token 832 ms after admission, 238 tokens in 22.53s, stop
+req: 90 prompt tokens, queued 25808 ms, first token 990 ms after admission, 256 tokens in 25.65s, length
+req: 93 prompt tokens, queued 26369 ms, first token 908 ms after admission, 256 tokens in 25.75s, length
+req: 94 prompt tokens, queued 26985 ms, first token 1014 ms after admission, 256 tokens in 25.99s, length
+req: 92 prompt tokens, queued 25889 ms, first token 766 ms after admission, 256 tokens in 25.53s, length
+sched: 5200 steps (357 speculative), 9.7 window tokens/step, 75.41 ms/step (64.88 waiting for samples), admitting 4.23s
+  by width: 1:23x0.1ms 2:18x0.1ms 3:43x0.1ms 4:718x0.8ms 5:22x0.2ms 6:38x0.2ms 7:110x0.2ms 8:3341x2.9ms 9:1x0.1ms 12:4x0.1ms 13:2x0.1ms 14:1x0.0ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:4x0.1ms 19:1x0.1ms 20:5x0.1ms 21:3x0.1ms 22:3x0.1ms 23:2x0.1ms 24:5x0.1ms 25:9x0.1ms 26:6x0.1ms 27:7x0.1ms 28:4x0.1ms 29:4x0.1ms 30:8x0.1ms 31:1x0.1ms 32:453x70.4ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 137 snapshots, 101 evictions
+  last 200: 69.9% hits, 1667.6 misses/step, 32.0 swaps/step, 76.28 ms/step in the CPU pool
+req: 99 prompt tokens, queued 25907 ms, first token 1280 ms after admission, 256 tokens in 24.97s, length
+req: 98 prompt tokens, queued 26008 ms, first token 1061 ms after admission, 256 tokens in 24.70s, length
+req: 92 prompt tokens, queued 25910 ms, first token 1157 ms after admission, 256 tokens in 24.58s, length
+req: 89 prompt tokens, queued 25597 ms, first token 1308 ms after admission, 256 tokens in 24.64s, length
+req: 97 prompt tokens, queued 25267 ms, first token 1572 ms after admission, 256 tokens in 25.03s, length
+req: 95 prompt tokens, queued 24954 ms, first token 1457 ms after admission, 256 tokens in 25.02s, length
+req: 103 prompt tokens, queued 25493 ms, first token 916 ms after admission, 256 tokens in 24.74s, length
+req: 94 prompt tokens, queued 25661 ms, first token 743 ms after admission, 256 tokens in 24.71s, length
+sched: 5400 steps (357 speculative), 9.8 window tokens/step, 76.21 ms/step (65.57 waiting for samples), admitting 4.24s
+  by width: 1:23x0.1ms 2:18x0.1ms 3:43x0.1ms 4:718x0.8ms 5:22x0.2ms 6:38x0.2ms 7:115x0.2ms 8:3506x3.0ms 9:1x0.1ms 12:4x0.1ms 13:2x0.1ms 14:1x0.0ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:4x0.1ms 19:1x0.1ms 20:5x0.1ms 21:3x0.1ms 22:3x0.1ms 23:2x0.1ms 24:5x0.1ms 25:9x0.1ms 26:6x0.1ms 27:8x0.1ms 28:5x0.1ms 29:5x0.1ms 30:8x0.1ms 31:1x0.1ms 32:480x70.3ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 145 snapshots, 109 evictions
+  last 200: 69.4% hits, 1675.9 misses/step, 32.0 swaps/step, 76.58 ms/step in the CPU pool
+req: 96 prompt tokens, queued 24877 ms, first token 1013 ms after admission, 136 tokens in 14.40s, stop
+req: 98 prompt tokens, queued 24759 ms, first token 1116 ms after admission, 199 tokens in 18.52s, stop
+req: 97 prompt tokens, queued 25124 ms, first token 1264 ms after admission, 256 tokens in 24.72s, length
+sched: 5600 steps (357 speculative), 9.7 window tokens/step, 76.18 ms/step (65.83 waiting for samples), admitting 4.24s
+  by width: 1:23x0.1ms 2:18x0.1ms 3:43x0.1ms 4:718x0.8ms 5:45x0.2ms 6:39x0.2ms 7:191x2.2ms 8:3605x2.9ms 9:1x0.1ms 12:4x0.1ms 13:2x0.1ms 14:1x0.0ms 15:2x0.1ms 16:1x0.1ms 17:1x0.1ms 18:4x0.1ms 19:1x0.1ms 20:5x0.1ms 21:3x0.1ms 22:3x0.1ms 23:2x0.1ms 24:5x0.1ms 25:9x0.1ms 26:7x0.1ms 27:8x0.1ms 28:5x0.1ms 29:5x0.1ms 30:8x0.1ms 31:1x0.1ms 32:480x70.3ms
+  prefill: 0 chunks, 0 tokens, 0.0 ms each, 0 tok/s
+  prefix cache: 36 entries, 0 hits, 0 tokens restored, 148 snapshots, 112 evictions
+  last 200: 70.6% hits, 1057.0 misses/step, 32.0 swaps/step, 54.28 ms/step in the CPU pool
+req: 97 prompt tokens, queued 25087 ms, first token 1265 ms after admission, 256 tokens in 21.89s, length
+req: 97 prompt tokens, queued 25480 ms, first token 1220 ms after admission, 256 tokens in 21.26s, length
+req: 93 prompt tokens, queued 25413 ms, first token 839 ms after admission, 256 tokens in 20.54s, length
+req: 98 prompt tokens, queued 24926 ms, first token 868 ms after admission, 256 tokens in 19.84s, length
+req: 95 prompt tokens, queued 24855 ms, first token 772 ms after admission, 256 tokens in 18.77s, length

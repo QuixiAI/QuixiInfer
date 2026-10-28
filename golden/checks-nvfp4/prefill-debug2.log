@@ -1,0 +1,21 @@
+kv pages: 1025 of 3.05 MiB (3.05 GiB pinned), 1 per sequence
+host experts: 63.4 GiB pinned in 32.7s
+prefill: chunks of 256 tokens, 0.56 GiB of buffers
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.41 GiB in VRAM)
+expert cache: 720 of 24576 experts in 2.02 GiB of VRAM
+prefix cache: 18 entries of 113.0 MiB
+expert cache: 720 experts, 2.02 GiB
+
+thread 'main' (678120) panicked at crates/qx-gpu/src/runtime.rs:42:21:
+An execution error happened during profiling
+Caused by:
+  A launch error happened
+Caused by:
+  A compilation error happened during launch
+Caused by:
+  The device is poisoned, the kernel could not be loaded
+Caused by:
+  cuModuleLoadData failed with status 700
+Backtrace:
+No backtrace available
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,14 @@
+kv pages: 1025 of 3.38 MiB (3.38 GiB pinned), 1 per sequence
+host experts: 63.4 GiB pinned in 7.1s
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.41 GiB in VRAM)
+expert cache: 163 of 24576 experts in 0.58 GiB of VRAM
+prefill: chunks of 256 tokens, 0.57 GiB of buffers lent from the expert cache's tail
+prefix cache: 2.00 GiB; entries of 112.7 MiB plus 1536.0 KiB per 1k tokens (113.0 MiB at the full context)
+kv pages: 1025 of 3.38 MiB (3.38 GiB pinned), 1 per sequence
+host experts: 63.4 GiB pinned in 7.2s
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.41 GiB in VRAM)
+expert cache: 1716 of 24576 experts in 4.58 GiB of VRAM
+prefill: chunks of 256 tokens, 0.57 GiB of buffers lent from the expert cache's tail
+prefix cache: 2.00 GiB; entries of 112.7 MiB plus 1536.0 KiB per 1k tokens (113.0 MiB at the full context)
+GPU share of routings: 14.6% vs 29.0%
+48 positions: logits bitwise identical

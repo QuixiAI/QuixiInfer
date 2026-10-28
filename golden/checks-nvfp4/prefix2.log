@@ -1,0 +1,14 @@
+kv pages: 1028 of 3.38 MiB (3.39 GiB pinned), 2 per sequence
+host experts: 63.4 GiB pinned in 7.1s
+prefill: chunks of 512 tokens, 0.75 GiB of buffers
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.41 GiB in VRAM)
+expert cache: 8049 of 24576 experts in 20.89 GiB of VRAM
+prefix cache: 8.00 GiB; entries of 112.7 MiB plus 1536.0 KiB per 1k tokens (113.4 MiB at the full context)
+phase: straight
+phase: snapshot
+phase: perturb
+phase: restore
+phase: rest
+restored prefix of 300: 0 of 39 logits rows differ; generated tokens identical: true
+cache: 1 entries, 1 hits, 300 tokens restored, 1 snapshots, 0 evictions
+PASS

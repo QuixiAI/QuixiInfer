@@ -1,0 +1,27 @@
+[package]
+name = "qx-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+qx-gpu = { path = "../qx-gpu" }
+qx-pack = { path = "../qx-pack" }
+qx-quant = { path = "../qx-quant" }
+qx-cpu = { path = "../qx-cpu" }
+qx-ref = { path = "../qx-ref" }
+qx-tok = { path = "../qx-tok" }
+cubecl = { version = "0.11", features = ["cuda", "cuda-cpp"] }
+cubecl-runtime = "0.11.3"
+rayon = "1.10"
+anyhow = { workspace = true }
+half = { workspace = true }
+bytemuck = "1"
+libc = "0.2"
+io-uring = "0.7"
+cudarc = { workspace = true }
+
+[[test]]
+name = "parity"
+harness = false

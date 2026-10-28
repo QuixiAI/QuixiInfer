@@ -1,0 +1,10 @@
+[env]
+# NVRTC must match the driver's PTX support (driver 595 = CUDA 13.2); 13.1's NVRTC emits PTX it accepts.
+CUDA_PATH = "/usr/local/cuda-13.1"
+CUDA_ROOT = "/usr/local/cuda-13.1"
+# nvcc used by build.rs: 13.1's nvcc cannot parse this glibc's headers, and 13.3 cubins load on the 13.2 driver.
+QX_NVCC = "/usr/local/cuda-13.3/bin/nvcc"
+
+[build]
+
+rustflags = ["-C", "target-cpu=native"]

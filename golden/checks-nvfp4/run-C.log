@@ -1,0 +1,18 @@
+expert cache: starting from the saved routing profile
+quixiinfer: loading (context 262144 per sequence)
+kv pages: 5377 of 3.05 MiB (16.00 GiB pinned), 1024 per sequence
+host experts: 63.4 GiB pinned in 243.3s
+prefill: chunks of 1024 tokens, 1.38 GiB of buffers
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.45 GiB in VRAM)
+expert cache: 5834 of 24576 experts in 15.19 GiB of VRAM
+prefix cache: 8 entries of 496.7 MiB
+amera instead先看/q (ickeruntingSourceTypeuri( ado wholesaleuhr或多个abushia密闭服务项目(Tal2 Instance Trevora
+[5 prompt tokens at 59.3 tok/s, 24 generated at 55.4 tok/s, length]
+
+thread '<unnamed>' (723128) panicked at crates/qx-gpu/src/mem.rs:17:26:
+bind CUDA context: DriverError(CUDA_ERROR_DEINITIALIZED, "<Failure when calling cuGetErrorString()>")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread '<unnamed>' (723128) panicked at crates/qx-gpu/src/mem.rs:17:26:
+bind CUDA context: DriverError(CUDA_ERROR_DEINITIALIZED, "<Failure when calling cuGetErrorString()>")
+stack backtrace:

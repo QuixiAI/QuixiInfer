@@ -1,0 +1,14 @@
+[package]
+name = "qx-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+qx-quant = { path = "../qx-quant" }
+half = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"

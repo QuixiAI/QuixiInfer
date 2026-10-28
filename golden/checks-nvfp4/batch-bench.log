@@ -1,0 +1,11 @@
+kv pages: 1056 of 3.05 MiB (3.14 GiB pinned), 2 per sequence
+host experts: 63.4 GiB pinned in 51.5s
+prefill: chunks of 512 tokens, 0.75 GiB of buffers
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.41 GiB in VRAM)
+expert cache: 5231 of 24576 experts in 13.64 GiB of VRAM
+prefix cache: 72 entries of 113.4 MiB
+  B     tok/s   step ms   hits %  misses/st cpu ms/st ple rows/st
+  1      53.5     18.70     64.1      172.4      9.78      16.0
+  4      98.3     40.71     72.5      527.8     28.05      64.0
+  8     107.9     74.18     73.7     1009.7     52.34     128.0
+ 16     116.5    137.35     74.2     1984.8    102.73     255.0

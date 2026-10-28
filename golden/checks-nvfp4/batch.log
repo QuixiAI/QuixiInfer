@@ -1,0 +1,10 @@
+expert cache: starting from the saved routing profile
+kv pages: 1028 of 3.38 MiB (3.39 GiB pinned), 1 per sequence
+host experts: 63.4 GiB pinned in 7.1s
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.41 GiB in VRAM)
+expert cache: 8155 of 24576 experts in 21.17 GiB of VRAM
+prefill: chunks of 256 tokens, 0.57 GiB of buffers lent from the expert cache's tail
+prefix cache: 8.00 GiB; entries of 112.7 MiB plus 1536.0 KiB per 1k tokens (113.0 MiB at the full context)
+logits: 4 slots x 80 positions in 80 mixed windows: 0 rows differ, KL mean 0.00e0 max 0.00e0, top-1 320/320
+generation: 4 of 4 slots identical
+PASS

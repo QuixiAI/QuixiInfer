@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+burn = { version = "0.22.1", default-features = false, features = ["std", "cuda"] }
+burn-cuda = "0.22.1"
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "cuda-13010", "dynamic-loading"] }
+half = "2.7.1"
+memmap2 = "0.9.12"
+anyhow = "1"
+
+[profile.release]
+debug = 1
+codegen-units = 16

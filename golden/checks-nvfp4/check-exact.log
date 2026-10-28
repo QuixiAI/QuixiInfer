@@ -1,0 +1,25 @@
+kv pages: 1025 of 3.05 MiB (3.05 GiB pinned), 1 per sequence
+host experts: 63.4 GiB pinned in 128.8s
+prefill: chunks of 256 tokens, 0.56 GiB of buffers
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.41 GiB in VRAM)
+expert cache: 720 of 24576 experts in 2.02 GiB of VRAM
+prefix cache: 18 entries of 113.0 MiB
+expert cache: 720 experts, 2.02 GiB
+engine loaded in 133.4s
+pos    0 tok    760  logits rel err 1.05e-2  KLD 2.66e-4  top1 same
+pos    1 tok   3841  logits rel err 2.04e-2  KLD 7.70e-4  top1 same
+pos    2 tok  13477  logits rel err 4.28e-2  KLD 3.38e-4  top1 same
+pos    3 tok  37550  logits rel err 3.04e-2  KLD 1.13e-3  top1 same
+pos    4 tok  33075  logits rel err 5.75e-2  KLD 2.31e-4  top1 same
+pos    5 tok    888  logits rel err 3.12e-2  KLD 2.78e-4  top1 same
+pos    6 tok    279  logits rel err 4.72e-2  KLD 2.90e-4  top1 same
+pos    7 tok  15217  logits rel err 9.45e-2  KLD 6.38e-4  top1 same
+pos    8 tok   5388  logits rel err 1.07e-1  KLD 1.41e-2  top1 same
+pos    9 tok     13  logits rel err 2.28e-1  KLD 1.51e-1  top1 same
+pos   10 tok    733  logits rel err 1.11e-1  KLD 3.03e-2  top1 same
+pos   11 tok    279  logits rel err 1.16e-1  KLD 8.68e-2  top1 same
+pos   12 tok   6941  logits rel err 1.67e-1  KLD 4.58e-3  top1 same
+pos   13 tok     11  logits rel err 2.27e-1  KLD 2.12e-1  top1 same
+pos   14 tok    279  logits rel err 1.69e-1  KLD 1.02e-1  top1 same
+pos   15 tok  15039  logits rel err 1.88e-1  KLD 4.55e-3  top1 same
+16 positions: top-1 16/16, logits rel err max 2.28e-1, KLD mean 3.81e-2 max 2.12e-1, engine 1.457 s/token

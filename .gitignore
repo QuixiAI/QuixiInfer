@@ -1,0 +1,5 @@
+/target
+*.qxp
+/golden/out*/
+/tools/golden/golden
+/golden/data/

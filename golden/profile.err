@@ -1,0 +1,23 @@
+calibration: 6638 tokens
+  500 / 6638 tokens, 30.0 tok/s
+  1000 / 6638 tokens, 29.5 tok/s
+  1500 / 6638 tokens, 28.8 tok/s
+  2000 / 6638 tokens, 28.0 tok/s
+  2500 / 6638 tokens, 28.6 tok/s
+  3000 / 6638 tokens, 28.7 tok/s
+  3500 / 6638 tokens, 28.5 tok/s
+  4000 / 6638 tokens, 28.2 tok/s
+  4500 / 6638 tokens, 28.4 tok/s
+  5000 / 6638 tokens, 28.5 tok/s
+  5500 / 6638 tokens, 28.3 tok/s
+  6000 / 6638 tokens, 28.1 tok/s
+  6500 / 6638 tokens, 28.2 tok/s
+held-out: 4096 tokens
+  500 / 4096 tokens, 31.5 tok/s
+  1000 / 4096 tokens, 22.9 tok/s
+  1500 / 4096 tokens, 14.0 tok/s
+  2000 / 4096 tokens, 11.5 tok/s
+  2500 / 4096 tokens, 11.0 tok/s
+  3000 / 4096 tokens, 11.0 tok/s
+  3500 / 4096 tokens, 11.9 tok/s
+  4000 / 4096 tokens, 11.8 tok/s

@@ -1,0 +1,9 @@
+expert cache: starting from the saved routing profile
+quixiinfer: loading (context 262144 per sequence)
+kv pages: 4854 of 3.38 MiB (16.00 GiB pinned), 1024 per sequence
+host experts: 63.4 GiB pinned in 7.1s
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.45 GiB in VRAM)
+expert cache: 5349 of 24576 experts in 13.94 GiB of VRAM
+prefill: chunks of 2048 tokens, 2.67 GiB of buffers
+prefix cache: 4.00 GiB; entries of 112.7 MiB plus 1536.0 KiB per 1k tokens (496.7 MiB at the full context)
+quixiinfer: listening on http://127.0.0.1:8001/v1

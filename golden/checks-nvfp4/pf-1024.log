@@ -1,0 +1,36 @@
+kv pages: 1122 of 3.38 MiB (3.70 GiB pinned), 98 per sequence
+host experts: 63.4 GiB pinned in 15.7s
+prefill: chunks of 1024 tokens, 1.16 GiB of buffers
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.42 GiB in VRAM)
+expert cache: 487 of 24576 experts in 1.42 GiB of VRAM
+prefix cache: 2.00 GiB; entries of 112.7 MiB plus 1536.0 KiB per 1k tokens (149.4 MiB at the full context)
+expert cache: 487 experts, 1.42 GiB
+watch: copy at 1926 main at 1926 ready 1927 freed 1925 (g0 1680)
+watch: copy at 2234 main at 2234 ready 2235 freed 2233 (g0 2016)
+watch: copy at 2598 main at 2598 ready 2599 freed 2597 (g0 2352)
+watch: copy at 2990 main at 2990 ready 2991 freed 2989 (g0 2688)
+watch: copy at 3186 main at 3186 ready 3187 freed 3185 (g0 3024)
+watch: copy at 3332 main at 3332 ready 3332 freed 3331 (g0 3024)
+watch: copy at 3522 main at 3522 ready 3523 freed 3521 (g0 3360)
+watch: copy at 3662 main at 3662 ready 3663 freed 3661 (g0 3360)
+watch: copy at 3942 main at 3942 ready 3943 freed 3941 (g0 3696)
+watch: copy at 4285 main at 4286 ready 4286 freed 4284 (g0 4032)
+watch: copy at 4642 main at 4642 ready 4643 freed 4641 (g0 4368)
+watch: copy at 4866 main at 4866 ready 4867 freed 4865 (g0 4704)
+watch: copy at 5006 main at 5006 ready 5007 freed 5005 (g0 4704)
+watch: copy at 5202 main at 5202 ready 5203 freed 5201 (g0 5040)
+watch: copy at 5342 main at 5342 ready 5343 freed 5341 (g0 5040)
+watch: copy at 5566 main at 5566 ready 5567 freed 5565 (g0 5376)
+watch: copy at 5902 main at 5902 ready 5903 freed 5901 (g0 5712)
+watch: copy at 6266 main at 6266 ready 6267 freed 6265 (g0 6048)
+watch: copy at 6630 main at 6630 ready 6631 freed 6629 (g0 6384)
+watch: copy at 6910 main at 6910 ready 6911 freed 6909 (g0 6720)
+watch: copy at 7218 main at 7218 ready 7219 freed 7217 (g0 7056)
+watch: copy at 7330 main at 7330 ready 7331 freed 7329 (g0 7056)
+watch: copy at 7582 main at 7582 ready 7583 freed 7581 (g0 7392)
+watch: copy at 7890 main at 7890 ready 7891 freed 7889 (g0 7728)
+watch: copy at 8021 main at 8021 ready 8021 freed 8021 (g0 7728)
+watch: copy at 8226 main at 8226 ready 8227 freed 8225 (g0 8064)
+watch: copy at 8366 main at 8366 ready 8367 freed 8365 (g0 8064)
+watch: copy at 8674 main at 8674 ready 8675 freed 8673 (g0 8400)
+prefill 24999 tokens in 121.067s: 206 tok/s

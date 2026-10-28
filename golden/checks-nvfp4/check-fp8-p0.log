@@ -1,0 +1,46 @@
+kv pages: 1025 of 3.05 MiB (3.05 GiB pinned), 1 per sequence
+host experts: 63.4 GiB pinned in 29.6s
+prefill: chunks of 256 tokens, 0.56 GiB of buffers
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.41 GiB in VRAM)
+expert cache: 720 of 24576 experts in 2.02 GiB of VRAM
+prefix cache: 18 entries of 113.0 MiB
+expert cache: 720 experts, 2.02 GiB
+engine loaded in 33.6s
+pos    0 tok    760  logits rel err 1.08e-2  KLD 2.87e-4  top1 same
+pos    1 tok   3841  logits rel err 2.11e-2  KLD 8.47e-4  top1 same
+pos    2 tok  13477  logits rel err 5.71e-2  KLD 5.82e-4  top1 same
+pos    3 tok  37550  logits rel err 3.56e-2  KLD 1.22e-3  top1 same
+pos    4 tok  33075  logits rel err 8.22e-2  KLD 3.78e-4  top1 same
+pos    5 tok    888  logits rel err 8.36e-2  KLD 1.77e-3  top1 same
+pos    6 tok    279  logits rel err 5.85e-2  KLD 3.72e-4  top1 same
+pos    7 tok  15217  logits rel err 5.36e-2  KLD 4.57e-4  top1 same
+pos    8 tok   5388  logits rel err 6.82e-2  KLD 5.53e-3  top1 same
+pos    9 tok     13  logits rel err 3.08e-1  KLD 4.18e-1  top1 same
+pos   10 tok    733  logits rel err 2.02e-1  KLD 6.12e-2  top1 same
+pos   11 tok    279  logits rel err 1.38e-1  KLD 1.25e-1  top1 same
+pos   12 tok   6941  logits rel err 2.08e-1  KLD 9.85e-3  top1 same
+pos   13 tok     11  logits rel err 2.87e-1  KLD 5.09e-1  top1 DIFF
+pos   14 tok    279  logits rel err 2.04e-1  KLD 3.24e-1  top1 same
+pos   15 tok  15039  logits rel err 1.74e-1  KLD 5.57e-3  top1 same
+pos   16 tok    557  logits rel err 1.36e-1  KLD 2.39e-2  top1 same
+pos   17 tok   3354  logits rel err 1.67e-1  KLD 2.09e-2  top1 same
+pos   18 tok     13  logits rel err 2.18e-1  KLD 1.55e-1  top1 same
+pos   19 tok   1061  logits rel err 1.81e-1  KLD 2.23e-2  top1 same
+pos   20 tok    682  logits rel err 1.17e-1  KLD 2.77e-1  top1 same
+pos   21 tok   1801  logits rel err 1.97e-1  KLD 1.89e-3  top1 same
+pos   22 tok    264  logits rel err 1.05e-1  KLD 1.66e-4  top1 same
+pos   23 tok   2609  logits rel err 1.48e-1  KLD 2.86e-4  top1 same
+pos   24 tok    314  logits rel err 1.41e-1  KLD 1.04e-3  top1 same
+pos   25 tok   1208  logits rel err 1.34e-1  KLD 1.46e-3  top1 same
+pos   26 tok   1546  logits rel err 7.88e-2  KLD 4.04e-4  top1 same
+pos   27 tok  17960  logits rel err 1.16e-1  KLD 1.66e-2  top1 same
+pos   28 tok    321  logits rel err 1.27e-1  KLD 2.23e-3  top1 same
+pos   29 tok    978  logits rel err 7.68e-2  KLD 4.14e-4  top1 same
+pos   30 tok  13177  logits rel err 6.38e-2  KLD 1.19e-4  top1 same
+pos   31 tok  25519  logits rel err 1.28e-1  KLD 2.49e-4  top1 same
+pos   32 tok    430  logits rel err 1.08e-1  KLD 4.15e-5  top1 same
+pos   33 tok    264  logits rel err 9.43e-2  KLD 3.83e-4  top1 same
+pos   34 tok   3743  logits rel err 8.99e-2  KLD 8.48e-5  top1 same
+pos   35 tok   3166  logits rel err 2.09e-1  KLD 4.00e-3  top1 same
+pos   36 tok     13  logits rel err 2.68e-1  KLD 4.16e-2  top1 same
+37 positions: top-1 36/37, logits rel err max 3.08e-1, KLD mean 5.50e-2 max 5.09e-1, engine 0.087 s/token

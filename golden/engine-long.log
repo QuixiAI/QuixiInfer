@@ -1,0 +1,16 @@
+host experts: 45.4 GiB pinned in 4.5s
+expert cache: 2031 experts, 4.00 GiB
+engine loaded in 5.1s
+pos    0 tok    761  logits rel err 2.04e-6  KLD 2.48e-11  top1 same
+pos    1 tok   8644  logits rel err 1.82e-6  KLD 2.61e-11  top1 same
+pos    2 tok   1811  logits rel err 3.00e-6  KLD 9.03e-13  top1 same
+pos    3 tok    198  logits rel err 2.89e-6  KLD 1.79e-11  top1 same
+pos    4 tok   5780  logits rel err 2.99e-6  KLD 9.25e-13  top1 same
+pos    5 tok   5889  logits rel err 1.31e-6  KLD -1.93e-14  top1 same
+pos    6 tok    220  logits rel err 2.38e-6  KLD -6.80e-15  top1 same
+pos    7 tok     17  logits rel err 1.25e-6  KLD 2.19e-14  top1 same
+pos    8 tok     13  logits rel err 2.97e-6  KLD 5.98e-15  top1 same
+pos    9 tok     15  logits rel err 1.92e-6  KLD -3.88e-14  top1 same
+pos   10 tok     11  logits rel err 1.62e-6  KLD 2.57e-15  top1 same
+pos   11 tok   5869  logits rel err 1.31e-6  KLD -8.08e-15  top1 same
+pos   12 tok    220  logits rel err 2.63e-6  KLD 6.45e-15  top1 same

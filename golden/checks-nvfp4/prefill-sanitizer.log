@@ -1,0 +1,72 @@
+========= COMPUTE-SANITIZER
+kv pages: 1025 of 3.05 MiB (3.05 GiB pinned), 1 per sequence
+host experts: 63.4 GiB pinned in 36.4s
+prefill: chunks of 256 tokens, 0.56 GiB of buffers
+drafter: /home/eric/models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (1.41 GiB in VRAM)
+expert cache: 720 of 24576 experts in 2.02 GiB of VRAM
+prefix cache: 18 entries of 113.0 MiB
+expert cache: 720 experts, 2.02 GiB
+========= Invalid __local__ write of size 4 bytes
+=========     at qxp_route+0x29e0 in default_program:919
+=========     by thread (31,0,0) in block (0,0,0)
+=========     Access to 0x10fff6ec is out of bounds
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367b2a] in libcuda.so.1
+=========         Host Frame: _RNvXs_NtNtCsjUjUiaO0REN_11cubecl_cuda7compute6driverNtB4_4CudaNtNtNtCslehXpE3g6fN_13cubecl_server7command7backend6Driver6launch in driver.rs:214 [0x23f84ed] in qx-prefill-check
+=========         Host Frame: _RNvMNtNtCslehXpE3g6fN_13cubecl_server7command4baseINtB2_7CommandNtNtNtCsjUjUiaO0REN_11cubecl_cuda7compute6driver4CudaE6kernelB16_ in base.rs:566 [0x234e693] in qx-prefill-check
+=========         Host Frame: _RNvMs2_NtNtCsjUjUiaO0REN_11cubecl_cuda7compute6serverNtB5_10CudaServer14launch_checked in server.rs:923 [0x23c09ea] in qx-prefill-check
+=========         Host Frame: _RINvMs_NtNtCslehXpE3g6fN_13cubecl_server6stream13execute_scopeINtB5_12ExecuteScopeNtNtNtCsjUjUiaO0REN_11cubecl_cuda7compute6server10CudaServerE7executeuNCNvXs_B1k_B1i_NtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6Server6launch0EB1o_ in execute_scope.rs:235 [0x234290e] in qx-prefill-check
+=========         Host Frame: _RNvXs_NtNtCsjUjUiaO0REN_11cubecl_cuda7compute6serverNtB4_10CudaServerNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6Server6launch in server.rs:240 [0x23cf6c9] in qx-prefill-check
+=========         Host Frame: _RINvMNtNtCsgHmFgXk2IyQ_18cubecl_environment6stream2idNtB3_8StreamId8executesNCNCNCINvMs_NtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channelNtB1o_19ChannelDeviceHandle12submit_innerNCINvMs0_B1q_INtB1q_12DeviceHandleDNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6ServerEL_E6submitNCNvMs3_NtB3D_6clientNtB4J_6Client12launch_inners0_0E0Kb0_E000uEB3D_ in id.rs:67 [0x544f55c] in qx-prefill-check
+=========         Host Frame: _RINvMs2_NtNtCs8ZKwes1zzDd_3std6thread5localINtB6_8LocalKeyINtNtCskADBYZwJmSU_4core4cell7RefCellINtNtCsV4ENBGx8Hr_9hashbrown3map7HashMapNtNtBZ_3any6TypeIdIBV_INtNtCsgFX3jaOk65H_5alloc5boxed3BoxDNtB2b_3AnyEL_EEEEE4withNCINvMs4_B6_BF_11with_borrowNCINvMs1_NtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channelNtB43_14ChannelService6act_onuNCNCINvMs_B43_NtB43_19ChannelDeviceHandle12submit_innerNCINvMs0_B45_INtB45_12DeviceHandleDNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6ServerEL_E6submitNCNvMs3_NtB70_6clientNtB86_6Client12launch_inners0_0E0Kb0_E00E0uE0uEB70_ in local.rs:427 [0x545726d] in qx-prefill-check
+=========         Host Frame: _RNvYNCINvMNtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel4taskNtB8_4Task4initNCINvMs_Ba_NtBa_19ChannelDeviceHandle12submit_innerNCINvMs0_Bc_INtBc_12DeviceHandleDNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6ServerEL_E6submitNCNvMs3_NtB2R_6clientNtB3X_6Client12launch_inners0_0E0Kb0_E0Es_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceTQB1a_EE9call_onceB2R_.llvm.8947875229982015077 in function.rs:250 [0x5428017] in qx-prefill-check
+=========         Host Frame: _RNvMs2_NtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel14custom_channelNtB5_6Server5start in channel.rs:1079 [0x58da0f9] in qx-prefill-check
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCINvMs_NtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel14custom_channelNtB1f_12DeviceClient3newNCNvMs2_B1h_NtB1h_12DeviceRunner5start0E0uEB1n_ in backtrace.rs:166 [0x58da968] in qx-prefill-check
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCINvMs_NtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel14custom_channelNtB1b_12DeviceClient3newNCNvMs2_B1d_NtB1d_12DeviceRunner5start0E0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1j_ in function.rs:250 [0x58d86b2] in qx-prefill-check
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start in unix.rs:123 [0x65d6018] in qx-prefill-check
+=========         Host Frame: start_thread in pthread_create.c:454 [0xa3df9] in libc.so.6
+=========         Host Frame: __clone3 in clone3.S:78 [0x1375cb] in libc.so.6
+========= 
+========= Invalid __local__ write of size 4 bytes
+=========     at qxp_route+0x29e0 in default_program:919
+=========     by thread (31,0,0) in block (1,0,0)
+=========     Access to 0x10fff6ec is out of bounds
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367b2a] in libcuda.so.1
+=========         Host Frame: _RNvXs_NtNtCsjUjUiaO0REN_11cubecl_cuda7compute6driverNtB4_4CudaNtNtNtCslehXpE3g6fN_13cubecl_server7command7backend6Driver6launch in driver.rs:214 [0x23f84ed] in qx-prefill-check
+=========         Host Frame: _RNvMNtNtCslehXpE3g6fN_13cubecl_server7command4baseINtB2_7CommandNtNtNtCsjUjUiaO0REN_11cubecl_cuda7compute6driver4CudaE6kernelB16_ in base.rs:566 [0x234e693] in qx-prefill-check
+=========         Host Frame: _RNvMs2_NtNtCsjUjUiaO0REN_11cubecl_cuda7compute6serverNtB5_10CudaServer14launch_checked in server.rs:923 [0x23c09ea] in qx-prefill-check
+=========         Host Frame: _RINvMs_NtNtCslehXpE3g6fN_13cubecl_server6stream13execute_scopeINtB5_12ExecuteScopeNtNtNtCsjUjUiaO0REN_11cubecl_cuda7compute6server10CudaServerE7executeuNCNvXs_B1k_B1i_NtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6Server6launch0EB1o_ in execute_scope.rs:235 [0x234290e] in qx-prefill-check
+=========         Host Frame: _RNvXs_NtNtCsjUjUiaO0REN_11cubecl_cuda7compute6serverNtB4_10CudaServerNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6Server6launch in server.rs:240 [0x23cf6c9] in qx-prefill-check
+=========         Host Frame: _RINvMNtNtCsgHmFgXk2IyQ_18cubecl_environment6stream2idNtB3_8StreamId8executesNCNCNCINvMs_NtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channelNtB1o_19ChannelDeviceHandle12submit_innerNCINvMs0_B1q_INtB1q_12DeviceHandleDNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6ServerEL_E6submitNCNvMs3_NtB3D_6clientNtB4J_6Client12launch_inners0_0E0Kb0_E000uEB3D_ in id.rs:67 [0x544f55c] in qx-prefill-check
+=========         Host Frame: _RINvMs2_NtNtCs8ZKwes1zzDd_3std6thread5localINtB6_8LocalKeyINtNtCskADBYZwJmSU_4core4cell7RefCellINtNtCsV4ENBGx8Hr_9hashbrown3map7HashMapNtNtBZ_3any6TypeIdIBV_INtNtCsgFX3jaOk65H_5alloc5boxed3BoxDNtB2b_3AnyEL_EEEEE4withNCINvMs4_B6_BF_11with_borrowNCINvMs1_NtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channelNtB43_14ChannelService6act_onuNCNCINvMs_B43_NtB43_19ChannelDeviceHandle12submit_innerNCINvMs0_B45_INtB45_12DeviceHandleDNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6ServerEL_E6submitNCNvMs3_NtB70_6clientNtB86_6Client12launch_inners0_0E0Kb0_E00E0uE0uEB70_ in local.rs:427 [0x545726d] in qx-prefill-check
+=========         Host Frame: _RNvYNCINvMNtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel4taskNtB8_4Task4initNCINvMs_Ba_NtBa_19ChannelDeviceHandle12submit_innerNCINvMs0_Bc_INtBc_12DeviceHandleDNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6ServerEL_E6submitNCNvMs3_NtB2R_6clientNtB3X_6Client12launch_inners0_0E0Kb0_E0Es_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceTQB1a_EE9call_onceB2R_.llvm.8947875229982015077 in function.rs:250 [0x5428017] in qx-prefill-check
+=========         Host Frame: _RNvMs2_NtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel14custom_channelNtB5_6Server5start in channel.rs:1079 [0x58da0f9] in qx-prefill-check
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCINvMs_NtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel14custom_channelNtB1f_12DeviceClient3newNCNvMs2_B1h_NtB1h_12DeviceRunner5start0E0uEB1n_ in backtrace.rs:166 [0x58da968] in qx-prefill-check
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCINvMs_NtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel14custom_channelNtB1b_12DeviceClient3newNCNvMs2_B1d_NtB1d_12DeviceRunner5start0E0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1j_ in function.rs:250 [0x58d86b2] in qx-prefill-check
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start in unix.rs:123 [0x65d6018] in qx-prefill-check
+=========         Host Frame: start_thread in pthread_create.c:454 [0xa3df9] in libc.so.6
+=========         Host Frame: __clone3 in clone3.S:78 [0x1375cb] in libc.so.6
+========= 
+========= Invalid __local__ write of size 4 bytes
+=========     at qxp_route+0x29e0 in default_program:919
+=========     by thread (31,0,0) in block (6,0,0)
+=========     Access to 0x10fff6ec is out of bounds
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: cuLaunchKernel [0x367b2a] in libcuda.so.1
+=========         Host Frame: _RNvXs_NtNtCsjUjUiaO0REN_11cubecl_cuda7compute6driverNtB4_4CudaNtNtNtCslehXpE3g6fN_13cubecl_server7command7backend6Driver6launch in driver.rs:214 [0x23f84ed] in qx-prefill-check
+=========         Host Frame: _RNvMNtNtCslehXpE3g6fN_13cubecl_server7command4baseINtB2_7CommandNtNtNtCsjUjUiaO0REN_11cubecl_cuda7compute6driver4CudaE6kernelB16_ in base.rs:566 [0x234e693] in qx-prefill-check
+=========         Host Frame: _RNvMs2_NtNtCsjUjUiaO0REN_11cubecl_cuda7compute6serverNtB5_10CudaServer14launch_checked in server.rs:923 [0x23c09ea] in qx-prefill-check
+=========         Host Frame: _RINvMs_NtNtCslehXpE3g6fN_13cubecl_server6stream13execute_scopeINtB5_12ExecuteScopeNtNtNtCsjUjUiaO0REN_11cubecl_cuda7compute6server10CudaServerE7executeuNCNvXs_B1k_B1i_NtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6Server6launch0EB1o_ in execute_scope.rs:235 [0x234290e] in qx-prefill-check
+=========         Host Frame: _RNvXs_NtNtCsjUjUiaO0REN_11cubecl_cuda7compute6serverNtB4_10CudaServerNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6Server6launch in server.rs:240 [0x23cf6c9] in qx-prefill-check
+=========         Host Frame: _RINvMNtNtCsgHmFgXk2IyQ_18cubecl_environment6stream2idNtB3_8StreamId8executesNCNCNCINvMs_NtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channelNtB1o_19ChannelDeviceHandle12submit_innerNCINvMs0_B1q_INtB1q_12DeviceHandleDNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6ServerEL_E6submitNCNvMs3_NtB3D_6clientNtB4J_6Client12launch_inners0_0E0Kb0_E000uEB3D_ in id.rs:67 [0x544f55c] in qx-prefill-check
+=========         Host Frame: _RINvMs2_NtNtCs8ZKwes1zzDd_3std6thread5localINtB6_8LocalKeyINtNtCskADBYZwJmSU_4core4cell7RefCellINtNtCsV4ENBGx8Hr_9hashbrown3map7HashMapNtNtBZ_3any6TypeIdIBV_INtNtCsgFX3jaOk65H_5alloc5boxed3BoxDNtB2b_3AnyEL_EEEEE4withNCINvMs4_B6_BF_11with_borrowNCINvMs1_NtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channelNtB43_14ChannelService6act_onuNCNCINvMs_B43_NtB43_19ChannelDeviceHandle12submit_innerNCINvMs0_B45_INtB45_12DeviceHandleDNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6ServerEL_E6submitNCNvMs3_NtB70_6clientNtB86_6Client12launch_inners0_0E0Kb0_E00E0uE0uEB70_ in local.rs:427 [0x545726d] in qx-prefill-check
+=========         Host Frame: _RNvYNCINvMNtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel4taskNtB8_4Task4initNCINvMs_Ba_NtBa_19ChannelDeviceHandle12submit_innerNCINvMs0_Bc_INtBc_12DeviceHandleDNtNtNtCscwDfuqy5nAt_14cubecl_runtime6server4base6ServerEL_E6submitNCNvMs3_NtB2R_6clientNtB3X_6Client12launch_inners0_0E0Kb0_E0Es_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceTQB1a_EE9call_onceB2R_.llvm.8947875229982015077 in function.rs:250 [0x5428017] in qx-prefill-check
+=========         Host Frame: _RNvMs2_NtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel14custom_channelNtB5_6Server5start in channel.rs:1079 [0x58da0f9] in qx-prefill-check
+=========         Host Frame: _RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCINvMs_NtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel14custom_channelNtB1f_12DeviceClient3newNCNvMs2_B1h_NtB1h_12DeviceRunner5start0E0uEB1n_ in backtrace.rs:166 [0x58da968] in qx-prefill-check
+=========         Host Frame: _RNSNvYNCINvNtNtCs8ZKwes1zzDd_3std6thread9lifecycle15spawn_uncheckedNCINvMs_NtNtNtNtCs38pNEAU7sUh_13cubecl_common6device6handle7channel14custom_channelNtB1b_12DeviceClient3newNCNvMs2_B1d_NtB1d_12DeviceRunner5start0E0uEs_0INtNtNtCskADBYZwJmSU_4core3ops8function6FnOnceuE9call_once6vtableB1j_ in function.rs:250 [0x58d86b2] in qx-prefill-check
+=========         Host Frame: _RNvNvMs0_NtNtNtCs8ZKwes1zzDd_3std3sys6thread4unixNtB7_6Thread3new12thread_start in unix.rs:123 [0x65d6018] in qx-prefill-check
+=========         Host Frame: start_thread in pthread_create.c:454 [0xa3df9] in libc.so.6
+=========         Host Frame: __clone3 in clone3.S:78 [0x1375cb] in libc.so.6
+========= 
+exit 124
