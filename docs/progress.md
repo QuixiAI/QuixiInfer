@@ -557,6 +557,20 @@ Decode right after a 1k-token prefill: 95 tok/s (token-by-token prompt: 103), 90
   With 2,12 (4.799, 77.7%) and 2,16 (4.989, 86.1%) from before, the frontier is 6,16 (2,12's cost, 5 points more
   hits) and 3,16 (2,16's hits at two thirds of its cost); keeping more true experts and widening M beats keeping 2.
 
+  Throughput, `qx-batch-bench p100k.tokens 256 96 1,4,8,16` (auto split, production cache, win10 VM up, all five
+  in one sitting), tok/s and hit rate at B = 1 / 4 / 8 / 16:
+
+| `QX_ROUTE_CACHE` | tok/s | hits % |
+|---|---|---|
+| off | 64.6 / 132.3 / 160.4 / 134.0 | 76 / 80 / 78 / 73 |
+| 2,12 | 73.1 / 145.5 / 189.0 / 204.4 | 85 / 85 / 84 / 83 |
+| 6,16 | 77.6 / 160.0 / 204.9 / 241.4 | 88 / 88 / 86 / 86 |
+| 3,16 | 81.3 / 165.6 / 237.9 / 296.0 | 92 / 89 / 91 / 91 |
+| 2,16 | 80.0 / 173.6 / 242.3 / 300.5 | 93 / 92 / 91 / 91 |
+
+  3,16 matches 2,16 within noise at B >= 8 (+48% / +121% over off) for less quality cost; 6,16 beats 2,12 at the
+  same cost. The bench's hit rates run above `qx-ppl`'s (long decodes of one text per slot).
+
 ## Not yet
 
 - Admission without a GPU sync (`begin_seq`'s reset and uploads wait for the queued step: about 6% at c=16);
