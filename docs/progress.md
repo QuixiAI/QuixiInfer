@@ -514,6 +514,49 @@ Decode right after a 1k-token prefill: 95 tok/s (token-by-token prompt: 103), 90
     186.2 / 208.6; 2,16 79.8 / 145.9 / 214.1 / 298.7. Misses per step at B=16: 2,055 -> 1,383 -> 743.
   - Not in production: it trades accuracy for speed, a decision for the operator.
 
+- **Why cache-aware routing gained nothing at B=4 (2026-10-27).** It does cut the misses there (warm: 248 -> 191 per
+  step, pool 13.5 -> 10.4 ms), but the split B=4 step is GPU-bound: 27 ms against 10-14 ms of pool time, because two
+  halves of 2 tokens read every dense weight twice. `qx-batch-bench` 4,4,4,8 (third B=4 run, warm; win10 VM up):
+
+| | split | not split |
+|---|---|---|
+| exact routing, B=4 | 148.2 tok/s (27.0 ms) | 162.6 (24.6 ms) |
+| 2,12, B=4 | 149.3 (26.8 ms) | 190.5 (21.0 ms) |
+| exact routing, B=8 | 163.1 (49.1 ms) | 150.5 (53.1 ms) |
+| 2,12, B=8 | 196.6 (40.7 ms) | 202.4 (39.5 ms) |
+
+  The split pays only while the pool's time exceeds the halves' GPU time; with a warm cache at B=4, or with
+  cache-aware routing at B=8, it costs. The earlier B=4 gain (+4%) was with a colder cache. Next: choose split per
+  width from measured step times instead of a fixed `QX_SPLIT`.
+
+- **Split chosen per width by measurement (2026-10-28).** `QX_SPLIT` defaults to `auto` (`SplitAuto`): each width
+  runs blocks of 8 windows in one mode, the first interval of a block dropped (the async pipeline still holds the
+  other mode's window) and intervals over 2x the estimate (3x the other mode's, for a fresh one) dropped as other
+  work; the faster mode runs and the other gets a fresh block after 4 blocks, the gap doubling to 32 while it keeps
+  losing. `QX_SPLIT=N` forces the split from N tokens, 0 never; `QX_SPLIT_DEBUG` traces the choices.
+  - `qx-batch-bench` with `QX_ROUTE_CACHE=2,12` (win10 VM up, runs noisy as hit rates vary): B=4 warm auto 172.6 /
+    150.6 against always-split 148.5 / 148.4 and never 161.2 / 157.8; B=16 auto 216.6 / 227.0, split 240.8 / 228.8,
+    never 186.0 / 192.4. `qx-batch-check` (8 slots, `QX_TMV=0`): 0 rows differ.
+  - Server (production layout, exact routing, VM up): 53.0 / 92.2 / 95.1 / 93.6 tok/s at c=1/4/8/16 against
+    54.2 / 90.0 / 95.2 / 90.1 with the fixed split. Deployed.
+
+- **Cache-aware routing, more settings (2026-10-28).** `qx-ppl` as before (one run each, about +-1 point of hit
+  rate run to run; win10 VM up):
+
+| `QX_ROUTE_CACHE` | ppl | hit rate | KL from exact | same top-1 |
+|---|---|---|---|---|
+| off | 4.670 | 70.7% | | |
+| 8,32 | 4.808 (+3.0%) | 78.7% | 4.8e-2 | 91.9% |
+| **6,16** | 4.812 (+3.0%) | 82.6% | 6.9e-2 | 91.1% |
+| 6,20 | 4.891 (+4.7%) | 84.2% | 7.5e-2 | 90.9% |
+| 3,14 | 4.905 (+5.0%) | 83.7% | 8.9e-2 | 89.8% |
+| **3,16** | 4.891 (+4.7%) | 86.6% | 1.13e-1 | 89.2% |
+| 4,16 | 4.911 (+5.2%) | 85.6% | 9.7e-2 | 89.5% |
+| 2,14 | 4.943 (+5.8%) | 84.1% | 1.04e-1 | 89.3% |
+
+  With 2,12 (4.799, 77.7%) and 2,16 (4.989, 86.1%) from before, the frontier is 6,16 (2,12's cost, 5 points more
+  hits) and 3,16 (2,16's hits at two thirds of its cost); keeping more true experts and widening M beats keeping 2.
+
 ## Not yet
 
 - Admission without a GPU sync (`begin_seq`'s reset and uploads wait for the queued step: about 6% at c=16);

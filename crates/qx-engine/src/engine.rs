@@ -134,11 +134,99 @@ struct Half {
     words: DeviceBuf,
 }
 
-/// The narrowest window of several sequences that runs split in two halves (`Engine::launch_split`), each half's
-/// GPU work overlapping the other's CPU experts (`QX_SPLIT`, default 4; above TMAX: never).
+/// The narrowest window of several sequences that may run split in two halves (`Engine::launch_split`), each
+/// half's GPU work overlapping the other's CPU experts, and whether it always does. `QX_SPLIT` unset or `auto`:
+/// from 4 tokens, chosen per width by measured step times (`SplitAuto`); N: always from N tokens; 0: never.
+fn split_policy() -> (usize, bool) {
+    static U: std::sync::OnceLock<(usize, bool)> = std::sync::OnceLock::new();
+    *U.get_or_init(|| match std::env::var("QX_SPLIT").ok().filter(|v| v != "auto").and_then(|s| s.parse::<usize>().ok()) {
+        None => (4, false),
+        Some(0) => (usize::MAX, true),
+        Some(v) => (v.max(2), true),
+    })
+}
+
 fn split_min() -> usize {
-    static U: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *U.get_or_init(|| std::env::var("QX_SPLIT").ok().and_then(|s| s.parse().ok()).map_or(4, |v: usize| if v == 0 { usize::MAX } else { v.max(2) }))
+    split_policy().0
+}
+
+/// Whether to split, per window width, from step times measured in blocks: each block runs `BLOCK` windows of one
+/// mode, its first interval dropped (the pipeline still holds the other mode's window). The faster mode runs, and
+/// the other gets a fresh block (its estimate restarted) after 4 blocks, then after twice as many each time it
+/// loses again, up to 32: the cache warms and the traffic changes, so an old estimate is stale.
+#[derive(Default)]
+struct SplitAuto {
+    w: Vec<SplitWidth>,
+    /// The previous window: its width, mode and when it was queued.
+    last: Option<(usize, bool, std::time::Instant)>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SplitWidth {
+    /// Estimated step seconds and samples, unsplit and split.
+    est: [(f64, u32); 2],
+    /// The current block's mode and windows left; the next interval is the block's first.
+    mode: bool,
+    left: u32,
+    first: bool,
+    /// The current block re-measures the losing mode; winner blocks until the next re-check, and the gap.
+    recheck: bool,
+    until: u32,
+    gap: u32,
+}
+
+impl SplitAuto {
+    const BLOCK: u32 = 8;
+
+    /// Records the interval since the previous window (when it was of width t) and picks the mode for this one.
+    fn pick(&mut self, t: usize) -> bool {
+        if self.w.len() <= t {
+            self.w.resize(t + 1, SplitWidth { gap: 4, ..Default::default() });
+        }
+        let now = std::time::Instant::now();
+        let w = &mut self.w[t];
+        if let Some((pt, pm, at)) = self.last {
+            let first = std::mem::replace(&mut w.first, false);
+            if pt == t && !first {
+                let x = now.duration_since(at).as_secs_f64();
+                let (o, on) = w.est[!pm as usize];
+                let (e, n) = &mut w.est[pm as usize];
+                // an interval with other work in it (admission, a prompt chunk) is no step time
+                if (*n >= 2 && x < 2.0 * *e) || (*n < 2 && (on == 0 || x < 3.0 * o)) {
+                    *e = if *n == 0 { x } else { 0.8 * *e + 0.2 * x };
+                    *n += 1;
+                }
+            }
+        }
+        if w.left == 0 {
+            let best = w.est[1].0 < w.est[0].0;
+            if w.recheck {
+                // the re-measured mode won: it runs from now on, rechecked soon; lost: the next check waits longer
+                w.gap = if best == w.mode { 4 } else { (2 * w.gap).min(32) };
+                w.recheck = false;
+                w.until = w.gap;
+            }
+            let want = if w.est[0].1 == 0 || w.est[1].1 == 0 {
+                w.est[0].1 > 0
+            } else if w.until == 0 {
+                w.recheck = true;
+                w.est[!best as usize] = (0.0, 0);
+                !best
+            } else {
+                w.until -= 1;
+                best
+            };
+            if std::env::var("QX_SPLIT_DEBUG").is_ok() {
+                eprintln!("split t={t}: unsplit {:.2} ms, split {:.2} ms -> {}{}", 1e3 * w.est[0].0, 1e3 * w.est[1].0, if want { "split" } else { "unsplit" }, if w.recheck { " (recheck)" } else { "" });
+            }
+            w.first = want != w.mode;
+            w.mode = want;
+            w.left = Self::BLOCK;
+        }
+        w.left -= 1;
+        self.last = Some((t, w.mode, now));
+        w.mode
+    }
 }
 
 /// Cache-aware routing (`QX_ROUTE_CACHE=J,M`, off by default; lossy): each token keeps its top J experts and fills
@@ -318,6 +406,7 @@ pub struct Engine<'a> {
     half: std::cell::Cell<usize>,
     /// The last window's first half when it ran split (0: it did not), for its samples and logits.
     last_split: std::cell::Cell<usize>,
+    split_auto: std::cell::RefCell<SplitAuto>,
     // Field order is drop order: the driver thread reads the cache and the host experts, so it goes first.
     driver: Driver,
     pub cache: ExpertCache,
@@ -860,7 +949,7 @@ impl<'a> Engine<'a> {
         let step = DeviceBuf::new(ns * STEP_ROW * 4);
         let ctx = DeviceBuf::new(ns * (max_ctx + 1) * 4);
         let sample = DeviceBuf::new(ns * 32);
-        Ok(Self { cache, host, driver, step, ctx, sample, route_stats: false, route_counts, route_hits: Default::default(), route_total: Default::default(), route_trace: Default::default(), embd, output, head, layers, groups, head_hc, head_out, state, s, half2, half: Default::default(), last_split: Default::default(), split_graphs: (0..=TMAX).map(|_| None).collect(), gpu, cfg, kv_window: window, graph: None, win_graphs: (0..=TMAX).map(|_| None).collect(), batch_graphs: (0..=WMAX).map(|_| None).collect(), max_ctx, pos: 0, tokens: Vec::new(), prefill, prefill_alt, prefill_big: false, stage_ready: Default::default(), prefill_feeds_cache: true, drafter, spec_prof: std::cell::RefCell::new([0.0; 24]), spec: !std::env::var("QX_SPEC").is_ok_and(|v| v == "0"), prefix: std::cell::RefCell::new(prefix_cache), kv: std::cell::RefCell::new(kvp), slots: ns, cur: 0, seqs: vec![SeqHost::default(); ns], strides, masks, lanes: qx_gpu::mem::HostMapped::new(LANE_RING * TMAX * 4 + 64), lane_n: Default::default(), draft_slot: None, snapshot_prefill: false, lend, lent: std::cell::Cell::new(false), keep_lent: false })
+        Ok(Self { cache, host, driver, step, ctx, sample, route_stats: false, route_counts, route_hits: Default::default(), route_total: Default::default(), route_trace: Default::default(), embd, output, head, layers, groups, head_hc, head_out, state, s, half2, half: Default::default(), last_split: Default::default(), split_auto: Default::default(), split_graphs: (0..=TMAX).map(|_| None).collect(), gpu, cfg, kv_window: window, graph: None, win_graphs: (0..=TMAX).map(|_| None).collect(), batch_graphs: (0..=WMAX).map(|_| None).collect(), max_ctx, pos: 0, tokens: Vec::new(), prefill, prefill_alt, prefill_big: false, stage_ready: Default::default(), prefill_feeds_cache: true, drafter, spec_prof: std::cell::RefCell::new([0.0; 24]), spec: !std::env::var("QX_SPEC").is_ok_and(|v| v == "0"), prefix: std::cell::RefCell::new(prefix_cache), kv: std::cell::RefCell::new(kvp), slots: ns, cur: 0, seqs: vec![SeqHost::default(); ns], strides, masks, lanes: qx_gpu::mem::HostMapped::new(LANE_RING * TMAX * 4 + 64), lane_n: Default::default(), draft_slot: None, snapshot_prefill: false, lend, lent: std::cell::Cell::new(false), keep_lent: false })
     }
 
     fn k(&self, entry: &'static str, threads: u32, grid: (u32, u32, u32), info: &[u64]) {
@@ -1970,7 +2059,11 @@ impl<'a> Engine<'a> {
         }
         // split in two halves of whole segments, the first ceil(t / 2) tokens
         let ta = t.div_ceil(2);
-        let split = self.half2.is_some() && segs.len() > 1 && t >= split_min() && segs.iter().scan(0, |n, s| { *n += s.1; Some(*n) }).any(|n| n == ta);
+        let can = self.half2.is_some() && segs.len() > 1 && t >= split_min() && segs.iter().scan(0, |n, s| { *n += s.1; Some(*n) }).any(|n| n == ta);
+        let split = can && (split_policy().1 || self.split_auto.borrow_mut().pick(t));
+        if !can {
+            self.split_auto.borrow_mut().last = None;
+        }
         if split {
             self.queue_lanes(&lanes);
             ops::TMV_BATCHED.store(true, Ordering::Relaxed);

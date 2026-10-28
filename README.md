@@ -184,7 +184,7 @@ Stop the service before benchmarking: two engines cannot both pin the experts.
 | `QX_POOL_CPUS` | CPU expert pool threads: a count or a CPU list. Physical cores are faster than SMT siblings. |
 | `QX_PLE_CACHE_ROWS` | Rows of the PLE n-gram table cached in RAM. |
 | `QX_PREFILL_CHUNK` | Prompt tokens per prefill chunk (default and maximum 2048). |
-| `QX_SPLIT` | Smallest batch that runs as two interleaved halves (default 4; 0 turns it off). |
+| `QX_SPLIT` | Batches of several sequences may run as two interleaved halves. `auto` (the default): from 4 tokens, split or not per batch width, whichever measures faster. `N`: always split from N tokens. `0`: never. |
 | `QX_ROUTE_CACHE=J,M` | Experimental and lossy, off by default. Cache-aware routing: each token keeps its top J experts and fills the rest of its 10 from its top M, preferring experts already in VRAM. Measured: `2,12` gives +24% at 8 users and +49% at 16 for +2.8% perplexity; `2,16` gives +43% / +113% for +6.8% ([docs/progress.md](docs/progress.md)). |
 | `QX_HALF_LIFE`, `QX_SWAPS` | The expert swapper's routing-score half-life (tokens) and swaps per token. |
 | `QX_MODEL` | Model path for the tools: a pack or a GGUF. |
