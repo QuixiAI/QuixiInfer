@@ -62,7 +62,7 @@ fn load(args: &[String]) -> Result<(mpsc::Sender<Job>, &'static qx_tok::Tok, cha
         };
         let slots: usize = arg(args, "--slots").map(|s| s.parse()).transpose()?.unwrap_or(2);
         eprintln!("quixiinfer: loading DeepSeek-V4.1-Flash (context {ctx}, {slots} slots, prompt windows of {window}, tiers ranked by {})", profile.as_deref().unwrap_or("layer order"));
-        let opt = worker_ds::Options { max_ctx: ctx, window, slots, pack: pack.into(), vram_gib: gib("QX_DS_VRAM", "--vram-gib", 21.0)?, ram_gib: gib("QX_DS_RAM", "--ram-gib", 88.0)?, profile: profile.map(Into::into), profile_out: profile_out.map(Into::into) };
+        let opt = worker_ds::Options { max_ctx: ctx, window, slots, pack: pack.into(), vram_gib: gib("QX_DS_VRAM", "--vram-gib", 21.0)?, ram_gib: gib("QX_DS_RAM", "--ram-gib", 100.0)?, profile: profile.map(Into::into), profile_out: profile_out.map(Into::into) };
         let jobs = worker_ds::start(g, tok, opt)?;
         return Ok((jobs, tok, tpl, ctx));
     }

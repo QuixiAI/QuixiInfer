@@ -866,6 +866,14 @@ Decode right after a 1k-token prefill: 95 tok/s (token-by-token prompt: 103), 90
     request returned `{"name": "Tokyo", "population": 37114000, "country": "Japan"}`, a regex-guided completion
     `1969-07-20`. A start finding the `--profile-out` file loads the tiers from it;
     `tools/quixiinfer-deepseek.service.example` is a user unit with the memory cap.
+  - **Several requests at once.** The engine has sequence slots (per-slot rings, compressed stores, pending
+    pairs, positions, tokens and latent histories; a window is segments from several slots, the kernels index the
+    slot tables per token; single-step logits unchanged, 128/128), and `worker_ds` batches continuously: a token
+    per decoding slot plus prompt chunks in the rest of each window, host sampling per request, prefix reuse per
+    slot. Three concurrent requests on 3 slots answer correctly and identically across rounds, with a JSON
+    constraint mixed in; per-request decode 5-12 tok/s cold, 14-16 warm. The RAM tier default is now 100 GiB (the
+    server runs alone: 13 GB stay available on the 120 GiB box; `MemoryMax=118G`). Lesson: after stopping a
+    server, CUDA's teardown of the pinned mappings holds the VRAM for 10-30 s; the next job must wait for it.
 
 ## Not yet
 

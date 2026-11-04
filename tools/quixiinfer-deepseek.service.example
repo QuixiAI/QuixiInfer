@@ -12,9 +12,9 @@ Environment=QX_DS_PROMOS=32
 ExecStart=/home/eric/git/QuixiInfer/target/release/quixiinfer serve \
   --model /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
   --pack  /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp \
-  --ctx 32768 --port 8000 --vram-gib 21 --ram-gib 88 \
+  --ctx 32768 --port 8000 --vram-gib 21 --ram-gib 100 \
   --profile /home/eric/git/QuixiInfer/golden/profile-dsv41.txt --profile-out %h/.cache/quixiinfer-deepseek-profile.txt
-MemoryMax=112G
+MemoryMax=118G
 MemorySwapMax=0
 LimitMEMLOCK=infinity
 Restart=on-failure

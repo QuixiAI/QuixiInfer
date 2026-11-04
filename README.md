@@ -176,7 +176,8 @@ Stop the service before benchmarking: two engines cannot both pin the experts.
 
 The same binary serves [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)
 at UD-IQ2_XXS (284 B parameters, 280 GiB of weights) on the same machine, with the experts in three tiers: about
-21 GiB in VRAM, about 88 GiB pinned in RAM, the rest read from the pack on NVMe as routed. Decode runs at about
+21 GiB in VRAM, about 100 GiB pinned in RAM (the server is meant to run alone on the box; about 13 GiB stay free
+for the system), the rest read from the pack on NVMe as routed. Decode runs at about
 30 tokens/s, prompts at 45-50 tokens/s, one request at a time; a request sharing a prefix with the previous one
 continues from it. See `docs/deepseek41-plan.md` and `docs/progress.md`.
 
@@ -186,10 +187,10 @@ target/release/qx-pack pack   DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006
 target/release/qx-pack verify DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf
 
 # serve: the engine is chosen by the GGUF's architecture; cap the memory, the tiers pin most of the RAM
-systemd-run --user --scope -p MemoryMax=112G -p MemorySwapMax=0 -- \
+systemd-run --user --scope -p MemoryMax=118G -p MemorySwapMax=0 -- \
   target/release/quixiinfer serve --model DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
   --pack DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp --ctx 32768 --port 8000 \
-  --vram-gib 21 --ram-gib 88 --profile golden/profile-dsv41.txt --profile-out live-profile.txt
+  --vram-gib 21 --ram-gib 100 --profile golden/profile-dsv41.txt --profile-out live-profile.txt
 ```
 
 `--profile` ranks the experts the tiers are filled with at start (`golden/profile-dsv41.txt` comes from a routing
