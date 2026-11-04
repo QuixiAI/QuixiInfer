@@ -190,7 +190,8 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             let t0 = std::time::Instant::now();
             // one token per decoding slot, and the prompt chunk widths up to `window`
             let mut widths: Vec<usize> = (1..=eng.slots.min(4)).collect();
-            widths.extend(WIDTHS.iter().copied().filter(|&w| w >= 8 && w <= window && !widths.contains(&w)));
+            let chunks: Vec<usize> = WIDTHS.iter().copied().filter(|&w| w >= 8 && w <= window && !widths.contains(&w)).collect();
+            widths.extend(chunks);
             if !widths.contains(&window) {
                 widths.push(window);
             }
