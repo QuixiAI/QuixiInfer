@@ -253,6 +253,8 @@ pub struct DsEngine<'a> {
     /// Seconds in the last forward: all, experts (pool + GPU experts), the host's Engram row gather.
     pub t_forward: f64,
     pub t_engram: f64,
+    /// Phases of the last forward, seconds: uploads, launch or replay, device wait, history flush, download.
+    pub t_phase: [f64; 5],
     pub t_experts: f64,
 }
 
@@ -718,6 +720,7 @@ impl<'a> DsEngine<'a> {
             hist_flushed: vec![0; slots],
             graphs: (0..=DS_TMAX).map(|_| None).collect(),
             t_engram: 0.0,
+            t_phase: [0.0; 5],
             t_forward: 0.0,
             t_experts: 0.0,
             cfg,
@@ -1132,9 +1135,11 @@ impl<'a> DsEngine<'a> {
         }
         let pos_min = positions.iter().copied().min().unwrap() as usize;
         let pos_max = positions.iter().copied().max().unwrap() as usize;
+        let tp = std::time::Instant::now();
         self.s.tok.upload(&ids);
         self.s.pos.upload(&positions);
         self.s.slot.upload(&slots_v);
+        self.t_phase[0] = tp.elapsed().as_secs_f64();
         // the Engram rows of every Engram layer and token, gathered on the host into the mapped regions
         // (region ei holds token n's rows at n * cols * dim) before any launch
         let c = &self.cfg;
@@ -1189,6 +1194,7 @@ impl<'a> DsEngine<'a> {
         // (the grids that depend on the context are sized from the maximum; the kernels bound by position). The
         // first eligible window of a width runs eagerly (the warm-up the capture needs), then is recorded without
         // running: prepare, eager run and recording stay together, as CubeCL keeps one prepared capture per stream.
+        let tp = std::time::Instant::now();
         let max_ratio = c.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
         let eligible = self.driver.is_some() && act.is_none() && pos_min + 1 >= max_ratio && !std::env::var("QX_GRAPH").is_ok_and(|v| v == "0") && std::env::var("QX_DS_SYNC").is_err() && std::env::var("QX_DS_TRACE").is_err();
         if !eligible {
@@ -1207,8 +1213,12 @@ impl<'a> DsEngine<'a> {
             }
             self.graphs[t] = Some(g);
         }
+        self.t_phase[1] = tp.elapsed().as_secs_f64();
+        let tp = std::time::Instant::now();
         let gpu = &self.gpu;
         gpu.sync();
+        self.t_phase[2] = tp.elapsed().as_secs_f64();
+        let tp = std::time::Instant::now();
         for sl in 0..self.slots {
             if counted[sl] > 0 {
                 self.st.pos[sl] += counted[sl];
@@ -1217,12 +1227,16 @@ impl<'a> DsEngine<'a> {
                 }
             }
         }
+        self.t_phase[3] = tp.elapsed().as_secs_f64();
         if let Some(d) = &self.driver {
             d.shared.tokens_done.fetch_add(t as u64, std::sync::atomic::Ordering::Release);
         }
         self.adapt().expect("tier promotions");
+        let tp = std::time::Instant::now();
+        let out = self.s.logits.download(self.cfg.n_vocab * t);
+        self.t_phase[4] = tp.elapsed().as_secs_f64();
         self.t_forward = tf.elapsed().as_secs_f64();
-        self.s.logits.download(self.cfg.n_vocab * t)
+        out
     }
 
     /// Queues a window's launches (everything between the uploads and the final sync): `t` tokens whose

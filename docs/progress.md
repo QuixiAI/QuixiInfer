@@ -887,6 +887,16 @@ Decode right after a 1k-token prefill: 95 tok/s (token-by-token prompt: 103), 90
     against 13.7 at a short context: about 10 of the 53 ms per token at 16k are GPU-side context growth, the
     rest the pool; being profiled (the difference of two profiles, with and without the 64-step tail).
     `tools/ds-checks.sh` first run: every number reproduced in 3 minutes.
+  - Correction: the decode-tail numbers above were capture-dominated. A step's phases (uploads, launch or
+    replay, device wait, history flush, download) show the first single step after the windows costing 872 ms
+    (CubeCL's prepare, eager run and capture of the width-1 graph: about 0.5 ms per launch while the info cache
+    fills) and every later step 13.1 ms with a 0.01 ms replay, at 1k and at 16k alike. So the GPU-only decode
+    step does not grow with the context, and the full-decode slowdown at 16k is the pool's (the VRAM share
+    drifting through the corpus). What does matter: **each new window width costs about 0.9 s on first use**, and
+    the batching worker was producing arbitrary widths (decoders plus a prompt remainder). The widths now come
+    from a fixed set (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128: the decoders, then prompt tokens up to the
+    largest width the prompts can fill), the warm-up captures one token per decoding slot and the prompt chunk,
+    and the scheduler statistics print the width histogram.
 
 ## Not yet
 

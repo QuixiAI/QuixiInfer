@@ -71,6 +71,11 @@ pub fn sample(logits: &[f32], sp: &Sampling, pos: usize) -> u32 {
     cand[keep - 1].1
 }
 
+/// Window widths a step may use: capturing a width's graph costs about a second the first time, so the steps
+/// draw from this set (the decoders, then prompt tokens up to the largest width the prompts can fill) and the
+/// warm-up captures the common ones.
+const WIDTHS: [usize; 14] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128];
+
 pub struct Options {
     pub max_ctx: usize,
     /// Tokens per prompt chunk (at most DS_TMAX).
@@ -179,19 +184,26 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 None
             }
         };
-        // warm-up: the kernels' first compilation and the graph captures for the window widths in use
+        // warm-up: the kernels' first compilation and the graph captures of the common widths (one token per
+        // decoding slot, and the prompt chunk); the other widths of WIDTHS are captured on first use
         {
             let t0 = std::time::Instant::now();
-            let toks = vec![0u32; window + 3];
-            for _ in 0..2 {
-                eng.reset(0);
-                let _ = eng.forward_window(&toks[..window], None);
-                let _ = eng.forward_window(&toks[window..window + 1], None);
-                let _ = eng.forward_window(&toks[window + 1..], None);
+            // one token per decoding slot, and the prompt chunk widths up to `window`
+            let mut widths: Vec<usize> = (1..=eng.slots.min(4)).collect();
+            widths.extend(WIDTHS.iter().copied().filter(|&w| w >= 8 && w <= window && !widths.contains(&w)));
+            if !widths.contains(&window) {
+                widths.push(window);
+            }
+            let toks = vec![0u32; 2 * DS_TMAX];
+            eng.reset(0);
+            let _ = eng.forward_window(&toks[..2], None); // positions 0-1: the stores' first rows, before any capture
+            for &w in &widths {
+                let _ = eng.forward_window(&toks[..w], None);
             }
             eng.reset(0);
-            eprintln!("quixiinfer: warm-up {:.1}s", t0.elapsed().as_secs_f64());
+            eprintln!("quixiinfer: warm-up {:.1}s (graphs for windows of {widths:?})", t0.elapsed().as_secs_f64());
         }
+        let mut width_hist: std::collections::BTreeMap<usize, usize> = Default::default();
         let prefix_on = !std::env::var("QX_DS_PREFIX").is_ok_and(|v| v == "0");
         let stats = std::env::var("QX_SCHED_STATS").is_ok();
         let group = eng.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
@@ -248,7 +260,8 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             if running.is_empty() {
                 continue;
             }
-            // the window: decoders first (one token each), then prompt chunks in what is left
+            // the window: decoders first (one token each), then prompt tokens up to the largest width of WIDTHS
+            // the prompts can fill (at most `window` per prompt)
             let mut segs: Vec<(usize, u32)> = Vec::new();
             let mut plan: Vec<(usize, usize, bool)> = Vec::new(); // (request index, tokens, completes the prompt or decodes)
             for (ri, r) in running.iter().enumerate() {
@@ -257,16 +270,26 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     plan.push((ri, 1, true));
                 }
             }
+            let d = segs.len();
+            let avail: usize = running.iter().filter(|r| r.next.is_none() && r.read < r.job.prompt.len()).map(|r| (r.job.prompt.len() - r.read).min(window)).sum();
+            let need = (d + avail).min(DS_TMAX);
+            let width = WIDTHS.iter().copied().filter(|&w| w <= need && w <= DS_TMAX).max().unwrap_or(d).max(d);
+            let mut room = width - d;
             for (ri, r) in running.iter().enumerate() {
-                if r.next.is_none() && r.read < r.job.prompt.len() && segs.len() < DS_TMAX {
-                    let n = (r.job.prompt.len() - r.read).min(window).min(DS_TMAX - segs.len());
+                if room == 0 {
+                    break;
+                }
+                if r.next.is_none() && r.read < r.job.prompt.len() {
+                    let n = (r.job.prompt.len() - r.read).min(window).min(room);
                     segs.extend(r.job.prompt[r.read..r.read + n].iter().map(|&t| (r.slot, t)));
                     plan.push((ri, n, r.read + n == r.job.prompt.len()));
+                    room -= n;
                 }
             }
             if segs.is_empty() {
                 continue;
             }
+            *width_hist.entry(segs.len()).or_default() += 1;
             let out = eng.forward_segments(&segs, None);
             steps += 1;
             let mut row = 0;
@@ -326,8 +349,8 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     i += 1;
                 }
             }
-            if stats && steps % 200 == 0 {
-                eprintln!("sched: {steps} steps, {} running, {} waiting", running.len(), waiting.len());
+            if stats && (steps % 200 == 0 || running.is_empty()) {
+                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}", running.len(), waiting.len(), width_hist);
             }
             if let Some(path) = &opt.profile_out {
                 if running.is_empty() && last_save.is_none_or(|t| t.elapsed().as_secs() >= 60) {

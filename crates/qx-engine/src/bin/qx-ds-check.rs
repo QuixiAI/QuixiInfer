@@ -65,6 +65,7 @@ fn main() -> anyhow::Result<()> {
         let mut out_toks = Vec::new();
         let (mut t_all, mut t_exp, mut t_eng) = (0f64, 0f64, 0f64);
         let mut per_tok: Vec<f64> = Vec::new();
+        let mut phases: Vec<[f64; 5]> = Vec::new();
         let mut nan_seen = false;
         let total = toks.len() + n_gen;
         // QX_DS_DUMP_LOGITS=path: every position's logits (f32 LE rows) for comparisons across modes
@@ -81,6 +82,8 @@ fn main() -> anyhow::Result<()> {
             // QX_DS_TAIL=N: the last N tokens one at a time (decode at the long context the windows built)
             let tail = std::env::var("QX_DS_TAIL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(toks.len() - 1);
             let mut tail_times: Vec<f64> = Vec::new();
+            let mut tail_phase = [0f64; 5];
+            let mut tail_engram = 0f64;
             let mut p = 0;
             while p < toks.len() {
                 let cap = if p >= toks.len() - tail { 1 } else { window.min(toks.len() - tail - p) };
@@ -99,7 +102,14 @@ fn main() -> anyhow::Result<()> {
                 t_eng += eng.t_engram;
                 per_tok.extend(std::iter::repeat(eng.t_forward / w.len() as f64).take(w.len()));
                 if w.len() == 1 && tail > 0 {
+                    if tail_times.len() < 4 {
+                        eprintln!("  tail step {} at {}: {:.1} ms (uploads {:.2}, launch/replay {:.2}, wait {:.2}, flush {:.2}, download {:.2})", tail_times.len(), p, eng.t_forward * 1e3, eng.t_phase[0] * 1e3, eng.t_phase[1] * 1e3, eng.t_phase[2] * 1e3, eng.t_phase[3] * 1e3, eng.t_phase[4] * 1e3);
+                    }
                     tail_times.push(eng.t_forward);
+                    for (i, v) in eng.t_phase.iter().enumerate() {
+                        tail_phase[i] += v;
+                    }
+                    tail_engram += eng.t_engram;
                 }
                 p += w.len();
                 if (p / window) % 4 == 0 && w.len() > 1 || p == toks.len() {
@@ -114,6 +124,8 @@ fn main() -> anyhow::Result<()> {
             if !tail_times.is_empty() {
                 let m = tail_times.iter().sum::<f64>() * 1e3 / tail_times.len() as f64;
                 println!("decode tail of {} single steps at position {}+: {:.1} ms per token ({:.1} tok/s)", tail_times.len(), toks.len() - tail_times.len(), m, 1e3 / m);
+                let k = tail_times.len() as f64 / 1e3;
+                println!("  phases per step: engram {:.2} ms, uploads {:.2}, launch/replay {:.2}, device wait {:.2}, history flush {:.2}, logits download {:.2}", tail_engram / k, tail_phase[0] / k, tail_phase[1] / k, tail_phase[2] / k, tail_phase[3] / k, tail_phase[4] / k);
             }
             return Ok(());
         }
@@ -142,6 +154,7 @@ fn main() -> anyhow::Result<()> {
                 t_exp += eng.t_experts;
                 t_eng += eng.t_engram;
                 per_tok.push(eng.t_forward);
+                phases.push(eng.t_phase);
                 out_toks.push(next);
             }
             tok = if p + 1 < toks.len() { toks[p + 1] } else { next };
@@ -153,6 +166,11 @@ fn main() -> anyhow::Result<()> {
         let last = &per_tok[per_tok.len().saturating_sub(32)..];
         let last_ms = last.iter().sum::<f64>() * 1e3 / last.len().max(1) as f64;
         let n_gen = n_gen.max(per_tok.len());
+        if let Some(ph) = phases.get(phases.len().saturating_sub(32)..) {
+            let k = ph.len().max(1) as f64 / 1e3;
+            let sum = |i: usize| ph.iter().map(|v| v[i]).sum::<f64>() / k;
+            eprintln!("  phases per step (last {}): uploads {:.2} ms, launch/replay {:.2}, device wait {:.2}, history flush {:.2}, logits download {:.2}", ph.len(), sum(0), sum(1), sum(2), sum(3), sum(4));
+        }
         println!("generated {} tokens: {:.1} ms per token ({:.1} ms experts, {:.1} ms engram gather), {:.1} tok/s; last {}: {:.1} ms per token, {:.1} tok/s; tokens {:?}", n_gen, t_all * 1e3 / n_gen as f64, t_exp * 1e3 / n_gen as f64, t_eng * 1e3 / n_gen as f64, n_gen as f64 / t_all, last.len(), last_ms, 1e3 / last_ms, &out_toks[..out_toks.len().min(24)]);
         return Ok(());
     }
