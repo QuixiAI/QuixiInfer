@@ -2,6 +2,7 @@
 // Every kernel takes `const u64* info`; the layout is documented on each entry point.
 #include "qx_block.cuh"
 #include "qx_sys.cuh"
+#include "qx_kv.cuh"
 
 #define F(i) reinterpret_cast<float*>(info[i])
 #define SLOTS(i) reinterpret_cast<const u32*>(info[i])
@@ -216,7 +217,8 @@ extern "C" __global__ void qx_norm_rope(const u64* info) {
 /// of RMS norm of the mean of the block's raw keys. Does nothing mid-block.
 /// info: [0] raw keys, [1] address of the u32 position, [2] w, [3] pooled keys, [4] dim, [5] n_rot,
 /// [6] base bits, [7] eps bits, [8] block size, [9] ring slots when the raw keys are a ring (cell at slot
-/// cell % ring), 0 when they are indexed by cell. One block of `dim` threads.
+/// cell % ring), 0 when they are indexed by cell, [10] the layer's offset in a kp page. [3] is the slot's kp page
+/// table (`kp_row`). One block of `dim` threads.
 extern "C" __global__ void qx_idx_pool(const u64* info) {
     __shared__ float sc[32];
     __shared__ float buf[256];
@@ -247,22 +249,22 @@ extern "C" __global__ void qx_idx_pool(const u64* info) {
             const float x0 = buf[p], x1 = buf[p + nr / 2];
             v = i < nr / 2 ? x0 * c - x1 * s : x0 * s + x1 * c;
         }
-        F(3)[(u64)b * d + i] = v;
+        kp_row(reinterpret_cast<const u64*>(info[3]), info[10], b, kp, d)[i] = v;
     }
 }
 
 /// Indexer scores: score[b] = sum_h relu(q_h . K_b) / sqrt(dim) for the visible blocks b < (pos+1)/block.
 /// Skipped entirely while every visible block is kept anyway. One warp per block b.
 /// info: [0] q (heads x dim), [1] pooled keys, [2] scores, [3] address of the u32 position, [4] heads,
-/// [5] dim, [6] block size, [7] blocks kept, [8] scores stride per token, [9] slots (u32 x tokens), [10] pooled
-/// key floats per slot. [3] is the positions array. Grid (blocks, tokens): token t's query row is heads x dim
-/// further, its keys its slot's.
+/// [5] dim, [6] block size, [7] blocks kept, [8] scores stride per token, [9] slots (u32 x tokens), [10] kp page
+/// table entries per slot, [11] the layer's offset in a kp page. [1] is slot 0's kp page table (`kp_row`), [3]
+/// the positions array. Grid (blocks, tokens): token t's query row is heads x dim further, its keys its slot's.
 extern "C" __global__ void qx_idx_score(const u64* info) {
     const u32 b = (blockIdx.x * blockDim.x + threadIdx.x) / 32, l = threadIdx.x % 32, tk = blockIdx.y;
     const u32 nv = (reinterpret_cast<const u32*>(info[3])[tk] + 1) / U(6);
     if (nv <= U(7) || b >= nv) return;
     const u32 d = U(5);
-    const float* kb = CF(1) + (u64)SLOTS(9)[tk] * info[10] + (u64)b * d;
+    const float* kb = kp_row(reinterpret_cast<const u64*>(info[1]) + (u64)SLOTS(9)[tk] * info[10], info[11], b, U(6), d);
     const float* q = CF(0) + (u64)tk * U(4) * d;
     float tot = 0.f;
     for (u32 h = 0; h < U(4); ++h) {
@@ -619,8 +621,9 @@ extern "C" __global__ void qx_conv_rollback(const u64* info) {
 /// and when pos completes a block, the block's pooled key is formed as qx_idx_pool does.
 /// info: [0] raw keys (T x dim), [1] positions (u32 x T), [2] w, [3] pooled keys, [4] dim, [5] n_rot,
 /// [6] base bits, [7] eps bits, [8] block size, [9] ring, [10] ring slots, [11] T, [12] ring floats per slot,
-/// [13] pooled key floats per slot, [14] slots (u32 x T). Grid T blocks of `dim` threads: a segment's first
-/// token runs the segment on its slot's ring and keys.
+/// [13] kp page table entries per slot, [14] slots (u32 x T), [15] the layer's offset in a kp page. [3] is slot
+/// 0's kp page table (`kp_row`). Grid T blocks of `dim` threads: a segment's first token runs the segment on its
+/// slot's ring and keys.
 extern "C" __global__ void qx_idx_ring_pool(const u64* info) {
     __shared__ float sc[32];
     __shared__ float buf[256];
@@ -629,7 +632,7 @@ extern "C" __global__ void qx_idx_ring_pool(const u64* info) {
     if (!seg_start(SLOTS(14), t0, T, len)) return;
     const u32 slot = SLOTS(14)[t0];
     float* ring = F(9) + (u64)slot * info[12];
-    float* pooled = F(3) + (u64)slot * info[13];
+    const u64* pooled = reinterpret_cast<const u64*>(info[3]) + (u64)slot * info[13];
     for (u32 tk = t0; tk < t0 + len; ++tk) {
         const u32 pos = reinterpret_cast<const u32*>(info[1])[tk];
         if (i < d) ring[(u64)(pos % rs) * d + i] = CF(0)[(u64)tk * d + i];
@@ -658,7 +661,7 @@ extern "C" __global__ void qx_idx_ring_pool(const u64* info) {
                 const float x0 = buf[p], x1 = buf[p + nr / 2];
                 v = i < nr / 2 ? x0 * c - x1 * s : x0 * s + x1 * c;
             }
-            pooled[(u64)b * d + i] = v;
+            kp_row(pooled, info[15], b, kp, d)[i] = v;
         }
         __syncthreads();
     }

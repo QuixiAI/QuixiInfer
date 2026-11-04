@@ -287,6 +287,222 @@ template <int T> QX_DEV void gateup_q8k(const u64* info) {
 extern "C" __global__ void qx_moe_gateup_q8k_iq2_s(const u64* info) { gateup_q8k<QX_IQ2_S>(info); }
 extern "C" __global__ void qx_moe_gateup_q8k_iq3_s(const u64* info) { gateup_q8k<QX_IQ3_S>(info); }
 
+// ---- the IQ and K-quant expert formats with Q8_K activations on both sides, bit for bit the CPU pool ----
+//
+// One 256-element block per step; lane l holds elements 8l .. 8l+8. `iq_terms<T>` gives the lane's integer
+// contribution to the block's two sums from its 8 activations (packed int2 `a`): for the IQ formats
+// `sum += mult * (signed magnitudes . a)`, for IQ1_S `sum += mult * (8 * grid . a +- a-sum)`, for Q2_K
+// `sum += scale * (w . a)` and `msum += min * a-sum`. The block value is then `(d * dq) * sum * factor`
+// (Q2_K: `dq * (d * sum - dmin * msum)`), blocks accumulated in order, as qx_cpu::dot's scalar versions do.
+
+template <int T> QX_DEV void iq_terms(const u8* blk, int lane, int2 a, float& d, float& dmin, int& sum, int& msum) {
+    int m[8];
+    int mult = 0;
+    const u32 hi = a.x, lo = a.y;
+    if constexpr (T == QX_IQ2_S) {
+        d = ld_f16(blk);
+        const u8 *qs = blk + 2, *signs = blk + 34, *qh = blk + 66, *scales = blk + 74;
+        const int g = lane, sub = g / 2;
+        mult = 2 * ((scales[sub / 2] >> (4 * (sub % 2))) & 0xf) + 1;
+        const u64 grid = __ldg(&IQ2S_GRID[qs[g] | (((qh[g / 4] >> (2 * (g % 4))) & 3) << 8)]);
+        const u8 sg = signs[g];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) { const int v = (int)((grid >> (8 * e)) & 0xff); m[e] = (sg >> e) & 1 ? -v : v; }
+    } else if constexpr (T == QX_IQ3_S) {
+        d = ld_f16(blk);
+        const u8 *qs = blk + 2, *qh = blk + 66, *signs = blk + 74, *scales = blk + 106;
+        const int g = lane, sub = g / 4;
+        mult = 2 * ((scales[sub / 2] >> (4 * (sub % 2))) & 0xf) + 1;
+        const u8 sg = signs[g];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int kq = 2 * g + h;
+            const u32 grid = __ldg(&IQ3S_GRID[qs[kq] | (((qh[kq / 8] >> (kq % 8)) & 1) << 8)]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { const int e = 4 * h + j; const int v = (int)((grid >> (8 * j)) & 0xff); m[e] = (sg >> e) & 1 ? -v : v; }
+        }
+    } else if constexpr (T == QX_IQ2_XXS) {
+        d = ld_f16(blk);
+        const int i = lane / 4, g = lane % 4;
+        const u32 aw = ld_u32(blk + 2 + 8 * i), s = ld_u32(blk + 6 + 8 * i);
+        mult = 2 * (int)(s >> 28) + 1;
+        const u64 grid = __ldg(&IQ2XXS_GRID[(aw >> (8 * g)) & 0xff]);
+        const u8 sg = __ldg(&KSIGNS[(s >> (7 * g)) & 0x7f]);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) { const int v = (int)((grid >> (8 * e)) & 0xff); m[e] = (sg >> e) & 1 ? -v : v; }
+    } else if constexpr (T == QX_IQ2_XS) {
+        d = ld_f16(blk);
+        const int g = lane, sub = g / 2;
+        mult = 2 * ((blk[66 + sub / 2] >> (4 * (sub % 2))) & 0xf) + 1;
+        const u32 q = ld_u16(blk + 2 + 2 * g);
+        const u64 grid = __ldg(&IQ2XS_GRID[q & 511]);
+        const u8 sg = __ldg(&KSIGNS[q >> 9]);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) { const int v = (int)((grid >> (8 * e)) & 0xff); m[e] = (sg >> e) & 1 ? -v : v; }
+    } else if constexpr (T == QX_IQ3_XXS) {
+        d = ld_f16(blk);
+        const int i = lane / 4, g = lane % 4;
+        const u32 s = ld_u32(blk + 66 + 4 * i);
+        mult = 2 * (int)(s >> 28) + 1;
+        const u8 sg = __ldg(&KSIGNS[(s >> (7 * g)) & 0x7f]);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const u32 grid = __ldg(&IQ3XXS_GRID[blk[2 + 8 * i + 2 * g + h]]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { const int e = 4 * h + j; const int v = (int)((grid >> (8 * j)) & 0xff); m[e] = (sg >> e) & 1 ? -v : v; }
+        }
+    } else if constexpr (T == QX_IQ1_S) {
+        d = ld_f16(blk);
+        const int i = lane / 4, g = lane % 4;
+        const u32 qh = ld_u16(blk + 34 + 2 * i);
+        mult = 2 * (int)((qh >> 12) & 7) + 1;
+        const u64 grid = __ldg(&IQ1S_GRID[blk[2 + 4 * i + g] | (((qh >> (3 * g)) & 7) << 8)]);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) m[e] = (int)((grid >> (8 * e)) & 0xff);  // 0, 1, 2 for -1, 0, 1
+        const int bsum = __dp4a(pack4(m[4], m[5], m[6], m[7]), (int)lo, __dp4a(pack4(m[0], m[1], m[2], m[3]), (int)hi, 0));
+        const int qsum = __dp4a(0x01010101, (int)lo, __dp4a(0x01010101, (int)hi, 0));
+        sum += mult * (8 * (bsum - qsum) + ((qh & 0x8000) ? -qsum : qsum));
+        return;
+    } else if constexpr (T == QX_Q2_K) {
+        d = ld_f16(blk + 80);
+        dmin = ld_f16(blk + 82);
+        const int j = lane / 2;
+        const u8* q = blk + 16 + 32 * (lane / 16) + 8 * (lane % 4);
+        const int sh = 2 * ((lane % 16) / 4);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) m[e] = (q[e] >> sh) & 3;
+        const int isum = __dp4a(pack4(m[4], m[5], m[6], m[7]), (int)lo, __dp4a(pack4(m[0], m[1], m[2], m[3]), (int)hi, 0));
+        const int qsum = __dp4a(0x01010101, (int)lo, __dp4a(0x01010101, (int)hi, 0));
+        sum += (blk[j] & 0xf) * isum;
+        msum += (blk[j] >> 4) * qsum;
+        return;
+    }
+    sum += mult * __dp4a(pack4(m[4], m[5], m[6], m[7]), (int)lo, __dp4a(pack4(m[0], m[1], m[2], m[3]), (int)hi, 0));
+}
+
+/// The block value from the warp-summed integer terms, in the CPU pool's operation order.
+template <int T> QX_DEV float iq_block_value(float d, float dmin, float dq, int sum, int msum) {
+    if constexpr (T == QX_Q2_K) return __fmul_rn(dq, __fsub_rn(__fmul_rn(d, (float)sum), __fmul_rn(dmin, (float)msum)));
+    float rv = __fmul_rn(__fmul_rn(d, dq), (float)sum);
+    if constexpr (T == QX_IQ2_S || T == QX_IQ2_XXS || T == QX_IQ2_XS || T == QX_IQ1_S) rv = __fmul_rn(rv, 0.125f);
+    if constexpr (T == QX_IQ3_XXS) rv = __fmul_rn(rv, 0.25f);
+    return rv;
+}
+
+/// Gate and up rows of the resident selected experts against Q8_K activations, for an input of up to NB * 256
+/// elements. Grid and info as gateup_q8k.
+template <int T, int NB> QX_DEV void gateup_q8k_t(const u64* info) {
+    const u32 kk = blockIdx.y;
+    const u64 slot = reinterpret_cast<const u64*>(info[0])[kk];
+    if (slot == 0) return;
+    const u32 warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+    const u32 ff = U(5), nb = U(6) / 256;
+    const u32 tok = U(3) ? kk / U(3) : 0;
+    const i8* xq = reinterpret_cast<const i8*>(info[1]) + (u64)tok * U(6);
+    const float* xd = CF(2) + (u64)tok * nb;
+    int2 a[NB];
+    float dq[NB];
+#pragma unroll
+    for (u32 b = 0; b < NB; ++b) {
+        if (b < nb) {
+            a[b] = *reinterpret_cast<const int2*>(xq + b * 256 + 8 * lane);
+            dq[b] = xd[b];
+        }
+    }
+    const u32 r = warp;
+    if (r >= 2 * ff) return;
+    const u8* row = reinterpret_cast<const u8*>(slot) + (u64)r * info[7];
+    float acc = 0.f;
+#pragma unroll
+    for (u32 b = 0; b < NB; ++b) {
+        if (b >= nb) break;
+        float d = 0.f, dmin = 0.f;
+        int sum = 0, msum = 0;
+        iq_terms<T>(row + (u64)b * Fmt<T>::BB, lane, a[b], d, dmin, sum, msum);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xffffffffu, sum, o); msum += __shfl_xor_sync(0xffffffffu, msum, o); }
+        acc = __fadd_rn(acc, iq_block_value<T>(d, dmin, dq[b], sum, msum));
+    }
+    if (lane == 0) F(4)[(u64)kk * 2 * ff + r] = acc;
+}
+extern "C" __global__ void qx_moe_gateup_q8k_iq2_s_w20(const u64* info) { gateup_q8k_t<QX_IQ2_S, 20>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_iq2_xxs_w20(const u64* info) { gateup_q8k_t<QX_IQ2_XXS, 20>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_iq2_xs_w20(const u64* info) { gateup_q8k_t<QX_IQ2_XS, 20>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_iq3_xxs_w20(const u64* info) { gateup_q8k_t<QX_IQ3_XXS, 20>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_iq1_s_w20(const u64* info) { gateup_q8k_t<QX_IQ1_S, 20>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_q2_k_w20(const u64* info) { gateup_q8k_t<QX_Q2_K, 20>(info); }
+
+/// Down rows of the resident selected experts for formats with 256-element blocks: the expert's hidden
+/// activations `h = silu(min(g, c)) * clamp(u, -c, c)` (c = 0: plain silu(g) * u) are quantized to Q8_K in shared
+/// memory exactly as the CPU pool does (qx_quant_q8k's rule per 256), then each warp streams 2 rows with
+/// integer dots, blocks summed in order. ff <= 2560. Grid: (ceil(E / (8 * DRPW)), k), 256 threads.
+/// info: [0] slots, [1] gu, [2] clamp (f32 bits), [3] unused, [4] v out (k x E), [5] ff, [6] E, [7] offset of the
+/// down rows in the slot, [8] down row bytes.
+template <int T> QX_DEV void down_q8k_t(const u64* info) {
+    __shared__ __align__(16) i8 hq[2560];
+    __shared__ float hd[10];
+    __shared__ float av[256];
+    __shared__ u32 ai[256];
+    const u32 kk = blockIdx.y, ff = U(5), n = U(6), nb = ff / 256;
+    const u64 slot = reinterpret_cast<const u64*>(info[0])[kk];
+    if (slot == 0) return;
+    const float* gu = CF(1) + (u64)kk * 2 * ff;
+    const float c = __uint_as_float((u32)info[2]);
+    const u32 t = threadIdx.x;
+    for (u32 b = 0; b < nb; ++b) {
+        const u32 i = b * 256 + t;
+        const float g = gu[i], u = gu[ff + i];
+        const float h = c > 0.f ? qx_silu_mul(fminf(g, c), fminf(fmaxf(u, -c), c)) : qx_silu_mul(g, u);
+        av[t] = fabsf(h);
+        ai[t] = t;
+        __syncthreads();
+        for (u32 s = 128; s > 0; s >>= 1) {
+            if (t < s) {
+                const float o = av[t + s];
+                const u32 oi = ai[t + s];
+                if (o > av[t] || (o == av[t] && oi < ai[t])) { av[t] = o; ai[t] = oi; }
+            }
+            __syncthreads();
+        }
+        if (av[0] == 0.f) {
+            hq[i] = 0;
+            if (t == 0) hd[b] = 0.f;
+        } else {
+            const u32 mi = b * 256 + ai[0];
+            const float gm = gu[mi], um = gu[ff + mi];
+            const float hm = c > 0.f ? qx_silu_mul(fminf(gm, c), fminf(fmaxf(um, -c), c)) : qx_silu_mul(gm, um);
+            const float iscale = __fdiv_rn(-127.f, hm);
+            hq[i] = (i8)min(127, __float2int_rn(__fmul_rn(iscale, h)));
+            if (t == 0) hd[b] = __fdiv_rn(1.f, iscale);
+        }
+        __syncthreads();
+    }
+    const u32 warp = t / 32, lane = t % 32;
+    for (u32 rr = 0; rr < 2; ++rr) {
+        const u32 r = (blockIdx.x * (blockDim.x / 32) + warp) * 2 + rr;
+        if (r >= n) return;
+        const u8* row = reinterpret_cast<const u8*>(slot) + info[7] + (u64)r * info[8];
+        float acc = 0.f;
+        for (u32 b = 0; b < nb; ++b) {
+            const int2 a = *reinterpret_cast<const int2*>(hq + b * 256 + 8 * lane);
+            float d = 0.f, dmin = 0.f;
+            int sum = 0, msum = 0;
+            iq_terms<T>(row + (u64)b * Fmt<T>::BB, lane, a, d, dmin, sum, msum);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xffffffffu, sum, o); msum += __shfl_xor_sync(0xffffffffu, msum, o); }
+            acc = __fadd_rn(acc, iq_block_value<T>(d, dmin, hd[b], sum, msum));
+        }
+        if (lane == 0) F(4)[(u64)kk * n + r] = acc;
+    }
+}
+extern "C" __global__ void qx_moe_down_q8k_iq2_s(const u64* info) { down_q8k_t<QX_IQ2_S>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq3_s(const u64* info) { down_q8k_t<QX_IQ3_S>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq2_xxs(const u64* info) { down_q8k_t<QX_IQ2_XXS>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq2_xs(const u64* info) { down_q8k_t<QX_IQ2_XS>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq3_xxs(const u64* info) { down_q8k_t<QX_IQ3_XXS>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq1_s(const u64* info) { down_q8k_t<QX_IQ1_S>(info); }
+extern "C" __global__ void qx_moe_down_q8k_q2_k(const u64* info) { down_q8k_t<QX_Q2_K>(info); }
+
 /// NVFP4 gate and up rows . Q8_K x, bit-equal to the CPU pool (qx_cpu::dot::nvfp4_q8k): per 256-chunk, lane l
 /// holds 8 codes of sub-block l / 2 (even lanes the low nibbles, odd the high); the integer sub-block sums pair
 /// up, the 16 values d_s * isum_s are summed by a shuffle tree in `tree16`'s pairwise order, times the

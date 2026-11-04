@@ -6,7 +6,6 @@ use crate::experts::{ExpertCache, LayerExperts};
 use crate::host_experts::HostExperts;
 use crate::mailbox::{self, CacheState, Driver, LayerPtrs, PleSource, SwapConfig};
 use crate::ops::{self, MGemv, Seg, GEMV_STORE};
-use qx_cpu::pool::GateFmt;
 use qx_gpu::kernel::modules::{ATTN, STEP};
 use std::sync::atomic::Ordering;
 use anyhow::{anyhow, Result};
@@ -287,14 +286,30 @@ impl Fp8Kv {
     }
 }
 
-/// Per-layer sequence state: `conv`, `s`, `kr`, `kp`, the FP8 KV per sequence slot (see `Strides`), the rest shared.
+/// A layer's pooled indexer keys in kp pages (`KvPages::kp`, kernels' `kp_row`): slot s's kp page table at
+/// `tab + s * stride * 8`, the layer's rows `off` bytes into each page.
+#[derive(Clone, Copy)]
+pub(crate) struct Kp {
+    pub tab: u64,
+    pub stride: usize,
+    pub off: usize,
+}
+
+impl Kp {
+    fn table(&self, slot: usize) -> u64 {
+        self.tab + (slot * self.stride * 8) as u64
+    }
+}
+
+/// Per-layer sequence state: `conv`, `s`, `kr`, the FP8 KV per sequence slot (see `Strides`), `kp` in pages, the
+/// rest shared.
 enum LayerState {
     /// `qkv`, `cv`, `beta`, `alpha`: the layer's window inputs (TMAX rows each), kept for a rollback;
     /// `s0`, `conv0`: the states before the window (of the one sequence a speculative window runs).
     Gdn { conv: DeviceBuf, s: DeviceBuf, qkv: DeviceBuf, cv: DeviceBuf, beta: DeviceBuf, alpha: DeviceBuf, s0: DeviceBuf, conv0: DeviceBuf },
     /// `k`, `v`: f32 caches in VRAM (QX_KV=f32), or empty with `fp8` set. `kr`: raw indexer keys (a ring of one
     /// block with FP8), `kp`: pooled block keys.
-    Attn { k: DeviceBuf, v: DeviceBuf, kr: DeviceBuf, kp: DeviceBuf, fp8: Option<Fp8Kv> },
+    Attn { k: DeviceBuf, v: DeviceBuf, kr: DeviceBuf, kp: Kp, fp8: Option<Fp8Kv> },
 }
 
 /// Scratch vectors, reused by every layer.
@@ -377,7 +392,6 @@ pub struct Strides {
     conv: usize,
     gdn: usize,
     kr: usize,
-    kp: usize,
     hist: usize,
 }
 
@@ -609,14 +623,14 @@ impl<'a> Engine<'a> {
         let extra_pages: usize = std::env::var("QX_KV_EXTRA_PAGES").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
         // QX_KV_GIB caps the pinned page arena below slots x contexts (the server reserves pages at admission)
         let kv_cap = std::env::var("QX_KV_GIB").ok().and_then(|s| s.parse::<f64>().ok()).map(|gib| (gib * 1073741824.0) as usize / crate::kvpages::KvPages::page_bytes_for(n_attn, cfg.n_head_kv, cfg.head_dim));
-        let kvp = crate::kvpages::KvPages::new(n_attn, cfg.n_head_kv, cfg.head_dim, ns, max_ctx, if kv_f32 { 0 } else { extra_pages }, kv_cap);
-        eprintln!("kv pages: {} of {:.2} MiB ({:.2} GiB pinned), {} per sequence", kvp.pages(), kvp.page_bytes as f64 / 1048576.0, (kvp.pages() * kvp.page_bytes) as f64 / 1073741824.0, kvp.max_pages);
+        let kp_layer = crate::kvpages::PAGE / cfg.kpool * cfg.idx_dim * 4;
+        let kvp = crate::kvpages::KvPages::new(n_attn, cfg.n_head_kv, cfg.head_dim, ns, max_ctx, if kv_f32 { 0 } else { extra_pages }, kv_cap, kp_layer);
+        eprintln!("kv pages: {} of {:.2} MiB ({:.2} GiB pinned, pooled keys {:.2} GiB of VRAM), {} per sequence", kvp.pages(), kvp.page_bytes as f64 / 1048576.0, (kvp.pages() * kvp.page_bytes) as f64 / 1073741824.0, (kvp.pages() * kvp.kp_page) as f64 / 1073741824.0, kvp.max_pages);
         let mut l_attn = 0;
         let strides = Strides {
             conv: 3 * ch,
             gdn: cfg.ssm_v_heads * cfg.ssm_dim * cfg.ssm_dim,
             kr: IDX_RING * cfg.idx_dim,
-            kp: max_ctx.div_ceil(cfg.kpool) * cfg.idx_dim,
             hist: (cfg.ple_conv_k - 1) * cfg.ple_ngram * HCD,
         };
         for l in 0..cfg.n_layer {
@@ -624,13 +638,14 @@ impl<'a> Engine<'a> {
             let mixer = if cfg.is_attn(l) {
                 let (nkv, hd) = (cfg.n_head_kv, cfg.head_dim);
                 let fp8 = if kv_f32 { None } else { Some(Fp8Kv::new(ns, window, nkv, hd, |s| kvp.table(s), kvp.offsets(l_attn))) };
+                let kp = Kp { tab: kvp.kp_tables.ptr, stride: kvp.max_pages, off: l_attn * kp_layer };
                 l_attn += 1;
                 let full = if kv_f32 { max_ctx * nkv * hd * 4 } else { 0 };
                 state.push(LayerState::Attn {
                     k: DeviceBuf::new(full),
                     v: DeviceBuf::new(full),
                     kr: DeviceBuf::new(if kv_f32 { max_ctx * cfg.idx_dim } else { ns * strides.kr } * 4),
-                    kp: DeviceBuf::new(ns * strides.kp * 4),
+                    kp,
                     fp8,
                 });
                 MixerW::Attn(AttnW {
@@ -892,12 +907,7 @@ impl<'a> Engine<'a> {
                 gate_bytes: x.gate_bytes(),
                 gate_row_bytes: x.gate.row_bytes(),
                 down_row_bytes: x.down.row_bytes(),
-                fmt: match x.gate_ty() {
-                    GgmlType::IQ3_S => GateFmt::Iq3s,
-                    GgmlType::IQ2_S => GateFmt::Iq2s,
-                    GgmlType::NVFP4 => GateFmt::Nvfp4,
-                    t => panic!("no CPU expert kernels for {t:?}"),
-                },
+                fmt: x.pool_fmt(),
             })
             .collect();
         let adapt = if std::env::var("QX_ADAPT").map(|v| v != "0").unwrap_or(true) {
@@ -1016,17 +1026,17 @@ impl<'a> Engine<'a> {
             self.gpu.run(ATTN.kernel("qx_kv_append_fp8", CubeDim::new_1d((hd / 2) as u32)), (nkv as u32, 2, t as u32), &[s.knew.ptr, s.vnew.ptr, f.tab.ptr, slots, 0, 0, 0, 0, 0, 0, pos, self.kv_window as u64, nkv as u64, hd as u64]);
             // indexer: each token's raw key into its slot's ring, a pooled key whenever a block completes
             let st = &self.strides;
-            self.k("qx_idx_ring_pool", id as u32, (t as u32, 1, 1), &[s.kr.ptr, pos, w.ik_norm.ptr, kp.ptr, id as u64, c.n_rot as u64, bits(c.rope_base), bits(EPS), c.kpool as u64, kr.ptr, IDX_RING as u64, t as u64, st.kr as u64, st.kp as u64, slots]);
+            self.k("qx_idx_ring_pool", id as u32, (t as u32, 1, 1), &[s.kr.ptr, pos, w.ik_norm.ptr, kp.tab, id as u64, c.n_rot as u64, bits(c.rope_base), bits(EPS), c.kpool as u64, kr.ptr, IDX_RING as u64, t as u64, st.kr as u64, kp.stride as u64, slots, kp.off as u64]);
         } else {
             self.norm_rope(s.kraw.ptr, hd, w.k_norm.ptr, k.ptr, hd, nkv, hd, nkv * hd, 1, 0, 0, pos);
             self.k("qx_copy", 256, blocks(nkv * hd, 256), &[s.vnew.ptr, v.ptr, (nkv * hd) as u64, pos, (nkv * hd) as u64]);
             self.k("qx_copy", 256, blocks(id, 256), &[s.kr.ptr, kr.ptr, id as u64, pos, id as u64]);
-            self.k("qx_idx_pool", id as u32, (1, 1, 1), &[kr.ptr, pos, w.ik_norm.ptr, kp.ptr, id as u64, c.n_rot as u64, bits(c.rope_base), bits(EPS), c.kpool as u64, 0]);
+            self.k("qx_idx_pool", id as u32, (1, 1, 1), &[kr.ptr, pos, w.ik_norm.ptr, kp.table(0), id as u64, c.n_rot as u64, bits(c.rope_base), bits(EPS), c.kpool as u64, 0, kp.off as u64]);
         }
         self.norm_rope(s.iq.ptr, id, w.iq_norm.ptr, s.qi.ptr, id, c.idx_heads, id, 0, t, c.idx_heads * id, c.idx_heads * id, pos);
         let max_blocks = self.max_ctx.div_ceil(c.kpool);
         let sel = c.idx_top_k + c.kpool;
-        self.k("qx_idx_score", 256, ((max_blocks * 32).div_ceil(256) as u32, t as u32, 1), &[s.qi.ptr, kp.ptr, s.scores.ptr, pos, c.idx_heads as u64, id as u64, c.kpool as u64, n_top as u64, max_blocks as u64, slots, self.strides.kp as u64]);
+        self.k("qx_idx_score", 256, ((max_blocks * 32).div_ceil(256) as u32, t as u32, 1), &[s.qi.ptr, kp.tab, s.scores.ptr, pos, c.idx_heads as u64, id as u64, c.kpool as u64, n_top as u64, max_blocks as u64, slots, kp.stride as u64, kp.off as u64]);
         self.k("qx_qsa_select", 1024, (t as u32, 1, 1), &[s.scores.ptr, pos, c.kpool as u64, n_top as u64, s.cells.ptr, s.count.ptr, max_blocks as u64, sel as u64]);
         let splits = sel.div_ceil(32);
         if let Some(f) = fp8 {
@@ -1190,15 +1200,13 @@ impl<'a> Engine<'a> {
                     conv.zero_range(c * st.conv * 4, st.conv * 4);
                     s.zero_range(c * st.gdn * 4, st.gdn * 4);
                 }
-                LayerState::Attn { k, v, kr, kp, fp8 } => {
+                LayerState::Attn { k, v, kr, fp8, .. } => {
                     if fp8.is_none() {
                         k.zero();
                         v.zero();
                         kr.zero();
-                        kp.zero();
                     } else {
                         kr.zero_range(c * st.kr * 4, st.kr * 4);
-                        kp.zero_range(c * st.kp * 4, st.kp * 4);
                     }
                 }
             }
@@ -1209,9 +1217,9 @@ impl<'a> Engine<'a> {
             for p in std::mem::take(&mut kv.slot_pages[c]) {
                 kv.release(p);
             }
-            let (mp, tables) = (kv.max_pages, kv.tables.ptr);
-            let _ = tables;
+            let mp = kv.max_pages;
             kv.tables.zero_range(c * mp * 8, mp * 8);
+            kv.kp_tables.zero_range(c * mp * 8, mp * 8);
         }
         if let Some(d) = &self.drafter {
             d.reset();
@@ -1304,6 +1312,7 @@ impl<'a> Engine<'a> {
             };
             kv.slot_pages[slot].push(p);
             self.k("qx_set_u64", 1, (1, 1, 1), &[kv.table(slot) + (i * 8) as u64, kv.addr(p)]);
+            self.k("qx_set_u64", 1, (1, 1, 1), &[kv.kp_table(slot) + (i * 8) as u64, kv.kp_addr(p)]);
         }
     }
 

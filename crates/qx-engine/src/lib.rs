@@ -1,4 +1,5 @@
 //! The QuixiInfer inference engine.
+pub mod dsv41;
 pub mod engine;
 pub mod experts;
 pub mod host_experts;
@@ -6,6 +7,7 @@ pub mod kvpages;
 pub mod mailbox;
 pub mod ple_io;
 pub mod routing;
+pub mod tiers;
 pub mod ops;
 
 /// The model to load when none is named: the pack if it has been made, else the GGUF.

@@ -6,7 +6,39 @@ use anyhow::Result;
 use qx_gpu::mem::DeviceBuf;
 use qx_pack::ggml::GgmlType;
 use qx_pack::gguf::Gguf;
+use qx_cpu::pool::WType;
 use qx_ref::weights::W;
+
+/// The pool's name for a GGUF expert type.
+pub fn wtype(t: GgmlType) -> WType {
+    match t {
+        GgmlType::IQ2_S => WType::Iq2S,
+        GgmlType::IQ3_S => WType::Iq3S,
+        GgmlType::IQ4_NL => WType::Iq4Nl,
+        GgmlType::NVFP4 => WType::Nvfp4,
+        GgmlType::IQ2_XXS => WType::Iq2Xxs,
+        GgmlType::IQ2_XS => WType::Iq2Xs,
+        GgmlType::IQ3_XXS => WType::Iq3Xxs,
+        GgmlType::IQ1_S => WType::Iq1S,
+        GgmlType::Q2_K => WType::Q2K,
+        t => panic!("no CPU expert kernels for {t:?}"),
+    }
+}
+
+/// The GGUF type of a pool format.
+pub fn ggml_of(w: WType) -> GgmlType {
+    match w {
+        WType::Iq2S => GgmlType::IQ2_S,
+        WType::Iq3S => GgmlType::IQ3_S,
+        WType::Iq4Nl => GgmlType::IQ4_NL,
+        WType::Nvfp4 => GgmlType::NVFP4,
+        WType::Iq2Xxs => GgmlType::IQ2_XXS,
+        WType::Iq2Xs => GgmlType::IQ2_XS,
+        WType::Iq3Xxs => GgmlType::IQ3_XXS,
+        WType::Iq1S => GgmlType::IQ1_S,
+        WType::Q2K => GgmlType::Q2_K,
+    }
+}
 
 /// Where one layer's routed experts live in the GGUF, and their geometry.
 pub struct LayerExperts<'a> {
@@ -42,6 +74,10 @@ impl<'a> LayerExperts<'a> {
     }
     pub fn gate_ty(&self) -> GgmlType {
         self.gate.ty
+    }
+    /// The pool's formats for this layer's experts (no SwiGLU clamp: Qwen's experts have none).
+    pub fn pool_fmt(&self) -> qx_cpu::pool::ExpertFmt {
+        qx_cpu::pool::ExpertFmt { gate: wtype(self.gate.ty), down: wtype(self.down.ty), clamp: 0.0 }
     }
     /// Bytes of one expert's gate (= up) rows and down rows.
     pub fn gate_bytes(&self) -> usize {

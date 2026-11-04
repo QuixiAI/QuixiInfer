@@ -2,7 +2,7 @@
 //! runs) must be bit-equal between the tiers, the f32 paths close to an f64 reference.
 use cubecl::prelude::CubeDim;
 use qx_cpu::act::quantize_q8_k;
-use qx_cpu::pool::{Expert, GateFmt, Pool};
+use qx_cpu::pool::{Expert, ExpertFmt, Pool};
 use qx_gpu::kernel::modules::MOE;
 use qx_gpu::mem::DeviceBuf;
 use qx_gpu::Gpu;
@@ -81,7 +81,7 @@ fn main() {
         .collect();
     let xr: Vec<&[f32]> = xs.iter().map(|v| v.as_slice()).collect();
     let mut y_cpu = vec![0f32; a * E];
-    pool.run_multi(GateFmt::Nvfp4, &xr, FF, gate_row, down_row, &experts, &mut y_cpu);
+    pool.run_multi(ExpertFmt::NVFP4, &xr, FF, gate_row, down_row, &experts, &mut y_cpu);
     let diff = y_gpu.iter().zip(&y_cpu).filter(|(g, c)| g.to_bits() != c.to_bits()).count();
     let maxrel = y_gpu.iter().zip(&y_cpu).map(|(g, c)| ((g - c).abs() / c.abs().max(1e-6)) as f64).fold(0.0, f64::max);
     println!("q8 path: {diff} of {} outputs differ between GPU and CPU pool (max rel {maxrel:.2e})", a * E);

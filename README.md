@@ -172,6 +172,32 @@ LimitMEMLOCK=infinity
 
 Stop the service before benchmarking: two engines cannot both pin the experts.
 
+### DeepSeek-V4.1-Flash
+
+The same binary serves [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)
+at UD-IQ2_XXS (284 B parameters, 280 GiB of weights) on the same machine, with the experts in three tiers: about
+21 GiB in VRAM, about 88 GiB pinned in RAM, the rest read from the pack on NVMe as routed. Decode runs at about
+30 tokens/s, prompts at 45-50 tokens/s, one request at a time; a request sharing a prefix with the previous one
+continues from it. See `docs/deepseek41-plan.md` and `docs/progress.md`.
+
+```sh
+# the pack from the six GGUF shards (pass the first), once
+target/release/qx-pack pack   DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp
+target/release/qx-pack verify DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf
+
+# serve: the engine is chosen by the GGUF's architecture; cap the memory, the tiers pin most of the RAM
+systemd-run --user --scope -p MemoryMax=112G -p MemorySwapMax=0 -- \
+  target/release/quixiinfer serve --model DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
+  --pack DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp --ctx 32768 --port 8000 \
+  --vram-gib 21 --ram-gib 88 --profile golden/profile-dsv41.txt --profile-out live-profile.txt
+```
+
+`--profile` ranks the experts the tiers are filled with at start (`golden/profile-dsv41.txt` comes from a routing
+trace of a mixed corpus); `--profile-out` writes the live ranking after requests, and a start finding that file loads from it
+instead. `--window` sets the prompt chunk (64 tokens by default, up to 128). The chat template and
+tokenizer come from the GGUF (tokenization checked against llama.cpp). Structured outputs and several requests at
+once are not available for this model yet.
+
 ### Settings
 
 | Setting | What it does |

@@ -635,8 +635,9 @@ extern "C" __global__ void qxp_kv_append_fp8(const u64* info) {
 /// Indexer pooling for every block the chunk completes: block b (cells 4b .. 4b+3, the last in the chunk) is
 /// pooled from the chunk's raw keys and, for cells before p0, the ring of the previous block's raw keys.
 /// info: [0] chunk raw keys (T x dim), [1] p0 ptr, [2] w, [3] pooled keys, [4] dim, [5] n_rot, [6] base bits,
-/// [7] eps bits, [8] block size, [9] ring (ring slots x dim, cell c at c % slots), [10] T, [11] ring slots.
-/// Grid: ceil(T / block) + 1 blocks of dim threads.
+/// [7] eps bits, [8] block size, [9] ring (ring slots x dim, cell c at c % slots), [10] T, [11] ring slots,
+/// [12] the layer's offset in a kp page. [3] is the slot's kp page table (`kp_row`). Grid: ceil(T / block) + 1
+/// blocks of dim threads.
 extern "C" __global__ void qxp_idx_pool(const u64* info) {
     __shared__ float sc[32];
     __shared__ float buf[256];
@@ -663,7 +664,7 @@ extern "C" __global__ void qxp_idx_pool(const u64* info) {
             const float x0 = buf[p], x1 = buf[p + nr / 2];
             v = i < nr / 2 ? x0 * c - x1 * s : x0 * s + x1 * c;
         }
-        F(3)[(u64)b * d + i] = v;
+        kp_row(reinterpret_cast<const u64*>(info[3]), info[12], b, kp, d)[i] = v;
     }
 }
 
@@ -680,7 +681,8 @@ extern "C" __global__ void qxp_idx_ring(const u64* info) {
 /// Each score is the same chain of operations as `qxp_qsa_select`'s own loop (per head an fma over the dims in
 /// order, relu, summed over heads in order, times 1/sqrt(dim)), so the scores are the same bits.
 /// info: [0] query indexer heads (T x heads x dim), [1] p0 ptr, [2] pooled keys, [3] scores (T x max blocks),
-/// [4] heads, [5] dim, [6] block, [7] top, [8] max blocks, [9] T. Grid (ceil(blocks / 64), ceil(T / 64)), 256 threads.
+/// [4] heads, [5] dim, [6] block, [7] top, [8] max blocks, [9] T, [10] the layer's offset in a kp page. [2] is the
+/// slot's kp page table (`kp_row`). Grid (ceil(blocks / 64), ceil(T / 64)), 256 threads.
 extern "C" __global__ void __launch_bounds__(256) qxp_idx_score(const u64* info) {
     __shared__ __align__(16) float qs[32][68];
     __shared__ __align__(16) float ks[32][68];
@@ -707,7 +709,7 @@ extern "C" __global__ void __launch_bounds__(256) qxp_idx_score(const u64* info)
                 const u32 r = e / 32, i = e % 32;
                 const u32 t = t0 + r, b = b0 + r;
                 qs[i][r] = t < T ? CF(0)[((u64)t * heads + h) * d + i0 + i] : 0.f;
-                ks[i][r] = b < nv_hi ? CF(2)[(u64)b * d + i0 + i] : 0.f;
+                ks[i][r] = b < nv_hi ? kp_row(reinterpret_cast<const u64*>(info[2]), info[10], b, kp, d)[i0 + i] : 0.f;
             }
             __syncthreads();
 #pragma unroll 8
@@ -745,8 +747,8 @@ extern "C" __global__ void __launch_bounds__(256) qxp_idx_score(const u64* info)
 /// visible blocks (ties to the lower block), or of all visible blocks when there are no more, then the tail.
 /// info: [0] query indexer heads (T x heads x dim), [1] p0 ptr, [2] pooled keys, [3] cells out (T x stride),
 /// [4] counts out (T), [5] heads, [6] dim, [7] block, [8] top, [9] scores scratch (T x max blocks),
-/// [10] max blocks, [11] cells stride, [12] 1: the scores are already in [9] (`qxp_idx_score`). Grid T blocks of
-/// 1024 threads.
+/// [10] max blocks, [11] cells stride, [12] 1: the scores are already in [9] (`qxp_idx_score`), [13] the layer's
+/// offset in a kp page. [2] is the slot's kp page table (`kp_row`). Grid T blocks of 1024 threads.
 extern "C" __global__ void qxp_qsa_select(const u64* info) {
     __shared__ u32 hist[256];
     __shared__ u32 s_prefix, s_need, s_count;
@@ -767,7 +769,7 @@ extern "C" __global__ void qxp_qsa_select(const u64* info) {
     float* sc = F(9) + (u64)t * info[10];
     const float inv = rsqrtf((float)d);
     for (u32 b = U(12) ? nv : tid; b < nv; b += nt) {
-        const float* kb = CF(2) + (u64)b * d;
+        const float* kb = kp_row(reinterpret_cast<const u64*>(info[2]), info[13], b, kp, d);
         float tot = 0.f;
         for (u32 h = 0; h < heads; ++h) {
             float s = 0.f;

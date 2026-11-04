@@ -4,7 +4,7 @@
 pub mod tables;
 
 use half::{bf16, f16};
-use tables::{FP4_VALUES2, IQ2S_GRID, IQ3S_GRID, IQ4NL_VALUES};
+use tables::{FP4_VALUES2, IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, IQ4NL_VALUES, KSIGNS};
 
 pub const QK_K: usize = 256;
 
@@ -151,6 +151,159 @@ pub fn dequant_iq2_s(src: &[u8], out: &mut [f32]) {
                 let m = ((grid >> (8 * e)) & 0xff) as f32;
                 let s = if (signs[g] >> e) & 1 != 0 { -1.0 } else { 1.0 };
                 o[8 * g + e] = db * m * s;
+            }
+        }
+    }
+}
+
+#[inline]
+fn u16le(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+#[inline]
+fn u32le(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+#[inline]
+fn sign(bits: u8, e: usize) -> f32 {
+    if (bits >> e) & 1 != 0 { -1.0 } else { 1.0 }
+}
+
+/// IQ2_XXS: 66 bytes per 256: f16 d, then 8 sub-blocks of 32 elements as two u32 each: the first holds four
+/// 8-bit grid indices (one per 8 elements), the second four 7-bit sign-pattern indices into `KSIGNS` and the
+/// 4-bit scale in its top bits: `d * (0.5 + scale) * 0.25`.
+pub fn dequant_iq2_xxs(src: &[u8], out: &mut [f32]) {
+    for (b, o) in src.chunks_exact(66).zip(out.chunks_exact_mut(QK_K)) {
+        let d = h(b, 0);
+        for i in 0..8 {
+            let a = u32le(b, 2 + 8 * i);
+            let s = u32le(b, 6 + 8 * i);
+            let db = d * (0.5 + (s >> 28) as f32) * 0.25;
+            for g in 0..4 {
+                let grid = IQ2XXS_GRID[((a >> (8 * g)) & 0xff) as usize];
+                let sg = KSIGNS[((s >> (7 * g)) & 0x7f) as usize];
+                for e in 0..8 {
+                    let m = ((grid >> (8 * e)) & 0xff) as f32;
+                    o[32 * i + 8 * g + e] = db * m * sign(sg, e);
+                }
+            }
+        }
+    }
+}
+
+/// IQ2_XS: 74 bytes per 256: f16 d, qs[32] of u16 (9-bit grid index, 7-bit sign-pattern index), scales[8] of
+/// nibbles per 16-element sub-block: `d * (0.5 + scale) * 0.25`.
+pub fn dequant_iq2_xs(src: &[u8], out: &mut [f32]) {
+    for (b, o) in src.chunks_exact(74).zip(out.chunks_exact_mut(QK_K)) {
+        let d = h(b, 0);
+        let scales = &b[66..74];
+        for g in 0..32 {
+            let sub = g / 2;
+            let sc = (scales[sub / 2] >> (4 * (sub % 2))) & 0xf;
+            let db = d * (0.5 + sc as f32) * 0.25;
+            let q = u16le(b, 2 + 2 * g);
+            let grid = IQ2XS_GRID[(q & 511) as usize];
+            let sg = KSIGNS[(q >> 9) as usize];
+            for e in 0..8 {
+                let m = ((grid >> (8 * e)) & 0xff) as f32;
+                o[8 * g + e] = db * m * sign(sg, e);
+            }
+        }
+    }
+}
+
+/// IQ3_XXS: 98 bytes per 256: f16 d, qs[64] of 8-bit grid indices (4 elements each), then 8 u32 per 32-element
+/// sub-block holding four 7-bit sign-pattern indices and the 4-bit scale in the top bits: `d * (0.5 + scale) * 0.5`.
+pub fn dequant_iq3_xxs(src: &[u8], out: &mut [f32]) {
+    for (b, o) in src.chunks_exact(98).zip(out.chunks_exact_mut(QK_K)) {
+        let d = h(b, 0);
+        let qs = &b[2..66];
+        for i in 0..8 {
+            let s = u32le(b, 66 + 4 * i);
+            let db = d * (0.5 + (s >> 28) as f32) * 0.5;
+            for g in 0..4 {
+                let sg = KSIGNS[((s >> (7 * g)) & 0x7f) as usize];
+                for half in 0..2 {
+                    let grid = IQ3XXS_GRID[qs[8 * i + 2 * g + half] as usize];
+                    for j in 0..4 {
+                        let e = 4 * half + j;
+                        let m = ((grid >> (8 * j)) & 0xff) as f32;
+                        o[32 * i + 8 * g + e] = db * m * sign(sg, e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// IQ1_S: 50 bytes per 256: f16 d, qs[32] of 8-bit grid indices, qh[8] of u16 per 32-element sub-block: three
+/// extra index bits for each of its four groups, a 3-bit scale (`d * (2 * scale + 1)`) and a sign bit choosing
+/// the offset +-0.125 added to every grid value (-1, 0, 1).
+pub fn dequant_iq1_s(src: &[u8], out: &mut [f32]) {
+    for (b, o) in src.chunks_exact(50).zip(out.chunks_exact_mut(QK_K)) {
+        let d = h(b, 0);
+        let qs = &b[2..34];
+        for i in 0..8 {
+            let qh = u16le(b, 34 + 2 * i);
+            let dl = d * (2 * ((qh >> 12) & 7) + 1) as f32;
+            let delta = if qh & 0x8000 == 0 { 0.125 } else { -0.125 };
+            for g in 0..4 {
+                let idx = qs[4 * i + g] as usize | ((((qh >> (3 * g)) & 7) as usize) << 8);
+                let grid = IQ1S_GRID[idx];
+                for e in 0..8 {
+                    let v = ((grid >> (8 * e)) & 0xff) as f32 - 1.0;
+                    o[32 * i + 8 * g + e] = dl * (v + delta);
+                }
+            }
+        }
+    }
+}
+
+/// Q2_K: 84 bytes per 256: scales[16] (low nibble scale, high nibble min, per 16 elements), qs[64] of 2-bit
+/// values, f16 d, f16 dmin. Element e of the block is bits `2 * ((e % 128) / 32)` of byte `32 * (e / 128) + e % 32`.
+pub fn dequant_q2_k(src: &[u8], out: &mut [f32]) {
+    for (b, o) in src.chunks_exact(84).zip(out.chunks_exact_mut(QK_K)) {
+        let scales = &b[0..16];
+        let qs = &b[16..80];
+        let d = h(b, 80);
+        let dmin = h(b, 82);
+        for e in 0..QK_K {
+            let j = e / 16;
+            let dl = d * (scales[j] & 0xf) as f32;
+            let ml = dmin * (scales[j] >> 4) as f32;
+            let q = (qs[32 * (e / 128) + e % 32] >> (2 * ((e % 128) / 32))) & 3;
+            o[e] = dl * q as f32 - ml;
+        }
+    }
+}
+
+/// The 6-bit scale and min of sub-block `j` (0..8) from a K-quant's packed 12 scale bytes.
+#[inline]
+fn k_scale_min(scales: &[u8], j: usize) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        ((scales[j + 4] & 0xf) | ((scales[j - 4] >> 6) << 4), (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4))
+    }
+}
+
+/// Q5_K: 176 bytes per 256: f16 d, f16 dmin, scales[12] (6-bit scale and min per 32 elements), qh[32] (one high
+/// bit per element, bit j for sub-block j), qs[128] of nibbles (sub-block 2c in the low nibbles of chunk c, 2c + 1
+/// in the high).
+pub fn dequant_q5_k(src: &[u8], out: &mut [f32]) {
+    for (b, o) in src.chunks_exact(176).zip(out.chunks_exact_mut(QK_K)) {
+        let d = h(b, 0);
+        let dmin = h(b, 2);
+        let scales = &b[4..16];
+        let qh = &b[16..48];
+        let qs = &b[48..176];
+        for j in 0..8 {
+            let (sc, m) = k_scale_min(scales, j);
+            let (dj, mj) = (d * sc as f32, dmin * m as f32);
+            for k in 0..32 {
+                let ql = (qs[32 * (j / 2) + k] >> (4 * (j % 2))) & 0xf;
+                let hb = (qh[k] >> j) & 1;
+                o[32 * j + k] = dj * (ql | (hb << 4)) as f32 - mj;
             }
         }
     }

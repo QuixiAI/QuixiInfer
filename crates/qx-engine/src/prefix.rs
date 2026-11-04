@@ -1,37 +1,26 @@
 //! The prefix cache: a sequence's state after its first `pos` tokens, kept so a later prompt that starts with the
 //! same tokens restarts from there. An entry holds the recurrent state (DeltaNet S and conv states, PLE history,
-//! indexer raw-key ring and pooled keys) in a pinned arena and references to the sequence's host KV pages
-//! (`KvPages`, shared by reference count; a partial last page is copied on restore). The VRAM KV ring is refilled
-//! from the pages. Entries are evicted least recently used.
+//! indexer raw-key ring) in a pinned arena and references to the sequence's KV pages (`KvPages`, with the pooled
+//! indexer keys in their VRAM twins; shared by reference count, a partial last page copied on restore). The VRAM
+//! KV ring is refilled from the pages. Entries are evicted least recently used.
 use super::*;
 use qx_gpu::mem::HostMapped;
 
-/// Where the parts of an entry's state sit in its arena range (byte offsets). Everything before `kp` has a fixed
-/// size; the pooled indexer keys that follow are sized by the entry's position (`kp_rows` rows of `idx_dim`
-/// floats per attention layer, 256-byte aligned each), not by the context: at 262k a full-context entry was
-/// 497 MiB and 4 GiB held 8 of them.
+/// Where the parts of an entry's state sit in its arena range (byte offsets); `bytes` in all, whatever the
+/// position (the pooled indexer keys, which grow with it, are in the shared pages).
 #[derive(Clone, Copy)]
 struct Layout {
     gdn: usize,
     conv: usize,
     hist: usize,
     kr: usize,
-    kp: usize,
-    n_attn: usize,
-    idx_dim: usize,
-    kpool: usize,
+    bytes: usize,
 }
 
 impl Layout {
-    fn kp_rows(&self, p: usize) -> usize {
-        p.div_ceil(self.kpool)
-    }
-    fn kp_part(&self, kp_rows: usize) -> usize {
-        (kp_rows * self.idx_dim * 4).next_multiple_of(256)
-    }
     /// Bytes of an entry saved at position `p`.
-    fn entry_bytes(&self, p: usize) -> usize {
-        (self.kp + self.n_attn * self.kp_part(self.kp_rows(p))).next_multiple_of(4096)
+    fn entry_bytes(&self, _p: usize) -> usize {
+        self.bytes
     }
 }
 
@@ -41,7 +30,6 @@ pub struct Entry {
     /// The entry's range of the arena.
     off: usize,
     bytes: usize,
-    kp_rows: usize,
     last_used: u64,
 }
 
@@ -70,10 +58,10 @@ impl PrefixCache {
             o += n.next_multiple_of(256);
             at
         };
-        let layout = Layout { gdn: take(n_gdn * strides.gdn * 4), conv: take(n_gdn * strides.conv * 4), hist: take(strides.hist * 4), kr: take(n_attn * strides.kr * 4), kp: 0, n_attn, idx_dim: cfg.idx_dim, kpool: cfg.kpool };
-        let layout = Layout { kp: o, ..layout };
-        let bytes = budget.max(layout.entry_bytes(max_ctx)) / 4096 * 4096;
-        eprintln!("prefix cache: {:.2} GiB; entries of {:.1} MiB plus {:.1} KiB per 1k tokens ({:.1} MiB at the full context)", bytes as f64 / 1073741824.0, layout.kp as f64 / 1048576.0, (n_attn * layout.idx_dim * 4) as f64 * 1024.0 / layout.kpool as f64 / 1024.0, layout.entry_bytes(max_ctx) as f64 / 1048576.0);
+        let layout = Layout { gdn: take(n_gdn * strides.gdn * 4), conv: take(n_gdn * strides.conv * 4), hist: take(strides.hist * 4), kr: take(n_attn * strides.kr * 4), bytes: 0 };
+        let layout = Layout { bytes: o.next_multiple_of(4096), ..layout };
+        let bytes = budget.max(layout.bytes) / 4096 * 4096;
+        eprintln!("prefix cache: {:.2} GiB; entries of {:.1} MiB", bytes as f64 / 1073741824.0, layout.bytes as f64 / 1048576.0);
         Self { arena: HostMapped::new(bytes), layout, free: vec![(0, bytes)], entries: Vec::new(), tick: 0, hits: 0, tokens_restored: 0, snapshots: 0, evictions: 0 }
     }
 
@@ -133,9 +121,8 @@ impl<'a> Engine<'a> {
         unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr(), n) }
     }
 
-    /// The per-layer state regions of `slot`: (device address, bytes, arena offset) for every part, the pooled
-    /// keys limited to `kp_rows` rows per attention layer.
-    fn state_parts(&self, slot: usize, layout: &Layout, kp_rows: usize) -> Vec<(u64, usize, usize)> {
+    /// The per-layer state regions of `slot`: (device address, bytes, arena offset) for every part.
+    fn state_parts(&self, slot: usize, layout: &Layout) -> Vec<(u64, usize, usize)> {
         let st = self.strides;
         let mut parts = Vec::new();
         let (mut ig, mut ia) = (0, 0);
@@ -146,9 +133,8 @@ impl<'a> Engine<'a> {
                     parts.push((conv.ptr + (slot * st.conv * 4) as u64, st.conv * 4, layout.conv + ig * st.conv * 4));
                     ig += 1;
                 }
-                LayerState::Attn { kr, kp, .. } => {
+                LayerState::Attn { kr, .. } => {
                     parts.push((kr.ptr + (slot * st.kr * 4) as u64, st.kr * 4, layout.kr + ia * st.kr * 4));
-                    parts.push((kp.ptr + (slot * st.kp * 4) as u64, kp_rows * layout.idx_dim * 4, layout.kp + ia * layout.kp_part(kp_rows)));
                     ia += 1;
                 }
             }
@@ -197,7 +183,7 @@ impl<'a> Engine<'a> {
         self.gpu.sync();
         let tokens: Vec<u32> = self.ctx.download_at(self.ctx_at(slot), p);
         let layout = self.prefix.borrow().layout;
-        let (bytes, kp_rows) = (layout.entry_bytes(p), layout.kp_rows(p));
+        let bytes = layout.entry_bytes(p);
         // the arena range: a free one (the entry with these tokens is dropped first), evicting least recently
         // used entries until one fits
         let base = {
@@ -221,7 +207,7 @@ impl<'a> Engine<'a> {
                 }
             }
         };
-        for (dev, n, off) in self.state_parts(slot, &layout, kp_rows) {
+        for (dev, n, off) in self.state_parts(slot, &layout) {
             let dst = self.arena_at(&self.prefix.borrow(), base, off, n);
             unsafe { cudarc::driver::result::memcpy_dtoh_sync(dst, dev) }.expect("state download");
         }
@@ -236,7 +222,7 @@ impl<'a> Engine<'a> {
         };
         let mut pc = self.prefix.borrow_mut();
         let tick = pc.tick;
-        pc.entries.push(Entry { tokens, pages, off: base, bytes, kp_rows, last_used: tick });
+        pc.entries.push(Entry { tokens, pages, off: base, bytes, last_used: tick });
         pc.snapshots += 1;
     }
 
@@ -257,7 +243,7 @@ impl<'a> Engine<'a> {
         self.reset();
         self.set_sampling(sp);
         self.set_forced(prompt);
-        let (p, layout, base, kp_rows) = {
+        let (p, layout, base) = {
             let mut pc = self.prefix.borrow_mut();
             pc.tick += 1;
             let tick = pc.tick;
@@ -265,9 +251,9 @@ impl<'a> Engine<'a> {
             let en = &mut pc.entries[e];
             en.last_used = tick;
             assert!(prompt.starts_with(&en.tokens), "restore of a prefix the prompt does not start with");
-            (en.tokens.len(), layout, en.off, en.kp_rows)
+            (en.tokens.len(), layout, en.off)
         };
-        for (dev, n, off) in self.state_parts(slot, &layout, kp_rows) {
+        for (dev, n, off) in self.state_parts(slot, &layout) {
             let src = self.arena_at(&self.prefix.borrow(), base, off, n);
             unsafe { cudarc::driver::result::memcpy_htod_sync(dev, src) }.expect("state upload");
         }
@@ -282,6 +268,7 @@ impl<'a> Engine<'a> {
                 if i + 1 == pages.len() && p % crate::kvpages::PAGE != 0 {
                     let np = kv.alloc().expect("out of KV pages");
                     unsafe { std::ptr::copy_nonoverlapping(kv.host_ptr(pg), kv.host_ptr(np), kv.page_bytes) };
+                    unsafe { cudarc::driver::result::memcpy_dtod_sync(kv.kp_addr(np), kv.kp_addr(pg), kv.kp_page) }.expect("kp page copy");
                     mine.push(np);
                 } else {
                     kv.retain(pg);
@@ -290,6 +277,8 @@ impl<'a> Engine<'a> {
             }
             let addrs: Vec<u64> = mine.iter().map(|&pg| kv.addr(pg)).collect();
             kv.tables.upload_at(slot * kv.max_pages * 8, &addrs);
+            let addrs: Vec<u64> = mine.iter().map(|&pg| kv.kp_addr(pg)).collect();
+            kv.kp_tables.upload_at(slot * kv.max_pages * 8, &addrs);
             kv.slot_pages[slot] = mine;
         }
         // the VRAM ring: the most recent cells of each attention layer

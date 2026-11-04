@@ -204,6 +204,10 @@ Decode right after a 1k-token prefill: 95 tok/s (token-by-token prompt: 103), 90
   `docs/deepseek41-plan.md` (IQ1_S fits this box with every expert resident; 25-35 tok/s expected), the llama.cpp
   oracle built (`~/llama.cpp-dsv41`), `tools/pardl.py` written for the 233 GB download. Parked until the machine
   has more storage; Qwen3.8-Flash-Next stays in production.
+  **2026-11-03: unparked, target changed to UD-IQ2_XXS** (280 GiB: 146 GiB of experts, 126 GiB Engram table) on
+  the new 4 TB NVMe with the win10 VM retired (all 120 GiB of RAM ours). Needs a third expert tier on NVMe plus
+  NVMe for Engram rows, parked KV pages and prefix entries: `docs/deepseek41-plan.md` rewritten. Download in
+  progress to `~/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/`.
 
 - **NVFP4 (nvidia/Qwen3.8-Flash-Next-NVFP4).** The production model moves from UD-IQ3_XXS (files deleted; the
   IQ paths stay supported) to NVIDIA's NVFP4 checkpoint: routed experts NVFP4 (ggml `block_nvfp4`: 64 values in
@@ -571,13 +575,304 @@ Decode right after a 1k-token prefill: 95 tok/s (token-by-token prompt: 103), 90
   3,16 matches 2,16 within noise at B >= 8 (+48% / +121% over off) for less quality cost; 6,16 beats 2,12 at the
   same cost. The bench's hit rates run above `qx-ppl`'s (long decodes of one text per slot).
 
+- **Pooled indexer keys in pages (2026-10-28).** The indexer's pooled block keys (f32, 1.5 MiB per 1k tokens over
+  the 12 attention layers) were a flat buffer of the full context per slot: 384 MiB a slot at 262k, 3 GiB at 8
+  slots, 6 GiB at 16. They now live in VRAM pages paired with the host KV pages (`KvPages::kp`, a second page
+  table per slot, `kp_row` in kernels/include/qx_kv.cuh), so they cost what the KV arena holds: 4854 pages x
+  384 KiB = 1.78 GiB with `QX_KV_GIB=16`, whatever the slot count. Prefix entries share them with the KV pages
+  (a restored partial last page copies its kp page too) and no longer carry their own copy: 113 MiB an entry
+  instead of up to 497. Exact: `qx-ppl` over 6144 tokens writes byte-identical log-probs to the previous build,
+  `qx-prefill-check 4000` gives the previous build's numbers digit for digit, `qx-prefix-check 3000 300` and
+  `qx-spec-check 2500 64` pass. (A 4 x 2400 `qx-batch-check` was cut short by host memory pressure.)
+
+- **DeepSeek-V4.1-Flash UD-IQ2_XXS, D0-D1 groundwork (2026-11-03).** Target and machine changes in
+  `docs/deepseek41-plan.md`. The Qwen service is stopped (user's instruction) so the GPU and RAM are free for this.
+  - Downloaded (280 GiB, `tools/pardl.py`). `tools/gguf_layout.py` reads the shard headers alone: 146.1 GiB of
+    routed experts in 7.3-11.5 MiB records (gate/up IQ2_S x15 layers, IQ2_XXS x15, IQ1_S x10; down IQ3_XXS x15,
+    IQ2_S x15, IQ2_XS x6, IQ2_XXS x3, Q2_K x1), the 125.9 GiB Engram table (768M Q5_K rows of 176 B), 7.6 GiB
+    dense.
+  - Block decoders for IQ1_S, IQ2_XXS, IQ2_XS, IQ3_XXS, Q2_K and Q5_K (`qx-quant`, grids via `tools/gen_iq_tables.py`
+    plus `KSIGNS`; GPU `decode8` twins in `qx_quant.cuh`): `tools/dequant_check.py` finds them identical to gguf-py
+    on real tensors of the shards (max diff 0).
+  - CPU pool: `GateFmt` became `ExpertFmt { gate, down, clamp }` with per-part `WType`s, the clamped SwiGLU
+    (`silu(min(g, c)) * clamp(u, -c, c)`) and Q8_K hidden activations for 256-block down formats; AVX-512 VNNI dots
+    for the five new types bit-equal to their scalar forms (IQ1_S's +-1/8 offset folded into the integer sum).
+    GPU: `gateup_q8k_t<T, 20>` (5120-wide inputs) and `down_q8k_t<T>` (Q8_K h quantized in shared memory by the
+    pool's rule). `qx-iq-check` (5120 x 2304, clamp 10, every gate/down pair the model uses): 0 of 61,440 outputs
+    differ between GPU and pool per pair; 7e-8 to 1e-4 from an f64 reference on the rounded activations.
+  - Reference: `crates/qx-ref/src/dsv41.rs`, the whole forward pass (Engram, single-pass mHC with Sinkhorn, MLA
+    window attention with compressed latents, indexer with candidate blocks, YaRN RoPE in NORM mode, sqrt-softplus
+    router, clamped SwiGLU), `qx-ref check` dispatching on `general.architecture`, activation names as the oracle's.
+  - Oracle tooling: `tools/golden/route_trace.cpp` records the selected experts per (token, layer) through the
+    eval callback (the top-k is a strided view); `tools/cache_sim3.py` simulates VRAM / RAM / NVMe tiers with the
+    decode cost model; the offline tools now link with DT_RPATH so the surviving `~/git/llama.cpp-dsv41/build`
+    resolves. Goldens must be recorded with `CUDA_VISIBLE_DEVICES=` (otherwise the oracle runs some ops on CUDA0).
+  - Lesson: the oracle run, the trace and a Qwen pack load must not share the 120 GiB; together they OOMed the box.
+  - **D1 result.** Against CPU-only goldens of the three short prompts (125 positions): layer 0's attention matches
+    the oracle to 2e-7 once two ggml details are mirrored (the Q8_0 activation quantizer multiplies by `127 / amax`,
+    not `1 / d`; RMS norm sums f32 squares in f64), and the FFN math replicated in Python on the oracle's own input
+    matches to 1.4e-7. Everything after that is rounding flips: a 3e-5 input difference flips a dozen Q8 decisions
+    and the 2-bit experts amplify them layer by layer, so positions 0-1 (BOS, first token) differ by KLD 1-2 even
+    between two rounding modes of the reference itself. Excluding them: golden vs reference KLD mean 0.055, median
+    0.004, top-1 93-95%; the reference against itself in two rounding modes 0.074 / 0.0034 / 95.8%. The reference
+    is within the oracle's own noise floor; this model at UD-IQ2_XXS is far noisier than Qwen NVFP4 was (1e-3).
+    `QX_REF_DUMP` / `QX_REF_DUMP_ACTS` write the reference's logits and activations for such comparisons.
+  - **D0b result.** Routing trace of 69k mixed tokens; `tools/cache_sim3.py` with 20 GiB of VRAM and 88 GiB of RAM
+    for experts: 74.4% of routings in VRAM, 25.0% in RAM (580 MiB per token for the pool), 0.6% on NVMe (14 MiB);
+    11.7 ms of RAM time and 2.3 ms of drive time per token, so about 50 tok/s single-stream is the target. Robust
+    to the budget split and the decay (44-50 across the variants); see the plan's table.
+  - **D2 done.** `qx-pack pack` wrote the 280 GiB pack unchanged (per-layer record sizes and the 176-byte Q5_K
+    Engram rows in 4 KiB pages were already supported) in about 2 minutes; `qx-pack verify` finds every tensor
+    byte-equal. The verifier's expert comparison now reads 16 records at a time: a layer per rayon thread was
+    118 GB of buffers on this model and OOMed the machine. New `tools/capped.sh` runs a command in a memory-capped
+    systemd scope; every heavy job goes through it from now on.
+  - **Tier store** (`crates/qx-engine/src/tiers.rs`, `qx-tier-check`): pinned RAM places per record-size class
+    filled from the pack by rank (36 GiB in 3.1 s), misses read by io_uring O_DIRECT into staging places, promotion
+    and eviction. On the pack: 17.7 GB/s for 48-record batches (577 us per 9.7 MiB record), 10.5 GB/s for 1-4
+    record batches (2.5 ms per batch), every record byte-equal to the GGUF. The drive is faster than the plan's
+    12 GB/s. The pack's header carried Qwen's calibration ranking (`qx-pack pack` defaulted to it for every model;
+    now only for `qwen4exp`); readers ignore a ranking of the wrong size.
+  - **D3 started: `crates/qx-engine/src/dsv41/` and `kernels/dsv41.cu`.** The one-token decode path with eager
+    launches (hyper-connections with Sinkhorn, YaRN RoPE in NORM mode, the compressor and index keys, the indexer
+    with candidate blocks and a radix top-k, attention over the window and the selected latents with sinks, the
+    Engram gate, the sqrt-softplus router, the clamped shared expert), the routed experts on the CPU pool from
+    the GGUF for now. `qx-ds-check` compares it with the reference op by op: in f32 mode (`QX_MGEMV_INT8=0`,
+    `QX_EXACT_EXPERTS=1`, `QX_REF_COMPAT=0`) every activation of position 0 is within 1e-6 after two fixes (the
+    fused GEMV silently returned zeros for the 24 x 20480 F32 mix matrix, now its own kernel; the GEMV dispatch
+    lacked the new type ids, so Q5_K shared experts came out zero; the indexer's head weights lacked the
+    1/sqrt(heads x dim) factor). Over the first 6 positions of prompt p0 (ratio-2 layers with up to 3 compressed
+    rows, ratio-1 layers with up to 6, the candidate pin active): all 816-822 activations per position within
+    1.3e-5, top-1 6/6, KLD 0.000000 against the reference.
+  - **Tiered path** (`DsEngine::load_tiered`, `qx-ds-check` with `QX_DS_PACK`): dense weights from the pack, the
+    hottest 20 GiB of expert records in VRAM by the trace's ranking (`golden/profile-dsv41.txt`; the top 2,113
+    records cover 52% of routings, the top 11,348 cover 97.6%), 60 GiB pinned next, the rest on NVMe, filled in 7 s.
+    Resident experts run the GPU integer kernels on Q8_K activations quantized on the device, the others go
+    through the store to the pool: over 12 positions the output is **bit-identical** to the all-pool path, as the
+    tiers are built to be. In production numerics (pool experts, int8 dense GEMV) the 12 positions give top-1
+    11/12 and KLD 0.40 against the reference, 9/12 and 0.12 with the dense products in f32: both within the
+    rounding-flip floor measured for the reference against the oracle. The reference's `experts` mode now rounds
+    the down projection's input to Q8_K for 256-block formats (the DeepSeek pool does); a new `engine` mode mirrors
+    the int8 GEMV's activation rounding too. The remaining 1e-3 differences are rounding flips: `QX_DS_TRACE`
+    counts how many Q8_K values of each layer's expert input the two sides round differently; at position 0 the
+    first three layers have 0 flips and match to 5e-7, layer 3 has 17 and its output is off by 5e-3, and from
+    there the flips compound (81, 298, 531 at position 1). The experts' Q8_K quantization makes bit-level agreement
+    past the first layers unreachable for two implementations that differ in f32 summation order; the f32 mode
+    is where the kernels are checked.
+  - **First end-to-end speed** (`QX_DS_BENCH`, host-driven path: a sync and a host round trip per layer, the
+    experts dispatched by the host, promotions between tokens): prompt p1 (59 tokens) then 64 greedy tokens,
+    20 GiB VRAM / 60 GiB RAM, 4 promotions per token into each tier: **108 ms per token, 9.2 tok/s**, 79 ms of it
+    in the expert phase. The tiers adapt as the simulation said but slowly at 4 promotions per token: the first 8
+    tokens route 21% / 41% / 38% to VRAM / RAM / NVMe, tokens 111-119 route 58% / 29% / 13%; an NVMe miss costs
+    about 0.6 ms, so the early tokens are drive-bound. Promotions cost 0.7 ms each (5.8 ms per token at 8).
+    With 16 promotions per token into each tier: 92 ms per token, 10.8 tok/s; by tokens 111-122 the routings go
+    82% / 13% / 4% and the expert phase is 24-33 ms, but the promotions themselves cost 22 ms per token on the host
+    (0.7 ms per 10 MiB copy) and the 40 per-layer host round trips the rest. Over all 59 positions of p1 with the
+    tiers adapting, the reference agreement is top-1 57/59, KLD mean 0.14 (3.6 at position 0, mostly below 1e-2
+    from position 8 on); the generated tokens are identical whatever the tiers hold.
+    Next: the asynchronous pipeline (mailbox-driven pool on a driver thread, promotions on its copy stream, no
+    per-layer sync) that the Qwen engine has; then the prompt's routing seeding the counts and NVMe lookahead.
+  - **Asynchronous pipeline, and a race found by bisection.** The driver thread (`dsv41/driver.rs`) serves the
+    mailbox (post, pool, done) and promotes between tokens on its own copy stream; the token runs with no host
+    round trip. Its first benches were nondeterministic: two identical runs with promotions disabled diverged
+    after 7 tokens, and both differed from the host-driven path from the first generated token, while a check
+    with a sync after every op matched the reference exactly. A sync-point knob (`QX_DS_SYNC=post|wait|combine|
+    layer|engram`) showed that *any* sync restores the host-driven sequence, even one only at the two Engram
+    layers, so the fault was the host outrunning the device, not the mailbox protocol. Cause: the Engram rows
+    gathered on the host went up with a synchronous `cuMemcpyHtoD`, which runs on the legacy stream and is not
+    ordered after the kernels CubeCL has queued on its non-blocking stream; with the host far ahead, layer 14's
+    rows landed before layer 1's Engram GEMV had read the buffer. Fix: the rows go into a pinned, device-mapped
+    buffer with one region per Engram layer, and a copy kernel (`qx_ds_copy_f32`) moves them in stream order.
+    After the fix two free-running asynchronous runs give the host-driven tokens exactly. Rule, now in
+    `qx-gpu`'s `mem.rs` doc: a host copy into memory a queued kernel reads needs a sync first or a stream-ordered
+    path; the Qwen engine's uploads sit at admission points that already sync.
+  - **Where a steady-state token went** (positions 119-122 of p1 + 64, 16 promotions per token): 20 ms of GPU
+    dense + attention + launches (`QX_DS_NOEXPERTS=1` measures the token without routed experts: 20 ms at
+    position 7, 21 at 122, i.e. 50 tok/s is the ceiling before the experts), 30 ms of pool, 21 ms of promotions
+    blocking the driver at the token boundary (a stream sync for the VRAM copies, then 16 synchronous NVMe reads
+    into RAM); 64-68 ms in all. The promotions are now off the path: the VRAM copies and their table writes stay
+    stream-ordered behind an event (the table entry lands after its record, so the next token reads it at once),
+    the RAM places being copied are locked against eviction until the event completes, and the NVMe-to-RAM
+    promotions trickle one per idle poll of the driver loop between jobs. Steady-state tokens: 52-57 ms
+    (16 or 32 promotions per token), 75.9 ms averaged over the 64 generated tokens with the cold start (13.2
+    tok/s); tokens unchanged. Left: the pool's 29 ms per token (about 60 expert evaluations: 48 from RAM, 11 from
+    NVMe at 0.6 ms each; 16 threads on cores 0-15) and the GPU's launch overhead (about 1,800 launches per token
+    at roughly 7 us each, the bulk of the 20 ms: the dense weights alone are 4-5 ms of bandwidth).
+  - **Graph capture, profile, kernel rewrites, fetch overlap.** The token's launches are now captured once
+    (`QX_GRAPH=0` disables; the first eligible token warms CubeCL's info cache, the second is recorded) and
+    replayed: no gain, the GPU-only token stayed at 20 ms, so the cost is kernel time. An `nsys` profile of the
+    GPU-only token (per-node graph tracing) gave 17.1 ms of kernels and 1,820 launches per token: `qx_mgemv` 6.5 ms
+    (527 launches, about 1 TB/s effective), `qx_ds_hc_mixes` 4.7 ms (80 launches of 58 us: one block of 24 warps
+    streaming 2 MB), `qx_ds_attn` 2.4 ms (59 us per layer at a 100-token context: a thread per key reading 2 KB
+    rows), `qx_rms_groups` 1.2 ms (241 launches), the rest 2.3 ms. `hc_mixes` is now a block per output and
+    `qx_ds_attn` scores with a warp per key and normalizes once: GPU-only token 16.5 ms (60 tok/s ceiling). The
+    exact f32 check still agrees with the reference at the 1e-7 level; in production numerics p0's 12 positions
+    give top-1 12/12, KLD mean 0.099 (the summation order changed, so the greedy text diverges from the earlier
+    runs after 11 tokens, as any rounding change does). The fetch timer split the pool's time into NVMe waiting
+    (13 ms per token) and compute (15 ms); the driver now computes the RAM-resident experts while the misses'
+    reads are in flight (`ExpertStore::fetch_submit` / `fetch_wait`). The pool itself is near memory bandwidth:
+    `qx-poolbw` measures 0.22 ms per 9.4 MiB expert at any batch size (44-54 GB/s on 16 cores), so a layer's 1-2
+    CPU experts cost 0.3-0.5 ms and the only CPU-side lever left is fewer of them. Pinning the engine thread off
+    the pool's cores (`QX_DS_CPUS`, `QX_DS_MAIN_CPU`) changed nothing.
+  - **State at 128 generated tokens, RAM tier 80 GiB, 32 promotions per token:** the last 32 tokens average
+    **41.8 ms, 23.9 tok/s** (58 ms over all 128 with the cold start); the Engram row gather on the host costs
+    4.1 ms per token under NVMe contention (0.3 ms when the drive is idle), next to go through io_uring in one
+    batch. Steady-state budget: GPU 16.5, pool compute about 14, NVMe wait about 5, Engram 4, gaps 2.
+  - Engram rows now go through one io_uring batch per token (4.1 ms -> 0.1-0.3 ms averaged over the run; the
+    steady-state token did not move, so the serial preads were mostly a cold-start cost). RAM tier 88 GiB (the
+    plan's budget; 112 GiB cap): last 32 tokens **40.5 ms, 24.7 tok/s**, 53.8 ms over 128. At 20 GiB of VRAM
+    experts the device has 2.5 GiB free after load (22 GiB does not fit: dense 7 GiB, embeddings 0.65, output
+    0.5, scratch). Re-profiled GPU-only token: 13.8 ms of kernels in 15.7 ms: `qx_mgemv` 6.5 (7.0 GiB of dense
+    weights per token, 1.15 TB/s), `hc_mixes` 2.35 (still 29 us a call: 24 blocks cannot pull 2 MB at bandwidth;
+    next a split over more blocks with the partials summed in `hc_terms`), `attn` 1.35, `rms_groups` 1.2.
+  - `hc_mixes` split 16 ways with the partials summed in `hc_terms` (exact check 6/6, KLD 0): GPU-only token
+    **13.7 ms** (73 tok/s ceiling). The shared expert's SiLU and down GEMV now run between the mailbox post and
+    the wait, overlapping the pool. **Teacher-forced benchmark** (`QX_DS_BENCH=0`, no generation, text-independent:
+    the greedy text had turned repetitive after the kernel reorderings and inflated the hit rate): wiki1k's first
+    256 tokens, 21 GiB VRAM / 88 GiB RAM, 32 promotions per token: last 32 tokens **40.8 ms, 24.5 tok/s**. Steady
+    state there: GPU 13.7 + resident experts about 3, pool 20 (12 compute, 7.5 waiting on 8 NVMe misses per token
+    at 0.9 ms each, partly overlapped), gaps 2; routings 82% VRAM, 15% RAM, 3.4% NVMe and the NVMe share not yet
+    falling at 256 tokens (the tiers hold the trace's ranking, the forced text differs).
+  - Driver fixes: victims' table zeros are issued before the copies (a zero queued behind 600 MiB of copies could
+    land after the slot's quarantine had expired), no new copies while the previous tick's are in flight, RAM
+    promotions as asynchronous io_uring reads (at most four in flight, a record counts as RAM-resident only once
+    read; the driver never blocks between posts). 64 promotions per token still produces NaN logits from position
+    205 of wiki1k, deterministically and with either tier's promotions disabled, so the cause is elsewhere.
+    Isolated: `golden/data/wiki1k.tokens` was tokenized with another model's tokenizer (ids up to 227,135 against
+    a 129,280 vocabulary; position 205 is id 210,905), so the embedding gather read past the table and the result
+    depended on what followed it in VRAM, which is why 32 promotions happened to pass it. The engine now rejects
+    out-of-range token ids; the forced benchmark uses the first 1,024 tokens of the DeepSeek routing trace
+    (`golden/data/route1k.tokens`). Found on the way: `qx_ds_topk` stored its per-warp "equal" counts at offset 16
+    of a 32-entry array with 32 warps (overlap and overflow once a store has more than 512 visible rows); fixed.
+  - **Forced benchmark on valid tokens** (`golden/data/route1k.tokens`, the mixed corpus's first 1,024 tokens,
+    21 GiB VRAM / 88 GiB RAM): **43.3 ms per token over the last 32 (23.1 tok/s)**, 44.3 over all 1,024, no NaN;
+    64 promotions per token: 42.6 ms. The mixed text keeps the tiers churning (positions 767-1023: 76% VRAM, 22%
+    RAM, 1.8% NVMe; pool 18.6 ms per token of which 3.4 waiting on NVMe). The GPU-only token grows with the
+    context: 13.7 ms near position 100, 17 at 255, 21 at 511, 24 at 1023 (the indexer scores every visible row,
+    the top-k is linear in them, attention saturates at window 128 + 512 selected rows); profiled next.
+  - **The context growth was all attention**: `qx_ds_attn` averaged 224 us per layer over the 1k run (9 ms per
+    token) against 34 us at a 100-token context; every other kernel was flat (`idx_score` 0.11 ms, `topk` 0.05).
+    A block per head streamed all 640 key rows twice although MLA's 64 heads share one 512-wide latent as key and
+    value. New `qx_ds_attn_part` (blocks over 8-head groups x 12-key chunks: each chunk loaded once into shared
+    memory for its 8 heads, per-chunk max/sum/partial output) and `qx_ds_attn_merge` (the chunks and the sink,
+    flash-decoding style). First version produced NaN: zero probabilities times uninitialized shared rows; the
+    missing rows are now zeroed, and the shared key stride is 513 to keep consecutive rows on consecutive banks.
+    Exact check 6/6 at KLD 0; production check p0 12/12, KLD 0.267. GPU-only token **13.1 ms at a 1k context**
+    (was 24; 12-13 ms from position 255 on). Forced route1k 1024, 32 promotions: **31.9 ms per token over the
+    last 32 (31.4 tok/s)**, 36.8 ms over all 1,024. Budget now: GPU 13 + resident experts 3, pool 20 (3.5 waiting
+    on NVMe) partly overlapped, gaps about 2. The CPU side is the limit; the structural lever left is windows of
+    several tokens (prefill chunks, DSpark verification), where the pool reads each expert once per window.
+  - Process: chains started with `setsid nohup` died with two session restarts; they now run as transient
+    systemd user services with the memory cap on the unit. Inside such a service cargo is not on PATH, which let
+    two chains measure a stale binary before the build status was echoed.
+  - **Windows of T tokens** (`DsEngine::forward_window`, `launch_window`; `QX_DS_WINDOW=T` in the forced bench,
+    `QX_DS_DUMP_LOGITS` for comparisons): every per-token buffer has DS_TMAX = 32 rows, the kernels take grid T
+    (they were written with positions arrays and strides), the compressor runs a window's tokens in order inside
+    one block (a group's pending pairs accumulate across them), the latent ring is n_swa + DS_TMAX wide, the grouped
+    output projection writes [group][token] and a `qx_ds_regroup` kernel lays the rows out per token for the second
+    projection, the mailbox posts T tokens and the pool reads each expert once per window, one graph per width.
+    Two bugs on the way: the per-layer top-k selection buffers were still one token wide (the top-k's "fewer rows
+    than k" path wrote `sel[i] = i` for tokens 1..7 past them into neighbouring GEMV tables: compute-sanitizer
+    showed the GEMV reading weights at 0x100000000, the u32 pair 0,1; found by printing the table words before
+    each launch), and the sanitizer run itself was the way in. Result: **windows of 8 give logits bit-identical to
+    one-token steps (128/128 rows)**. Windows of 32 differ everywhere: above 8 tokens the fused GEMV takes its
+    tensor-core path with bf16 inputs (being confirmed with `QX_TMV=0`). First prefill rate, windows of 32: 34 ms
+    per token at position 1023, pool-bound (promotions were per window, so the VRAM share fell to 53%; now scaled
+    by the window's width). The chunk's distinct experts set the floor: about 100 per layer at 32 tokens, 0.9 GB per
+    layer from RAM at the pool's 45 GB/s; wider chunks amortize further (the mailbox's 32-token limit is next).
+  - Confirmed: windows of 32 with `QX_TMV=0` (the fused GEMV's f32 path in chunks of 8) are **bit-identical to
+    one-token steps (128/128)**; the tensor-core path's bf16 inputs are the difference above 8 tokens. Prefill with
+    promotions scaled by the window's width, route1k 1024, at the end of the run: windows of 32, f32 GEMV 24.0 ms
+    per token (41.7 tok/s), tensor-core GEMV 22.6 (44.2); windows of 16, f32 GEMV 21.8-22.5 (44.5). Pool 24 ms per
+    token in all three (the GPU is hidden): prefill is bound by the chunk's distinct experts streaming from RAM.
+    Decode windows do not amortize the pool either (different tokens pick different experts), so speculation
+    would not help the CPU-bound part. Next: the GPU reads a share of the RAM-resident experts in place over PCIe
+    (the RAM tier is device-mapped pinned memory) in parallel with the pool, for decode and prefill alike.
+  - **Tried and shelved: the GPU reading RAM-resident experts in place over PCIe.** A second device table holds
+    each RAM record's mapped address; the post kernel hands a share (`QX_DS_GPU_SHARE`, eighths) of the RAM misses to
+    the GPU's own expert kernels, the rest to the pool; RAM places are quarantined two ticks before reuse. The
+    results stay bit-identical whichever side computes (128/128 rows, single steps and windows of 8), but the
+    in-place reads run at about 7 GB/s: 1.3 ms per expert against the pool's 0.22, and decode went from 32 to
+    135-175 ms per token at shares of 4-6 eighths (the per-layer round robin also sent nearly every RAM miss to
+    the GPU, and mapped misses never reached the promotion candidates, so the VRAM tier stopped adapting). DMA
+    copies into VRAM staging would reach 14-25 GB/s at best, still under the pool's 45; at most a 1.4x on the
+    expert phase for a lot of machinery. The knob stays, default 0. Prefill's lever is wider windows: the distinct
+    experts a window touches grow sublinearly with its width (about 100 per layer at 32 tokens, all 384 past
+    about 500), so bytes per token fall; the mailbox's 32-token limit (QX_TMAX / QX_AMAX) is next.
+  - Mailbox widened to 128 tokens (QX_TMAX 128, QX_AMAX 1280: MB_KIDX 5376, MB_ALL 10496, MB_X 16384; the pool's
+    MAX_EXPERTS 1280; DS_TMAX 128 with the split attention launched in slices of 32 tokens so its partials stay at
+    227 MB). The constants are shared with the Qwen engine, whose per-window scratch (`qkv`, `cv`, `beta`,
+    `alpha`, the token-major buffers) grows with TMAX: check its VRAM budget and load before the Qwen service
+    is re-enabled.
+  - Windows of 128 are bit-identical to single steps on the f32 GEMV path (128/128); the tensor-core GEMV is
+    capped at 32 tokens (`use_tmv` falls back above). A regression from the mapped path's deferred eviction
+    (promotions stalled: 1 RAM promotion per run, decode at 40 ms) is fixed: places are quarantined only when the
+    GPU reads RAM in place. **Prefill at the end of route1k 1024, 32 promotions per token: windows of 32 23.0 ms
+    per token, 64 21.8, 128 20.8 (48 tok/s); decode 32.5 ms (30.8 tok/s).** Width stops paying because the pool
+    turns compute-bound: a 128-token window needs 128 dot products per expert row, and 16 AVX-512 cores saturate
+    around 4 TMAC/s (about 110 CPU experts per layer at 0.45 ms each for 128 tokens). The GPU could take those
+    products only with the expert bytes moved over PCIe: DMA at 14-25 GB/s gives about the same 15-20 ms per
+    token as the pool, both together perhaps 10 ms; the NVMe tier (58 GiB of experts at 10 GB/s) caps any
+    whole-expert-set sweep near 20 ms per token. Prefill on this box lands at 50-100 tok/s, decode at 31; the
+    engine's remaining value is in serving: KV paging, prefix cache, sampling, the API.
+  - **Serving (first version).** `quixiinfer serve|run` dispatch on `general.architecture`: `deepseek41` loads the
+    tiered engine on the pack (`--pack` or QX_DS_PACK; `--vram-gib`/`--ram-gib` or QX_DS_VRAM/QX_DS_RAM; the
+    routing profile from `--profile`, QX_DS_PROFILE or `golden/profile-dsv41.txt`) and runs `worker_ds`: one
+    request at a time, the prompt in windows of `--window` (64) tokens, then one token a step with host-side
+    sampling (temperature, top-k, top-p, min-p, a splitmix draw keyed by seed and position), EOS and stop strings,
+    the OpenAI routes and the chat template from the GGUF unchanged. `qx-tok` picks the pre-tokenizer from
+    `tokenizer.ggml.pre`: `joyai-llm` (DeepSeek V4) is llama.cpp's chain of three splits. First runs: "What is the
+    capital of France?" (thinking off, greedy) answers "The capital of France is Paris." and stops on EOS; a haiku
+    request with thinking produces a coherent reasoning trace. Cold-start speeds in those short runs: prompt
+    4.6-6.6 tok/s, decode 5.6-17.8 tok/s (the tiers warm over the first hundred tokens). Not yet: several
+    requests at once (slots), the prefix cache, KV paging past the context, structured outputs for this model.
+    The HTTP API answers chat (non-streaming and SSE with `reasoning_content` deltas) and completions with stop
+    strings; the model id comes from the GGUF's `general.name`. Tokenization checked against llama.cpp's
+    `llama-tokenize` on six texts (prose, code, CJK, whitespace runs, a chat prompt with control tokens, symbols
+    and emoji): **identical ids on all, exact decode round trips.**
+  - Two graph bugs found while adding a warm-up and a prefix rewind. (1) The first eligible window of a width
+    called CubeCL's `graph_prepare` and ran eagerly, the second captured; with several widths in play a second
+    `graph_prepare` before the first capture panics ("a graph capture is already prepared on this stream"). Now
+    prepare, the executed eager run and the recording (not executed) happen in one call. (2) Three selection
+    grids (`idx_score`, `block_max`, `cand_mask`) were sized from the visible rows at capture time, so a replayed
+    graph never scored compressed rows beyond those of the capturing position: a silent long-context quality loss
+    that the short reference checks could not see. They are sized from the maximum now (the kernels bound by
+    position), as the Qwen engine does; re-checked against the reference over p1's 59 positions.
+  - Prefix reuse for consecutive requests (`worker_ds`, `QX_DS_PREFIX=0` off): the engine keeps a host history of
+    every position's latent per layer (copied out of the rings every 32 tokens), `rewind(p)` restores the ring
+    cells of the attention window from it (the compressed stores and indexer keys are positional and the positions
+    from p on are recomputed), and a new prompt sharing at least 64 tokens with the sequence in the engine
+    continues from that prefix (rounded to a group boundary). A warm-up at load runs the window widths in use
+    once (kernel compilation and graph captures off the first request).
+    Two-turn chat (greedy): turn 2 reused 114 of its 134 prompt tokens (prompt 1.85 s against 3.88 s without),
+    but its answer differed by a few words from the no-reuse run: the leftover 20-token window took the fused
+    GEMV's tensor-core path (bf16 inputs, 9-32 tokens) while 64-token windows take the f32 path. DeepSeek windows
+    now always use the f32 path (`QX_TMV=1` opts into the tensor cores), so single steps, windows and rewinds agree
+    bit for bit; the reference check over p1's 59 positions stays at 57/59, KLD 0.129.
+    Re-run: **turn 2's answer is identical with and without the reuse**; prompt 1.54 s (114 of 134 tokens reused)
+    against 3.88 s. Cold start remains visible in these short chats (33% of the first request's routings on
+    NVMe, decode 18 tok/s): the tiers start from the trace's ranking and adapt over the first few hundred tokens,
+    so the next step is saving the live ranking as the profile to load from.
+  - **Live routing profile** (`--profile-out FILE` / QX_DS_PROFILE_OUT, written after requests at most once a
+    minute; `DsEngine::save_profile` asks the driver for its ranking: VRAM residents, then RAM, then NVMe, each by
+    decayed score, every expert once). Two server rounds of the same three short chats: started from the trace
+    profile the first request put 7,923 routings on NVMe; restarted from the saved ranking, 877 (VRAM hits 45k
+    against 18k over the warm-up plus the request), prompt 13 against 8 tok/s. Short answers decode at 18-21
+    tok/s: the first hundred tokens of a new text are the warm-up regime the forced bench showed before settling at
+    31 tok/s. README has a DeepSeek section (pack, serve, profiles, the memory cap).
+  - **Structured outputs** on the DeepSeek path: the server's llguidance matchers (built from the GGUF tokenizer,
+    129,280 rows) give a token mask per step, applied to the logits before the host sampler (disallowed tokens to
+    -inf), the sampled token fed back, the request ending when the grammar is complete. `response_format`
+    (`json_schema`, `json_object`) and `guided_regex` / `guided_json` / `guided_grammar` all work: a schema
+    request returned `{"name": "Tokyo", "population": 37114000, "country": "Japan"}`, a regex-guided completion
+    `1969-07-20`. A start finding the `--profile-out` file loads the tiers from it;
+    `tools/quixiinfer-deepseek.service.example` is a user unit with the memory cap.
+
 ## Not yet
 
 - Admission without a GPU sync (`begin_seq`'s reset and uploads wait for the queued step: about 6% at c=16);
   snapshots without a sync (D2H copies ordered on the stream).
 - Multi-slot prefill chunks (a burst of arriving prompts in one chunk: 3x cheaper than lanes for 16 prompts).
-- Per-slot VRAM: the indexer key pool (f32, full context per slot) in fp16/fp8 or grown with the sequence, so 16
-  slots fit without shrinking the cache.
+- Per-slot VRAM: the pooled keys in fp16 (0.9 GiB less); the 0.15 GiB per slot of runtime headroom.
 - VRAM residency at c=16 (the throughput lever): token embedding to host memory (0.5 GiB), smaller KV ring, ...
 - DeepSeek-V4.1-Flash-1017: the GGUF port on this box once storage allows (`docs/deepseek41-plan.md`); NVFP4 on
   a multi-GPU machine.

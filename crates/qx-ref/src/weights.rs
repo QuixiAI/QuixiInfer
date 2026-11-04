@@ -6,7 +6,10 @@ use std::sync::OnceLock;
 
 /// `QX_REF_COMPAT=1`: round each matvec's input the way ggml's CPU backend quantizes activations, so the
 /// reference can be compared tightly with llama.cpp's outputs. `QX_REF_COMPAT=experts`: round only the
-/// routed experts' inputs, as QuixiInfer's CPU expert pool does. Off, every product is exact f32.
+/// routed experts' inputs, as QuixiInfer's CPU expert pool does. `QX_REF_COMPAT=engine`: the experts as
+/// `experts`, and the dense Q8_0 matrices' inputs as the engine's int8 fused GEMV rounds them (`qx_mgemv_q8x`:
+/// per 32, d = amax / 127 in f32, q = round(x / d) half away from zero), every other dense product in f32. Off,
+/// every product is exact f32.
 pub fn compat() -> bool {
     compat_mode() == 1
 }
@@ -16,20 +19,37 @@ pub fn compat_mode() -> u8 {
     *C.get_or_init(|| match std::env::var("QX_REF_COMPAT").as_deref() {
         Ok("1") => 1,
         Ok("experts") => 2,
+        Ok("engine") => 3,
         _ => 0,
     })
 }
 
-/// ggml's Q8_0 activation rounding: per 32, `d = amax / 127` stored as f16, `q = round(x / d)`.
-pub fn round_q8_0(x: &[f32]) -> Vec<f32> {
+/// The engine's int8 GEMV rounding of a dense Q8_0 matrix's input (`qx_mgemv_q8x`).
+pub fn round_q8_engine(x: &[f32]) -> Vec<f32> {
     let mut out = vec![0f32; x.len()];
     for (xs, os) in x.chunks(32).zip(out.chunks_mut(32)) {
         let amax = xs.iter().fold(0f32, |m, v| m.max(v.abs()));
         let d = amax / 127.0;
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        for (o, v) in os.iter_mut().zip(xs) {
+            *o = d * (v * id).round();
+        }
+    }
+    out
+}
+
+/// ggml's Q8_0 activation rounding (the SIMD `quantize_row_q8_0`): per 32, `d = amax / 127` stored as f16,
+/// `q = rint(x * (127 / amax))`. The reciprocal is `127 / amax`, not `1 / d`: the two differ by an ulp, which
+/// flips about one element in 5000 and costs 1e-4 of relative error on a 5120-wide product.
+pub fn round_q8_0(x: &[f32]) -> Vec<f32> {
+    let mut out = vec![0f32; x.len()];
+    for (xs, os) in x.chunks(32).zip(out.chunks_mut(32)) {
+        let amax = xs.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
         let dh = half::f16::from_f32(d).to_f32();
         for (o, v) in os.iter_mut().zip(xs) {
-            *o = dh * (v * id).round();
+            *o = dh * (v * id).round_ties_even();
         }
     }
     out
@@ -60,12 +80,15 @@ pub fn round_q8_k(x: &[f32]) -> Vec<f32> {
 }
 
 fn compat_input(ty: GgmlType, x: &[f32]) -> Option<Vec<f32>> {
+    if compat_mode() == 3 {
+        return (ty == GgmlType::Q8_0).then(|| round_q8_engine(x));
+    }
     if !compat() {
         return None;
     }
     match ty {
         GgmlType::Q8_0 | GgmlType::IQ4_NL | GgmlType::NVFP4 => Some(round_q8_0(x)),
-        GgmlType::Q6_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::IQ2_S | GgmlType::IQ3_S | GgmlType::IQ2_XXS | GgmlType::IQ3_XXS | GgmlType::IQ1_M => Some(round_q8_k(x)),
+        GgmlType::Q6_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q2_K | GgmlType::IQ2_S | GgmlType::IQ3_S | GgmlType::IQ2_XXS | GgmlType::IQ2_XS | GgmlType::IQ3_XXS | GgmlType::IQ1_S | GgmlType::IQ1_M => Some(round_q8_k(x)),
         GgmlType::BF16 => Some(x.iter().map(|v| half::bf16::from_f32(*v).to_f32()).collect()),
         GgmlType::F16 => Some(x.iter().map(|v| half::f16::from_f32(*v).to_f32()).collect()),
         GgmlType::F32 | GgmlType::I32 => None,
@@ -126,7 +149,7 @@ impl<'a> W<'a> {
 
     /// A routed expert's matvec: its input is rounded in either compat mode.
     pub fn matvec_rows_expert(&self, row0: usize, x: &[f32], y: &mut [f32]) {
-        if compat_mode() == 2 {
+        if compat_mode() >= 2 {
             let xq = match self.ty {
                 GgmlType::IQ4_NL | GgmlType::Q8_0 => round_q8_0(x),
                 _ => round_q8_k(x),
@@ -137,10 +160,15 @@ impl<'a> W<'a> {
         }
     }
 
-    /// A routed expert's down projection: QuixiInfer's pool feeds it Q8_0-rounded activations whatever the format.
+    /// A routed expert's down projection: QuixiInfer's pool feeds it Q8_0-rounded activations for the 32-element
+    /// down formats (IQ4_NL, Q8_0, NVFP4) and Q8_K-rounded ones for the 256-element formats (DeepSeek's).
     pub fn matvec_rows_expert_down(&self, row0: usize, x: &[f32], y: &mut [f32]) {
-        if compat_mode() == 2 {
-            self.matvec_rows(row0, &round_q8_0(x), y)
+        if compat_mode() >= 2 {
+            let xq = match self.ty {
+                GgmlType::IQ4_NL | GgmlType::Q8_0 | GgmlType::NVFP4 => round_q8_0(x),
+                _ => round_q8_k(x),
+            };
+            self.matvec_rows(row0, &xq, y)
         } else {
             self.matvec_rows(row0, x, y)
         }

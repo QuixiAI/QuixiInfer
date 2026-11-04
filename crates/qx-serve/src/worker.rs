@@ -30,14 +30,14 @@ pub enum Event {
 }
 
 /// Decodes a growing token list into text deltas, holding back bytes until they form whole UTF-8 characters.
-struct Detok<'a> {
-    tok: &'a Tok,
-    ids: Vec<u32>,
-    sent: usize,
+pub struct Detok<'a> {
+    pub tok: &'a Tok,
+    pub ids: Vec<u32>,
+    pub sent: usize,
 }
 
 impl<'a> Detok<'a> {
-    fn push(&mut self, id: u32) -> Option<String> {
+    pub fn push(&mut self, id: u32) -> Option<String> {
         self.ids.push(id);
         let text = self.tok.decode(&self.ids).ok()?;
         if text.ends_with('\u{fffd}') || text.len() <= self.sent {

@@ -2,6 +2,7 @@
 //! streamed to the terminal).
 mod chat;
 mod worker;
+mod worker_ds;
 mod grammar;
 
 use anyhow::{anyhow, Result};
@@ -17,7 +18,6 @@ use serde_json::{json, Value};
 use std::sync::{mpsc, Arc, Mutex};
 use worker::{Event, Job};
 
-const MODEL_ID: &str = "qwen3.8-flash-next";
 
 struct App {
     jobs: Mutex<mpsc::Sender<Job>>,
@@ -26,6 +26,8 @@ struct App {
     api_key: Option<String>,
     /// Tokens of context per sequence: the default completion limit is what the prompt leaves of it.
     max_ctx: usize,
+    /// The model id the API reports: the GGUF's `general.name`.
+    model_id: String,
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -46,6 +48,24 @@ fn load(args: &[String]) -> Result<(mpsc::Sender<Job>, &'static qx_tok::Tok, cha
     let tok: &'static qx_tok::Tok = Box::leak(Box::new(qx_tok::Tok::from_gguf(g)?));
     let tpl = chat::Template::new(g.get("tokenizer.chat_template").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("the GGUF has no chat template"))?.to_string())?;
     let ctx: usize = arg(args, "--ctx").map(|s| s.parse()).transpose()?.unwrap_or(32768);
+    if g.get("general.architecture").and_then(|v| v.as_str()) == Some("deepseek41") {
+        // DeepSeek-V4.1-Flash: the three-tier engine on the pack (`--pack` or QX_DS_PACK), one request at a time
+        let gib = |k: &str, flag: &str, d: f64| -> Result<f64> { Ok(match arg(args, flag) { Some(v) => v.parse()?, None => std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }) };
+        let pack = arg(args, "--pack").or_else(|| std::env::var("QX_DS_PACK").ok()).ok_or_else(|| anyhow!("DeepSeek needs the pack: --pack FILE.qxp or QX_DS_PACK"))?;
+        let profile = arg(args, "--profile").or_else(|| std::env::var("QX_DS_PROFILE").ok()).or_else(|| std::path::Path::new("golden/profile-dsv41.txt").exists().then(|| "golden/profile-dsv41.txt".to_string()));
+        let window: usize = arg(args, "--window").map(|s| s.parse()).transpose()?.unwrap_or(64);
+        let profile_out = arg(args, "--profile-out").or_else(|| std::env::var("QX_DS_PROFILE_OUT").ok());
+        // a ranking saved by an earlier run is what the tiers should start from
+        let profile = match &profile_out {
+            Some(po) if std::path::Path::new(po).exists() => Some(po.clone()),
+            _ => profile,
+        };
+        let slots: usize = arg(args, "--slots").map(|s| s.parse()).transpose()?.unwrap_or(2);
+        eprintln!("quixiinfer: loading DeepSeek-V4.1-Flash (context {ctx}, {slots} slots, prompt windows of {window}, tiers ranked by {})", profile.as_deref().unwrap_or("layer order"));
+        let opt = worker_ds::Options { max_ctx: ctx, window, slots, pack: pack.into(), vram_gib: gib("QX_DS_VRAM", "--vram-gib", 21.0)?, ram_gib: gib("QX_DS_RAM", "--ram-gib", 88.0)?, profile: profile.map(Into::into), profile_out: profile_out.map(Into::into) };
+        let jobs = worker_ds::start(g, tok, opt)?;
+        return Ok((jobs, tok, tpl, ctx));
+    }
     let order: Vec<(usize, usize)> = match arg(args, "--profile") {
         Some(p) => std::fs::read_to_string(p)?
             .lines()
@@ -137,7 +157,7 @@ async fn models(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
     if !authorized(&app, &h) {
         return err(StatusCode::UNAUTHORIZED, "invalid API key");
     }
-    Json(json!({"object": "list", "data": [{"id": MODEL_ID, "object": "model", "created": 0, "owned_by": "quixiinfer"}]})).into_response()
+    Json(json!({"object": "list", "data": [{"id": app.model_id, "object": "model", "created": 0, "owned_by": "quixiinfer"}]})).into_response()
 }
 
 async fn generate(app: Arc<App>, prompt: Vec<u32>, body: &Value, chat: bool, thinking: bool) -> Response {
@@ -158,7 +178,7 @@ async fn generate(app: Arc<App>, prompt: Vec<u32>, body: &Value, chat: bool, thi
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut split = ThinkSplit { in_think: chat && thinking, pending: String::new(), started: false };
     if stream {
-        let s = async_stream_events(rx, id, created, chat, split);
+        let s = async_stream_events(rx, id, created, chat, split, app.model_id.clone());
         return Sse::new(s).into_response();
     }
     let (mut reasoning, mut content) = (String::new(), String::new());
@@ -181,9 +201,9 @@ async fn generate(app: Arc<App>, prompt: Vec<u32>, body: &Value, chat: bool, thi
                     if !reasoning.is_empty() {
                         msg["reasoning_content"] = json!(reasoning);
                     }
-                    json!({"id": id, "object": "chat.completion", "created": created, "model": MODEL_ID, "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage})
+                    json!({"id": id, "object": "chat.completion", "created": created, "model": app.model_id, "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage})
                 } else {
-                    json!({"id": id, "object": "text_completion", "created": created, "model": MODEL_ID, "choices": [{"index": 0, "text": content, "finish_reason": finish}], "usage": usage})
+                    json!({"id": id, "object": "text_completion", "created": created, "model": app.model_id, "choices": [{"index": 0, "text": content, "finish_reason": finish}], "usage": usage})
                 };
                 return Json(out).into_response();
             }
@@ -192,15 +212,15 @@ async fn generate(app: Arc<App>, prompt: Vec<u32>, body: &Value, chat: bool, thi
     err(StatusCode::INTERNAL_SERVER_ERROR, "engine ended the request")
 }
 
-fn async_stream_events(rx: tokio::sync::mpsc::UnboundedReceiver<Event>, id: String, created: u64, chat: bool, mut split: ThinkSplit) -> impl futures::Stream<Item = Result<SseEvent, std::convert::Infallible>> {
+fn async_stream_events(rx: tokio::sync::mpsc::UnboundedReceiver<Event>, id: String, created: u64, chat: bool, mut split: ThinkSplit, model: String) -> impl futures::Stream<Item = Result<SseEvent, std::convert::Infallible>> {
     let mut first = true;
     tokio_stream::wrappers::UnboundedReceiverStream::new(rx).flat_map(move |ev| {
         let mut out: Vec<Result<SseEvent, std::convert::Infallible>> = Vec::new();
         let chunk = |delta: Value, finish: Value, usage: Option<Value>| {
             let mut v = if chat {
-                json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": MODEL_ID, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+                json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
             } else {
-                json!({"id": id, "object": "text_completion", "created": created, "model": MODEL_ID, "choices": [{"index": 0, "text": delta.get("content").cloned().unwrap_or(json!("")), "finish_reason": finish}]})
+                json!({"id": id, "object": "text_completion", "created": created, "model": model, "choices": [{"index": 0, "text": delta.get("content").cloned().unwrap_or(json!("")), "finish_reason": finish}]})
             };
             if let Some(u) = usage {
                 v["usage"] = u;
@@ -289,7 +309,8 @@ fn main() -> Result<()> {
             }
             let port: u16 = arg(&args, "--port").map(|s| s.parse()).transpose()?.unwrap_or(8080);
             let (jobs, tok, tpl, ctx) = load(&args)?;
-            let app = Arc::new(App { jobs: Mutex::new(jobs), tok, tpl, api_key, max_ctx: ctx });
+            let model_id = qx_pack::gguf::Gguf::open(std::path::Path::new(&model_path(&args))).ok().and_then(|g| g.get("general.name").and_then(|v| v.as_str()).map(|s| s.to_lowercase().replace(' ', "-"))).unwrap_or_else(|| "quixiinfer".into());
+            let app = Arc::new(App { jobs: Mutex::new(jobs), tok, tpl, api_key, max_ctx: ctx, model_id });
             let router = Router::new()
                 .route("/v1/models", get(models))
                 .route("/v1/chat/completions", post(chat_completions))

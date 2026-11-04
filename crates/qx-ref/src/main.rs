@@ -5,6 +5,46 @@ use qx_pack::gguf::Gguf;
 use qx_ref::model::Model;
 use std::collections::HashMap;
 
+/// Whichever architecture the GGUF holds.
+enum AnyModel<'a> {
+    Qwen(Model<'a>),
+    Dsv41(qx_ref::dsv41::Model<'a>),
+}
+
+enum AnyState {
+    Qwen(qx_ref::model::State),
+    Dsv41(qx_ref::dsv41::State),
+}
+
+impl<'a> AnyModel<'a> {
+    fn load(g: &'a Gguf) -> Result<Self> {
+        let arch = g.get("general.architecture").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        Ok(match arch.as_str() {
+            "deepseek41" => Self::Dsv41(qx_ref::dsv41::Model::load(g)?),
+            _ => Self::Qwen(Model::load(g)?),
+        })
+    }
+    fn n_vocab(&self) -> usize {
+        match self {
+            Self::Qwen(m) => m.cfg.n_vocab,
+            Self::Dsv41(m) => m.cfg.n_vocab,
+        }
+    }
+    fn new_state(&self) -> AnyState {
+        match self {
+            Self::Qwen(m) => AnyState::Qwen(m.new_state()),
+            Self::Dsv41(m) => AnyState::Dsv41(m.new_state()),
+        }
+    }
+    fn forward(&self, t: u32, st: &mut AnyState, act: &mut dyn FnMut(&str, &[f32])) -> Vec<f32> {
+        match (self, st) {
+            (Self::Qwen(m), AnyState::Qwen(s)) => m.forward(t, s, act),
+            (Self::Dsv41(m), AnyState::Dsv41(s)) => m.forward(t, s, act),
+            _ => unreachable!(),
+        }
+    }
+}
+
 fn read_f32(path: &str) -> Vec<f32> {
     let b = std::fs::read(path).unwrap_or_default();
     b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
@@ -33,12 +73,12 @@ fn main() -> Result<()> {
         std::process::exit(2);
     }
     let g = Gguf::open(std::path::Path::new(&a[2]))?;
-    let m = Model::load(&g)?;
+    let m = AnyModel::load(&g)?;
     let dir = &a[3];
     let k: usize = a[4].parse()?;
     let toks: Vec<u32> = std::fs::read(format!("{dir}/p{k}.tokens"))?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     let n = a.get(5).map(|s| s.parse().unwrap()).unwrap_or(toks.len()).min(toks.len());
-    let nv = m.cfg.n_vocab;
+    let nv = m.n_vocab();
     let logits = read_f32(&format!("{dir}/p{k}.logits"));
     // The golden run may record logits only from some position on: they are the last positions.
     let from = toks.len() - logits.len() / nv;
@@ -55,8 +95,14 @@ fn main() -> Result<()> {
     for (p, &t) in toks.iter().take(n).enumerate() {
         let mut seen: HashMap<String, usize> = HashMap::new();
         let mut report: Vec<(String, f32)> = Vec::new();
+        let dump_acts = std::env::var("QX_REF_DUMP_ACTS").ok();
         let out = m.forward(t, &mut st, &mut |name, v| {
             let c = seen.entry(name.to_string()).or_insert(0);
+            if let Some(dir) = &dump_acts {
+                // the reference's activations, for offline comparison with the golden ones
+                let raw: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let _ = std::fs::write(format!("{dir}/act.{p}.{name}.{c}.f32"), raw);
+            }
             if let Some(files) = golden.get(&(p, name.to_string())) {
                 if let Some(f) = files.get(*c) {
                     let gv = read_f32(f);
@@ -76,6 +122,11 @@ fn main() -> Result<()> {
         } else if !report.is_empty() {
             let worst = report.iter().cloned().fold(("".into(), 0f32), |a, b| if b.1 > a.1 { b } else { a });
             println!("pos {p}  {} activations, worst {} {:.2e}", report.len(), worst.0, worst.1);
+        }
+        if let Ok(dir) = std::env::var("QX_REF_DUMP") {
+            // the reference's logits per position, for offline comparison
+            let raw: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(format!("{dir}/p{k}.ref.{p}.f32"), raw)?;
         }
         if p >= from {
             let gl = &logits[(p - from) * nv..(p - from + 1) * nv];

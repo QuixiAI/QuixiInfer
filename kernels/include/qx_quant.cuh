@@ -7,7 +7,8 @@
 #include "qx_common.cuh"
 #include "qx_iq_tables.cuh"
 
-enum QxType { QX_F32 = 0, QX_BF16 = 1, QX_Q8_0 = 2, QX_Q6_K = 3, QX_IQ4_NL = 4, QX_IQ3_S = 5, QX_IQ2_S = 6, QX_F16 = 7, QX_Q6_K_P = 8, QX_Q8_0_P = 9, QX_NVFP4 = 10 };
+enum QxType { QX_F32 = 0, QX_BF16 = 1, QX_Q8_0 = 2, QX_Q6_K = 3, QX_IQ4_NL = 4, QX_IQ3_S = 5, QX_IQ2_S = 6, QX_F16 = 7, QX_Q6_K_P = 8, QX_Q8_0_P = 9, QX_NVFP4 = 10,
+              QX_IQ2_XXS = 11, QX_IQ2_XS = 12, QX_IQ3_XXS = 13, QX_IQ1_S = 14, QX_Q2_K = 15, QX_Q5_K = 16 };
 
 /// Unsigned E4M3 as ggml decodes NVFP4's sub-block scales: the value halved, so the doubled FP4 codes multiply back
 /// to the real product. 0 and 0x7f decode to 0.
@@ -19,6 +20,9 @@ QX_DEV float ue4m3_half(u8 x) {
 }
 
 QX_DEV float ld_f16(const u8* p) { return f16_to_f32((u16)p[0] | ((u16)p[1] << 8)); }
+// unaligned little-endian loads: the odd block sizes (66, 50, ...) leave no alignment to rely on
+QX_DEV u32 ld_u16(const u8* p) { return (u32)p[0] | ((u32)p[1] << 8); }
+QX_DEV u32 ld_u32(const u8* p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
 
 template <int T> struct Fmt;
 template <> struct Fmt<QX_F32> { static constexpr int BE = 1, BB = 4; };
@@ -30,6 +34,12 @@ template <> struct Fmt<QX_IQ4_NL> { static constexpr int BE = 32, BB = 18; };
 template <> struct Fmt<QX_IQ3_S> { static constexpr int BE = 256, BB = 110; };
 template <> struct Fmt<QX_IQ2_S> { static constexpr int BE = 256, BB = 82; };
 template <> struct Fmt<QX_NVFP4> { static constexpr int BE = 64, BB = 36; };
+template <> struct Fmt<QX_IQ2_XXS> { static constexpr int BE = 256, BB = 66; };
+template <> struct Fmt<QX_IQ2_XS> { static constexpr int BE = 256, BB = 74; };
+template <> struct Fmt<QX_IQ3_XXS> { static constexpr int BE = 256, BB = 98; };
+template <> struct Fmt<QX_IQ1_S> { static constexpr int BE = 256, BB = 50; };
+template <> struct Fmt<QX_Q2_K> { static constexpr int BE = 256, BB = 84; };
+template <> struct Fmt<QX_Q5_K> { static constexpr int BE = 256, BB = 176; };
 
 /// Bytes of a row of `cols` elements.
 template <int T> QX_DEV u64 row_bytes(u32 cols) { return (u64)cols / Fmt<T>::BE * Fmt<T>::BB; }
@@ -127,6 +137,96 @@ template <> QX_DEV void decode8<QX_IQ2_S>(const u8* row, u32 chunk, int lane, fl
     }
 }
 
+/// IQ2_XXS: per 32-element sub-block two u32: four 8-bit grid indices, then four 7-bit KSIGNS indices and the scale.
+template <> QX_DEV void decode8<QX_IQ2_XXS>(const u8* row, u32 chunk, int lane, float* o) {
+    const u8* b = row + (u64)chunk * 66;
+    const float d = ld_f16(b);
+    const int i = lane / 4, g = lane % 4;
+    const u32 a = ld_u32(b + 2 + 8 * i), s = ld_u32(b + 6 + 8 * i);
+    const float db = d * (0.5f + (float)(s >> 28)) * 0.25f;
+    const u64 grid = __ldg(&IQ2XXS_GRID[(a >> (8 * g)) & 0xff]);
+    const u8 sg = __ldg(&KSIGNS[(s >> (7 * g)) & 0x7f]);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const float m = (float)((grid >> (8 * e)) & 0xff);
+        o[e] = (sg >> e) & 1 ? -db * m : db * m;
+    }
+}
+/// IQ2_XS: a u16 per 8 elements (9-bit grid index, 7-bit sign index), scale nibbles per 16.
+template <> QX_DEV void decode8<QX_IQ2_XS>(const u8* row, u32 chunk, int lane, float* o) {
+    const u8* b = row + (u64)chunk * 74;
+    const float d = ld_f16(b);
+    const int g = lane, sub = g / 2;
+    const int sc = (b[66 + sub / 2] >> (4 * (sub % 2))) & 0xf;
+    const float db = d * (0.5f + (float)sc) * 0.25f;
+    const u32 q = ld_u16(b + 2 + 2 * g);
+    const u64 grid = __ldg(&IQ2XS_GRID[q & 511]);
+    const u8 sg = __ldg(&KSIGNS[q >> 9]);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const float m = (float)((grid >> (8 * e)) & 0xff);
+        o[e] = (sg >> e) & 1 ? -db * m : db * m;
+    }
+}
+/// IQ3_XXS: a grid byte per 4 elements; per 32-element sub-block a u32 of four sign indices and the scale.
+template <> QX_DEV void decode8<QX_IQ3_XXS>(const u8* row, u32 chunk, int lane, float* o) {
+    const u8* b = row + (u64)chunk * 98;
+    const float d = ld_f16(b);
+    const int i = lane / 4, g = lane % 4;
+    const u32 s = ld_u32(b + 66 + 4 * i);
+    const float db = d * (0.5f + (float)(s >> 28)) * 0.5f;
+    const u8 sg = __ldg(&KSIGNS[(s >> (7 * g)) & 0x7f]);
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const u32 grid = __ldg(&IQ3XXS_GRID[b[2 + 8 * i + 2 * g + half]]);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int e = 4 * half + j;
+            const float m = (float)((grid >> (8 * j)) & 0xff);
+            o[e] = (sg >> e) & 1 ? -db * m : db * m;
+        }
+    }
+}
+/// IQ1_S: grid values -1, 0, 1 (stored + 1) plus a per-sub-block offset of +-1/8, scale 3 bits.
+template <> QX_DEV void decode8<QX_IQ1_S>(const u8* row, u32 chunk, int lane, float* o) {
+    const u8* b = row + (u64)chunk * 50;
+    const float d = ld_f16(b);
+    const int i = lane / 4, g = lane % 4;
+    const u32 qh = ld_u16(b + 34 + 2 * i);
+    const float dl = d * (float)(2 * ((qh >> 12) & 7) + 1);
+    const float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+    const u64 grid = __ldg(&IQ1S_GRID[b[2 + 4 * i + g] | (((qh >> (3 * g)) & 7) << 8)]);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) o[e] = dl * ((float)((grid >> (8 * e)) & 0xff) - 1.f + delta);
+}
+/// Q2_K: 2-bit values, a 4-bit scale and 4-bit min per 16 elements; d and dmin at the end of the block.
+template <> QX_DEV void decode8<QX_Q2_K>(const u8* row, u32 chunk, int lane, float* o) {
+    const u8* b = row + (u64)chunk * 84;
+    const float d = ld_f16(b + 80), dmin = ld_f16(b + 82);
+    const int j = lane / 2;
+    const float dl = d * (float)(b[j] & 0xf), ml = dmin * (float)(b[j] >> 4);
+    const u8* q = b + 16 + 32 * (lane / 16) + 8 * (lane % 4);
+    const int sh = 2 * ((lane % 16) / 4);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) o[e] = dl * (float)((q[e] >> sh) & 3) - ml;
+}
+/// Q5_K: 4 + 1 bits, 6-bit scale and min per 32 (ggml's packed K scales).
+template <> QX_DEV void decode8<QX_Q5_K>(const u8* row, u32 chunk, int lane, float* o) {
+    const u8* b = row + (u64)chunk * 176;
+    const float d = ld_f16(b), dmin = ld_f16(b + 2);
+    const u8* scales = b + 4;
+    const int j = lane / 4, k0 = 8 * (lane % 4);
+    int sc, m;
+    if (j < 4) { sc = scales[j] & 63; m = scales[j + 4] & 63; }
+    else { sc = (scales[j + 4] & 0xf) | ((scales[j - 4] >> 6) << 4); m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4); }
+    const float dj = d * (float)sc, mj = dmin * (float)m;
+    const u8* qs = b + 48 + 32 * (j / 2) + k0;
+    const u8* qh = b + 16 + k0;
+    const int sh = 4 * (j % 2);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) o[e] = dj * (float)(((qs[e] >> sh) & 0xf) | (((qh[e] >> j) & 1) << 4)) - mj;
+}
+
 // ---- planar layouts: the same bytes regrouped per row so lanes load 8 aligned bytes at a time ----
 //
 // Q6_K planar row of nb blocks: [ql: nb*128][qh: nb*64][scales: nb*16][d: nb*2], rows padded to 16 bytes.
@@ -165,6 +265,12 @@ QX_DEV u64 type_row_bytes(u32 ty, u32 cols) {
         case QX_IQ3_S: return (u64)cols / 256 * 110;
         case QX_IQ2_S: return (u64)cols / 256 * 82;
         case QX_NVFP4: return (u64)cols / 64 * 36;
+        case QX_IQ2_XXS: return (u64)cols / 256 * 66;
+        case QX_IQ2_XS: return (u64)cols / 256 * 74;
+        case QX_IQ3_XXS: return (u64)cols / 256 * 98;
+        case QX_IQ1_S: return (u64)cols / 256 * 50;
+        case QX_Q2_K: return (u64)cols / 256 * 84;
+        case QX_Q5_K: return (u64)cols / 256 * 176;
         default: return 0;
     }
 }

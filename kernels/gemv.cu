@@ -45,6 +45,12 @@ extern "C" __global__ void qx_gemv_iq4_nl(const u64* info) { gemv_row<QX_IQ4_NL>
 extern "C" __global__ void qx_gemv_iq3_s(const u64* info) { gemv_row<QX_IQ3_S>(info); }
 extern "C" __global__ void qx_gemv_iq2_s(const u64* info) { gemv_row<QX_IQ2_S>(info); }
 extern "C" __global__ void qx_gemv_nvfp4(const u64* info) { gemv_row<QX_NVFP4>(info); }
+extern "C" __global__ void qx_gemv_iq2_xxs(const u64* info) { gemv_row<QX_IQ2_XXS>(info); }
+extern "C" __global__ void qx_gemv_iq2_xs(const u64* info) { gemv_row<QX_IQ2_XS>(info); }
+extern "C" __global__ void qx_gemv_iq3_xxs(const u64* info) { gemv_row<QX_IQ3_XXS>(info); }
+extern "C" __global__ void qx_gemv_iq1_s(const u64* info) { gemv_row<QX_IQ1_S>(info); }
+extern "C" __global__ void qx_gemv_q2_k(const u64* info) { gemv_row<QX_Q2_K>(info); }
+extern "C" __global__ void qx_gemv_q5_k(const u64* info) { gemv_row<QX_Q5_K>(info); }
 
 /// Decodes rows [row0, row0 + rows) to f32: out[r * cols + i]. info: [0] W, [1] out, [2] rows, [3] cols,
 /// [4] row0, [5] address of a u32 added to row0 (0: none), e.g. the token id for an embedding lookup,
@@ -75,3 +81,9 @@ extern "C" __global__ void qx_dequant_iq4_nl(const u64* info) { dequant_rows<QX_
 extern "C" __global__ void qx_dequant_iq3_s(const u64* info) { dequant_rows<QX_IQ3_S>(info); }
 extern "C" __global__ void qx_dequant_iq2_s(const u64* info) { dequant_rows<QX_IQ2_S>(info); }
 extern "C" __global__ void qx_dequant_nvfp4(const u64* info) { dequant_rows<QX_NVFP4>(info); }
+extern "C" __global__ void qx_dequant_iq2_xxs(const u64* info) { dequant_rows<QX_IQ2_XXS>(info); }
+extern "C" __global__ void qx_dequant_iq2_xs(const u64* info) { dequant_rows<QX_IQ2_XS>(info); }
+extern "C" __global__ void qx_dequant_iq3_xxs(const u64* info) { dequant_rows<QX_IQ3_XXS>(info); }
+extern "C" __global__ void qx_dequant_iq1_s(const u64* info) { dequant_rows<QX_IQ1_S>(info); }
+extern "C" __global__ void qx_dequant_q2_k(const u64* info) { dequant_rows<QX_Q2_K>(info); }
+extern "C" __global__ void qx_dequant_q5_k(const u64* info) { dequant_rows<QX_Q5_K>(info); }

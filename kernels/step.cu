@@ -121,7 +121,9 @@ extern "C" __global__ void qx_sample_greedy(const u64* info) {
 /// Also quantizes x to Q8_K for the GPU expert kernels, exactly as qx_quant_q8k.
 /// info: [0] mailbox (mapped), [1] table, [2] layer * n_expert, [3] ids, [4] weights, [5] x, [6] step state,
 /// [7] layer, [8] k, [9] E, [10] slots out (u64 x selections), [11] x qs out (i8 x E per token), [12] x d out
-/// (f32 x E/256 per token), [13] tokens in the window (0: 1): selection a = t * k + j, token t's x at t * E.
+/// (f32 x E/256 per token), [13] tokens in the window (0: 1): selection a = t * k + j, token t's x at t * E,
+/// [14] RAM table (u64 per expert: the device-mapped address of its pinned record, or 0; 0: none), [15] the share
+/// of RAM-resident misses the GPU computes in place, in eighths (every RAM miss counts round robin).
 /// Grid: one block of 256 threads per token. Block 0 scans the selections and posts the job; every block copies
 /// (when the CPU has work) and quantizes its token's x; block 0 publishes the job once all have. Step words [7]
 /// (the job whose scan is out) and [8] (blocks done with it) order them; all blocks of a window are resident
@@ -140,12 +142,21 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
             while (ld_acquire_sys(reinterpret_cast<const u64*>(mb + MB_DONE)) < prev) {
             }
             const u64* table = reinterpret_cast<const u64*>(info[1]) + info[2];
+            const u64* rtable = info[14] ? reinterpret_cast<const u64*>(info[14]) + info[2] : nullptr;
+            const u32 share = (u32)info[15];
             const i32* ids = reinterpret_cast<const i32*>(info[3]);
-            u32 n = 0;
+            u32 n = 0, nmap = 0, nram = vst[9];  // the RAM-miss round robin persists across layers and windows
             u64* slots = reinterpret_cast<u64*>(info[10]);
             i32* all = reinterpret_cast<i32*>(mb + MB_ALL(E));
             for (u32 j = 0; j < A; ++j) {
-                const u64 slot = *reinterpret_cast<const volatile u64*>(&table[ids[j]]);
+                u64 slot = *reinterpret_cast<const volatile u64*>(&table[ids[j]]);
+                if (slot == 0 && rtable) {
+                    const u64 ram = *reinterpret_cast<const volatile u64*>(&rtable[ids[j]]);
+                    if (ram && (nram++ % 8) < share) {
+                        slot = ram;
+                        ++nmap;
+                    }
+                }
                 slots[j] = slot;
                 all[j] = ids[j];
                 if (slot == 0) {
@@ -158,6 +169,8 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
             *reinterpret_cast<u32*>(mb + MB_NMISS) = n;
             *reinterpret_cast<u32*>(mb + MB_NTOK) = T;
             *reinterpret_cast<u32*>(mb + MB_KPT) = (u32)info[8];
+            *reinterpret_cast<u32*>(mb + MB_NMAP) = nmap;
+            vst[9] = nram;
             vst[6] = n;
             __threadfence();
             vst[7] = (u32)(prev + 1);

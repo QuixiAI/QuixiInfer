@@ -14,8 +14,19 @@ fn suffix(t: GgmlType) -> &'static str {
         GgmlType::IQ3_S => "iq3_s",
         GgmlType::IQ2_S => "iq2_s",
         GgmlType::NVFP4 => "nvfp4",
+        GgmlType::IQ2_XXS => "iq2_xxs",
+        GgmlType::IQ2_XS => "iq2_xs",
+        GgmlType::IQ3_XXS => "iq3_xxs",
+        GgmlType::IQ1_S => "iq1_s",
+        GgmlType::Q2_K => "q2_k",
+        GgmlType::Q5_K => "q5_k",
         t => panic!("no GPU kernels for {t:?}"),
     }
+}
+
+/// The kernel-name suffix of a type (`qx_..._<suffix>`).
+pub fn suffix_of(t: GgmlType) -> &'static str {
+    suffix(t)
 }
 
 fn entry(prefix: &str, t: GgmlType) -> &'static str {
@@ -76,6 +87,12 @@ pub fn qx_type(t: GgmlType) -> u64 {
         GgmlType::IQ2_S => 6,
         GgmlType::F16 => 7,
         GgmlType::NVFP4 => 10,
+        GgmlType::IQ2_XXS => 11,
+        GgmlType::IQ2_XS => 12,
+        GgmlType::IQ3_XXS => 13,
+        GgmlType::IQ1_S => 14,
+        GgmlType::Q2_K => 15,
+        GgmlType::Q5_K => 16,
         t => panic!("no GPU decoder for {t:?}"),
     }
 }
@@ -107,8 +124,8 @@ pub struct MGemv {
 pub fn use_tmv(t: usize) -> bool {
     static U: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     match *U.get_or_init(|| std::env::var("QX_TMV").ok().map(|v| v != "0")) {
-        Some(always) => always,
-        None => t > 8 || (t > 4 && TMV_BATCHED.load(std::sync::atomic::Ordering::Relaxed)),
+        Some(always) => always && t <= 32,
+        None => t <= 32 && (t > 8 || (t > 4 && TMV_BATCHED.load(std::sync::atomic::Ordering::Relaxed))),
     }
 }
 
@@ -227,6 +244,11 @@ impl MGemv {
 
     pub fn run(&self, gpu: &Gpu, x: u64) {
         self.run_x(gpu, x, 0, 0);
+    }
+
+    /// The segment table's words (diagnostics): 8 per segment, [w, y, rows, cols, qx, lanes, blocks, stride].
+    pub fn table_words(&self) -> Vec<u64> {
+        self.table.download(8 * self.n)
     }
 
     /// With x transformed as it loads: mode 1 silu(x * f32::from_bits(arg)), mode 2 silu(x) * x2 (arg = &x2).

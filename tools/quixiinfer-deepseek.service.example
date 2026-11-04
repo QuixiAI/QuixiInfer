@@ -1,0 +1,24 @@
+# A systemd *user* unit for the DeepSeek-V4.1-Flash server (copy to ~/.config/systemd/user/quixiinfer-deepseek.service,
+# adjust the paths, then `systemctl --user enable --now quixiinfer-deepseek`). The memory cap matters: the expert
+# tiers pin most of the RAM, and an out-of-memory condition must kill this unit, not the session.
+[Unit]
+Description=QuixiInfer: DeepSeek-V4.1-Flash-1017 (UD-IQ2_XXS)
+After=network.target
+
+[Service]
+WorkingDirectory=/home/eric/git/QuixiInfer
+Environment=QX_DS_PROMOS=32
+# EnvironmentFile=%h/.config/quixiinfer-deepseek.env   # API_KEY=... when listening beyond 127.0.0.1
+ExecStart=/home/eric/git/QuixiInfer/target/release/quixiinfer serve \
+  --model /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
+  --pack  /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp \
+  --ctx 32768 --port 8000 --vram-gib 21 --ram-gib 88 \
+  --profile /home/eric/git/QuixiInfer/golden/profile-dsv41.txt --profile-out %h/.cache/quixiinfer-deepseek-profile.txt
+MemoryMax=112G
+MemorySwapMax=0
+LimitMEMLOCK=infinity
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

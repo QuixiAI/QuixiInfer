@@ -539,7 +539,7 @@ impl<'a> Engine<'a> {
         let f = fp8.as_ref().expect("prefill needs the FP8 KV cache");
         // the current slot's keys and KV
         let kr = kr.ptr + (self.cur * self.strides.kr * 4) as u64;
-        let kp = kp.ptr + (self.cur * self.strides.kp * 4) as u64;
+        let (kp, kp_off) = (kp.table(self.cur), kp.off as u64);
         let kvt = f.tab.ptr + (self.cur * 64) as u64;
         let (nh, nkv, hd, id) = (c.n_head, c.n_head_kv, c.head_dim, c.idx_dim);
         let tt = t as u64;
@@ -557,7 +557,7 @@ impl<'a> Engine<'a> {
         nr(pb.kraw.ptr, hd, nkv * hd, aw.k_norm.ptr, pb.knew.ptr, hd, nkv * hd, nkv, hd);
         self.pk("qxp_kv_append_fp8", (hd / 2) as u32, (nkv as u32, 2, t as u32), &[pb.knew.ptr, pb.vnew.ptr, kvt, 0, 0, 0, 0, 0, 0, 0, pb.p0.ptr, self.kv_window as u64, nkv as u64, hd as u64]);
         // Indexer: pooled keys of the blocks the chunk completes (before the ring moves on), then the ring.
-        self.pk("qxp_idx_pool", id as u32, ((t / c.kpool + 2) as u32, 1, 1), &[pb.kr.ptr, pb.p0.ptr, aw.ik_norm.ptr, kp, id as u64, c.n_rot as u64, bits(c.rope_base), bits(EPS), c.kpool as u64, kr, tt, IDX_RING as u64]);
+        self.pk("qxp_idx_pool", id as u32, ((t / c.kpool + 2) as u32, 1, 1), &[pb.kr.ptr, pb.p0.ptr, aw.ik_norm.ptr, kp, id as u64, c.n_rot as u64, bits(c.rope_base), bits(EPS), c.kpool as u64, kr, tt, IDX_RING as u64, kp_off]);
         self.pk("qxp_idx_ring", id as u32, (1, 1, 1), &[pb.kr.ptr, pb.p0.ptr, kr, id as u64, IDX_RING as u64, tt]);
         nr(pb.iq.ptr, id, c.idx_heads * id, aw.iq_norm.ptr, pb.qi.ptr, id, c.idx_heads * id, c.idx_heads, id);
         let sel = sel_cells(c);
@@ -567,9 +567,9 @@ impl<'a> Engine<'a> {
         let tiled = !std::env::var("QX_IDX_TILED").is_ok_and(|v| v == "0");
         if tiled {
             let nv_hi = (self.pos + t) / c.kpool;
-            self.pk("qxp_idx_score", 256, ((nv_hi as u32).div_ceil(64).max(1), (t as u32).div_ceil(64), 1), &[pb.qi.ptr, pb.p0.ptr, kp, pb.scores.ptr, c.idx_heads as u64, id as u64, c.kpool as u64, top, max_blocks as u64, tt]);
+            self.pk("qxp_idx_score", 256, ((nv_hi as u32).div_ceil(64).max(1), (t as u32).div_ceil(64), 1), &[pb.qi.ptr, pb.p0.ptr, kp, pb.scores.ptr, c.idx_heads as u64, id as u64, c.kpool as u64, top, max_blocks as u64, tt, kp_off]);
         }
-        self.pk("qxp_qsa_select", 1024, (t as u32, 1, 1), &[pb.qi.ptr, pb.p0.ptr, kp, pb.cells.ptr, pb.counts.ptr, c.idx_heads as u64, id as u64, c.kpool as u64, top, pb.scores.ptr, max_blocks as u64, sel as u64, tiled as u64]);
+        self.pk("qxp_qsa_select", 1024, (t as u32, 1, 1), &[pb.qi.ptr, pb.p0.ptr, kp, pb.cells.ptr, pb.counts.ptr, c.idx_heads as u64, id as u64, c.kpool as u64, top, pb.scores.ptr, max_blocks as u64, sel as u64, tiled as u64, kp_off]);
         // cells older than the VRAM ring: mirror the layer's KV into VRAM for the chunk's attention
         let end = self.pos + t;
         let (kvt, ring) = if end + crate::mailbox::WMAX + 1 > self.kv_window && !std::env::var("QX_KV_MIRROR").is_ok_and(|v| v == "0") {

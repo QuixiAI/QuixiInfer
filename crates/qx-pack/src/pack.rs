@@ -635,17 +635,21 @@ pub fn verify(pack: &Path, src: Option<&Gguf>) -> Result<()> {
         Ok(())
     })?;
     eprintln!("  dense: {} tensors equal", pk.tensors.iter().filter(|t| !t.packed()).count());
-    // experts, a layer at a time
+    // experts, 16 records at a time (a whole layer per thread is 32 x 3.7 GiB for a 146 GiB model: it OOMed)
     let e = &info.experts;
-    (0..e.layer_offset.len()).into_par_iter().try_for_each(|l| -> Result<()> {
+    const CHUNK: usize = 16;
+    let n_chunks = e.n_expert.div_ceil(CHUNK);
+    (0..e.layer_offset.len() * n_chunks).into_par_iter().try_for_each(|lc| -> Result<()> {
+        let (l, c) = (lc / n_chunks, lc % n_chunks);
+        let (x0, x1) = (c * CHUNK, ((c + 1) * CHUNK).min(e.n_expert));
         let rec = e.record[l] as usize;
-        let (buf, _) = read(info.offset[1] + e.layer_offset[l], rec * e.n_expert)?;
+        let (buf, _) = read(info.offset[1] + e.layer_offset[l] + (x0 * rec) as u64, rec * (x1 - x0))?;
         let t = |n: &str| g.data(g.tensor(&format!("blk.{l}.ffn_{n}_exps.weight")).unwrap());
         let (gd, ud, dd) = (t("gate"), t("up"), t("down"));
         let (gb, db, tb) = (e.gate[l] as usize, e.down[l] as usize, e.tail[l] as usize);
         let tails = (tb != 0).then(|| expert_scales(g, l, e.n_expert)).transpose()?;
-        for x in 0..e.n_expert {
-            let r = &buf.as_slice()[x * rec..(x + 1) * rec];
+        for x in x0..x1 {
+            let r = &buf.as_slice()[(x - x0) * rec..(x - x0 + 1) * rec];
             let tail_ok = match &tails {
                 Some(t) => r[2 * gb + db..2 * gb + db + tb] == tail_bytes(&t[x]),
                 None => true,

@@ -17,7 +17,7 @@ Paths are relative to the home directory. Surveyed 2026-10-24.
 | Sparse lightning indexer | QuixiCore-CUDA `kernels/serving/indexer_logits_*.cuh`; llama.cpp `ggml-cuda/lightning-indexer.cu` | Score layout, ReLU-weighted head sum, block pooling |
 | Top-k block selection | basalt `native_qsa_indexer.hpp` | Top-k over pooled block scores |
 | Gated DeltaNet decode | QuixiCore-CUDA `kernels/serving/kda_decode_kernels.cuh`; llama.cpp `ggml-cuda/gated_delta_net.cu` | State layout in registers and shared memory; QuixiCore's is KDA, with a per-channel gate instead of this model's scalar gate |
-| Gated DeltaNet prefill, chunked | llama.cpp `ggml-cuda/gated-delta-net-mma.cu`; QuixiCore-CUDA `kernels/lin_attn_tm/gdn_kernels.cuh` | Chunked recurrence on tensor cores |
+| Gated DeltaNet prefill, chunked | llama.cpp `ggml-cuda/gated-delta-net-mma.cu` | Chunked recurrence on tensor cores (QuixiCore-CUDA's `lin_attn_tm/gdn_kernels.cuh` is a serial per-token recurrence, not chunked; its chunk-parallel `tm_linattn_kernels.cuh` is for plain linear attention) |
 | Short conv before DeltaNet | llama.cpp `ggml_ssm_conv` CUDA op | Rolling conv state |
 | Hyper-connections | QuixiCore-CUDA `kernels/serving/mhc_ampere.cuh`; llama.cpp `ggml-cuda/dsv4-hc.cu` | Fused pre-mix and post-mix; warp split of partial sums |
 | PLE n-gram block | llama.cpp `qwen4exp.cpp` PLE section; basalt `native_ple_postops.hpp` | Hashing, gather, conv and key/value projections |

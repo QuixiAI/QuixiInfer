@@ -1,6 +1,6 @@
 //! `qx-membw`: the CPU expert pool's throughput on NVFP4 records alone, and while the GPU's copy engine reads
 //! pinned host memory over PCIe at the same time: whether the two share the RAM's bandwidth or add up.
-use qx_cpu::pool::{Expert, GateFmt, Pool};
+use qx_cpu::pool::{Expert, ExpertFmt, Pool};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ fn main() {
                 })
                 .collect();
             next = (next + 64) % n_rec;
-            pool.run_multi(GateFmt::Nvfp4, &[&x], FF, gate_row, down_row, &ex, &mut y);
+            pool.run_multi(ExpertFmt::NVFP4, &[&x], FF, gate_row, down_row, &ex, &mut y);
             n += 64;
         }
         (n * (2 * gb + db)) as f64 / t0.elapsed().as_secs_f64() / 1e9

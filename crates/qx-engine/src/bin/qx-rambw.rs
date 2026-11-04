@@ -1,7 +1,7 @@
 //! `qx-rambw`: how close the CPU expert pool gets to the RAM's read bandwidth, and which thread layout gets it
 //! there. Allocates the records the way `host_experts` does (anonymous memory with MADV_HUGEPAGE), then measures
 //! a plain AVX-512 streaming read and the pool's NVFP4 decode job for several CPU sets.
-use qx_cpu::pool::{Expert, GateFmt, Pool};
+use qx_cpu::pool::{Expert, ExpertFmt, Pool};
 use std::arch::x86_64::*;
 
 const E: usize = 2560;
@@ -107,7 +107,7 @@ fn main() {
                 })
                 .collect();
             next = (next + 64) % n_rec;
-            pool.run_multi(GateFmt::Nvfp4, &[&x], FF, gate_row, down_row, &ex, &mut y);
+            pool.run_multi(ExpertFmt::NVFP4, &[&x], FF, gate_row, down_row, &ex, &mut y);
             n += 64;
         }
         println!("pool      {name:<22} {:5.1} GB/s", (n * (2 * gb + db)) as f64 / t0.elapsed().as_secs_f64() / 1e9);

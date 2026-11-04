@@ -1,4 +1,5 @@
-//! The model's tokenizer, built from the GGUF: GPT-2 byte-level BPE with Qwen 3.5's pre-tokenizer split, and the
+//! The model's tokenizer, built from the GGUF: GPT-2 byte-level BPE with the pre-tokenizer split that
+//! `tokenizer.ggml.pre` names (Qwen 3.5's, or DeepSeek V4's `joyai-llm` chain as llama.cpp applies it), and the
 //! control tokens as special tokens.
 use anyhow::{anyhow, Result};
 use qx_pack::gguf::Gguf;
@@ -13,6 +14,12 @@ use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 
 /// Qwen 3.5's split regex, as in its tokenizer.json.
 const QWEN35_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// llama.cpp's `joyai-llm` pre-tokenizer (DeepSeek V4): three splits applied in turn.
+const JOYAI_SPLITS: [&str; 3] = [
+    r"\p{N}{1,3}",
+    r"[一-龥぀-ゟ゠-ヿ]+",
+    r"[!\x22#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+];
 
 pub struct Tok {
     pub inner: Tokenizer,
@@ -33,11 +40,18 @@ impl Tok {
         let vocab: HashMap<String, u32> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
         let bpe = BPE::builder().vocab_and_merges(vocab.into_iter().collect::<ahash::AHashMap<String, u32>>(), merges).build().map_err(|e| anyhow!("BPE: {e}"))?;
         let mut tk = Tokenizer::new(bpe);
-        let split = Split::new(SplitPattern::Regex(QWEN35_SPLIT.into()), SplitDelimiterBehavior::Isolated, false).map_err(|e| anyhow!("split: {e}"))?;
-        tk.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
-            PreTokenizerWrapper::Split(split),
-            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, false)),
-        ]))));
+        let pre = g.get("tokenizer.ggml.pre").and_then(|v| v.as_str()).unwrap_or("qwen2");
+        let patterns: Vec<&str> = match pre {
+            "joyai-llm" | "hy-v4" => JOYAI_SPLITS.to_vec(),
+            _ => vec![QWEN35_SPLIT],
+        };
+        let mut chain: Vec<PreTokenizerWrapper> = Vec::new();
+        for p in patterns {
+            let split = Split::new(SplitPattern::Regex(p.into()), SplitDelimiterBehavior::Isolated, false).map_err(|e| anyhow!("split: {e}"))?;
+            chain.push(PreTokenizerWrapper::Split(split));
+        }
+        chain.push(PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, false)));
+        tk.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(chain))));
         tk.with_decoder(Some(ByteLevelDecoder::default()));
         // ggml token types: 3 control, 4 user-defined; both match as whole tokens before BPE.
         let mut specials = HashMap::new();

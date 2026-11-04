@@ -2,7 +2,7 @@
 //! pool and posts each position's PLE embedding once its token is known.
 //!
 //! Layouts mirror kernels/include/qx_sys.cuh.
-use qx_cpu::pool::{Expert, GateFmt, Pool};
+use qx_cpu::pool::{Expert, ExpertFmt, Pool, WType};
 use qx_gpu::mem::HostMapped;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -10,8 +10,8 @@ use std::sync::Arc;
 /// Tokens per speculative window (one sequence), tokens per window (all sequences), selections per window and
 /// u32 step words per sequence slot (kernels/include/qx_sys.cuh).
 pub const WMAX: usize = 8;
-pub const TMAX: usize = 32;
-pub const AMAX: usize = 320;
+pub const TMAX: usize = 128;
+pub const AMAX: usize = 1280;
 pub const STEP_ROW: usize = 16;
 const _: () = assert!(qx_cpu::pool::MAX_EXPERTS >= AMAX, "the CPU pool must take a whole window's misses");
 pub const MB_SEQ: usize = 0;
@@ -20,10 +20,11 @@ pub const MB_LAYER: usize = 128;
 pub const MB_NMISS: usize = 132;
 pub const MB_NTOK: usize = 136;
 pub const MB_KPT: usize = 140;
+pub const MB_NMAP: usize = 144;
 pub const MB_IDS: usize = 256;
-pub const MB_KIDX: usize = 1536;
-pub const MB_ALL: usize = 2816;
-pub const MB_X: usize = 4096;
+pub const MB_KIDX: usize = 5376;
+pub const MB_ALL: usize = 10496;
+pub const MB_X: usize = 16384;
 /// AMAX rows of E floats: the unweighted output of the missing expert with selection index a at row a.
 pub fn mb_y(e: usize) -> usize {
     MB_X + 4 * TMAX * e
@@ -50,7 +51,7 @@ pub struct LayerPtrs {
     pub gate_bytes: usize,
     pub gate_row_bytes: usize,
     pub down_row_bytes: usize,
-    pub fmt: GateFmt,
+    pub fmt: ExpertFmt,
 }
 unsafe impl Send for LayerPtrs {}
 
@@ -60,7 +61,7 @@ impl LayerPtrs {
     }
     /// Expert `e`'s per-tensor scales {gate, up, down} from its record tail (1 for the formats without one).
     fn scales(&self, e: usize) -> [f32; 3] {
-        if self.fmt != GateFmt::Nvfp4 {
+        if self.fmt.gate != WType::Nvfp4 {
             return [1.0; 3];
         }
         let p = unsafe { self.rec(e).add(self.rec_bytes - 16) };
@@ -474,12 +475,8 @@ impl Drop for Driver {
 /// f32 experts: row k of y = down_e(silu(gate_e x) * up_e x), every row decoded and dotted in f32.
 fn exact_experts(lp: &LayerPtrs, ids: &[i32], kidx: &[i32], x: &[f32], ff: usize, y: &mut [f32]) {
     let gb = lp.gate_bytes;
-    use qx_pack::ggml::GgmlType;
-    let (gt, dt) = match lp.fmt {
-        GateFmt::Iq3s => (GgmlType::IQ3_S, GgmlType::IQ4_NL),
-        GateFmt::Iq2s => (GgmlType::IQ2_S, GgmlType::IQ4_NL),
-        GateFmt::Nvfp4 => (GgmlType::NVFP4, GgmlType::NVFP4),
-    };
+    let (gt, dt) = (crate::experts::ggml_of(lp.fmt.gate), crate::experts::ggml_of(lp.fmt.down));
+    let c = lp.fmt.clamp;
     let n = x.len();
     let (mut row, mut row2) = (vec![0f32; n], vec![0f32; ff]);
     for (&e, &k) in ids.iter().zip(kidx) {
@@ -493,7 +490,7 @@ fn exact_experts(lp: &LayerPtrs, ids: &[i32], kidx: &[i32], x: &[f32], ff: usize
             let gv = qx_ref::weights::dot(&row, x) * sc[0];
             qx_pack::dequant(gt, u, &mut row);
             let uv = qx_ref::weights::dot(&row, x) * sc[1];
-            h[r] = qx_cpu::math::qx_silu_mul(gv, uv);
+            h[r] = if c > 0.0 { qx_cpu::math::qx_silu_mul(gv.min(c), uv.clamp(-c, c)) } else { qx_cpu::math::qx_silu_mul(gv, uv) };
         }
         for r in 0..n {
             let d = unsafe { std::slice::from_raw_parts(lp.rec(e).add(2 * gb + r * lp.down_row_bytes), lp.down_row_bytes) };

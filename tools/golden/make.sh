@@ -5,5 +5,5 @@ LLAMA=${LLAMA:-$HOME/llama.cpp}
 BUILD=${BUILD:-$LLAMA/build-qx}
 OUT=${OUT:-$(dirname "$0")/golden}
 g++ -O2 -std=c++17 "$(dirname "$0")/golden.cpp" -I"$LLAMA/include" -I"$LLAMA/ggml/include" \
-    -L"$BUILD/bin" -lllama -lggml -lggml-base -Wl,-rpath,"$BUILD/bin" -o "$OUT"
+    -L"$BUILD/bin" -lllama -lggml -lggml-base -Wl,--disable-new-dtags -Wl,-rpath,"$BUILD/bin" -o "$OUT"
 echo "built $OUT"

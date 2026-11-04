@@ -127,18 +127,19 @@ impl Drafter {
         bytes.set(bytes.get() + host.len());
         let (nkv, hd) = (cfg.n_head_kv, cfg.head_dim);
         // its own host pages for its one attention layer, all assigned up front
-        let mut pages = crate::kvpages::KvPages::new(1, nkv, hd, 1, max_ctx, 0, None);
+        let mut pages = crate::kvpages::KvPages::new(1, nkv, hd, 1, max_ctx, 0, None, crate::kvpages::PAGE / cfg.kpool * cfg.idx_dim * 4);
         let pages_tab = DeviceBuf::new(pages.max_pages * 8);
         let ids: Vec<u32> = (0..pages.max_pages).map(|_| pages.alloc().unwrap()).collect();
         pages_tab.upload(&ids.iter().map(|&p| pages.addr(p)).collect::<Vec<u64>>());
+        pages.kp_tables.upload(&ids.iter().map(|&p| pages.kp_addr(p)).collect::<Vec<u64>>());
         let state = LayerState::Attn {
             k: DeviceBuf::new(0),
             v: DeviceBuf::new(0),
             kr: DeviceBuf::new(IDX_RING * cfg.idx_dim * 4),
-            kp: DeviceBuf::new(max_ctx.div_ceil(cfg.kpool) * cfg.idx_dim * 4),
+            kp: Kp { tab: pages.kp_tables.ptr, stride: pages.max_pages, off: 0 },
             fp8: Some(Fp8Kv::new(1, window, nkv, hd, |_| pages_tab.ptr, pages.offsets(0))),
         };
-        bytes.set(bytes.get() + 2 * window * nkv * (hd + 4) + max_ctx.div_ceil(cfg.kpool) * cfg.idx_dim * 4 + WMAX * HC * 3 * E * 4);
+        bytes.set(bytes.get() + 2 * window * nkv * (hd + 4) + pages.pages() * pages.kp_page + WMAX * HC * 3 * E * 4);
         let seg = |m: &Mat, y: &DeviceBuf| Seg { w: m.buf.ptr, y: y.ptr, rows: m.rows, cols: m.cols, qx: m.qx, stride: m.stride };
         let hc_groups = |h: &HcW| -> (MGemv, MGemv) {
             let mut first = vec![seg(&h.down, &s.lo)];
@@ -197,9 +198,8 @@ impl Drafter {
 impl Drafter {
     /// Clears the drafter's sequence state (its KV is overwritten as positions are written).
     pub fn reset(&self) {
-        if let LayerState::Attn { kr, kp, .. } = &self.state {
+        if let LayerState::Attn { kr, .. } = &self.state {
             kr.zero();
-            kp.zero();
         }
     }
 

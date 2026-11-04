@@ -20,6 +20,16 @@ QX_DEV u8* kv_page_row(const u64* tab, bool v, u32 cell, u32 g, u32 nkv, u32 d, 
     return reinterpret_cast<u8*>(base + (v ? tab[6] : tab[5]) + i * d);
 }
 
+// The indexer's pooled keys are paged the same way, in VRAM: kp page i (one per host page) holds the
+// QX_KV_PAGE / block pooled keys of every attention layer, [layer][block within the page][dim] f32, and a slot's
+// kp page table holds their addresses by block / (QX_KV_PAGE / block) (crates/qx-engine/src/kvpages.rs).
+
+/// Block b's pooled key in the kp pages `tab` (a slot's kp page table), the layer's rows `off` bytes into a page.
+QX_DEV float* kp_row(const u64* tab, u64 off, u32 b, u32 block, u32 d) {
+    const u32 per = QX_KV_PAGE / block;
+    return reinterpret_cast<float*>(tab[b / per] + off) + (u64)(b % per) * d;
+}
+
 /// Max over the 16 lanes of a half-warp (one 32-dim group when a lane holds two dims).
 QX_DEV float group16_max(float m) {
 #pragma unroll

@@ -130,6 +130,7 @@ template <int XM, int NT> QX_DEV void partial(u32 ty, const u8* row, const XIn<X
     switch (ty) {
 #define C(t) case t: row_partial<t, XM, NT>(row, x, cols, lane, lanes, step0, dstep, out); return;
         C(QX_F32) C(QX_BF16) C(QX_Q8_0) C(QX_Q6_K) C(QX_IQ4_NL) C(QX_IQ3_S) C(QX_IQ2_S) C(QX_Q6_K_P) C(QX_Q8_0_P) C(QX_NVFP4)
+        C(QX_IQ2_XXS) C(QX_IQ2_XS) C(QX_IQ3_XXS) C(QX_IQ1_S) C(QX_Q2_K) C(QX_Q5_K)
 #undef C
         default:
 #pragma unroll

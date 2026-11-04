@@ -51,9 +51,12 @@ fn main() -> Result<()> {
             let out = std::path::Path::new(&args[3]);
             let flag = |f: &str| args.iter().position(|a| a == f);
             let ne = g.tensors.iter().find(|t| t.name.ends_with("ffn_gate_exps.weight")).map_or(0, |t| *t.shape.last().unwrap() as usize);
+            // the compiled-in calibration ranking is Qwen3.8-Flash-Next's: other models get none unless --profile says
+            let arch = g.get("general.architecture").and_then(|v| v.as_str()).unwrap_or("");
             let text = match flag("--profile") {
                 Some(i) => std::fs::read_to_string(&args[i + 1])?,
-                None => qx_pack::pack::CALIB_ROUTING.to_string(),
+                None if arch == "qwen4exp" => qx_pack::pack::CALIB_ROUTING.to_string(),
+                None => String::new(),
             };
             let routing: Vec<u32> = text
                 .lines()
