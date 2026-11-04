@@ -78,9 +78,13 @@ fn main() -> anyhow::Result<()> {
         // QX_DS_WINDOW=T (forced mode): the tokens in windows of T through forward_window
         let window = std::env::var("QX_DS_WINDOW").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
         if n_gen == 0 && window > 1 {
+            // QX_DS_TAIL=N: the last N tokens one at a time (decode at the long context the windows built)
+            let tail = std::env::var("QX_DS_TAIL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(toks.len() - 1);
+            let mut tail_times: Vec<f64> = Vec::new();
             let mut p = 0;
             while p < toks.len() {
-                let w = &toks[p..(p + window).min(toks.len())];
+                let cap = if p >= toks.len() - tail { 1 } else { window.min(toks.len() - tail - p) };
+                let w = &toks[p..(p + cap).min(toks.len())];
                 let logits = eng.forward_window(w, None);
                 let nv = logits.len() / w.len();
                 for (i, row) in logits.chunks(nv).enumerate() {
@@ -94,8 +98,11 @@ fn main() -> anyhow::Result<()> {
                 t_all += eng.t_forward;
                 t_eng += eng.t_engram;
                 per_tok.extend(std::iter::repeat(eng.t_forward / w.len() as f64).take(w.len()));
+                if w.len() == 1 && tail > 0 {
+                    tail_times.push(eng.t_forward);
+                }
                 p += w.len();
-                if (p / window) % 4 == 0 || p == toks.len() {
+                if (p / window) % 4 == 0 && w.len() > 1 || p == toks.len() {
                     let tiers = eng.tier_stats().unwrap_or_default();
                     eprintln!("pos {}: {:.0} ms per window of {} ({:.1} ms per token){tiers}", p - 1, eng.t_forward * 1e3, w.len(), eng.t_forward * 1e3 / w.len() as f64);
                 }
@@ -104,6 +111,10 @@ fn main() -> anyhow::Result<()> {
             let last = &per_tok[n.saturating_sub(32)..];
             let last_ms = last.iter().sum::<f64>() * 1e3 / last.len().max(1) as f64;
             println!("windows of {window}: {} tokens, {:.1} ms per token ({:.1} ms engram gather), {:.1} tok/s; last {}: {:.1} ms per token, {:.1} tok/s; tokens {:?}", n, t_all * 1e3 / n as f64, t_eng * 1e3 / n as f64, n as f64 / t_all, last.len(), last_ms, 1e3 / last_ms, &out_toks[..out_toks.len().min(24)]);
+            if !tail_times.is_empty() {
+                let m = tail_times.iter().sum::<f64>() * 1e3 / tail_times.len() as f64;
+                println!("decode tail of {} single steps at position {}+: {:.1} ms per token ({:.1} tok/s)", tail_times.len(), toks.len() - tail_times.len(), m, 1e3 / m);
+            }
             return Ok(());
         }
         for p in 0..total {

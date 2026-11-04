@@ -557,7 +557,14 @@ impl<'a> DsEngine<'a> {
                     (0..cfg.n_layer).flat_map(|l| (0..n_expert).map(move |e| (l, e))).collect()
                 });
                 // VRAM: the hottest records that fit; a slot per record at its own size
-                let budget = (vram_gib * 1073741824.0) as usize;
+                // the expert tier takes at most what the context, slots and scratch left (everything else is
+                // allocated by now), less headroom for the runtime's pools and the window graphs
+                let want = (vram_gib * 1073741824.0) as usize;
+                let (free, _) = qx_gpu::mem::mem_info();
+                let budget = want.min(free.saturating_sub(1536 << 20));
+                if budget < want {
+                    eprintln!("tiers: VRAM budget cut from {:.1} to {:.1} GiB: the context and slots take the rest", vram_gib, budget as f64 / 1073741824.0);
+                }
                 let mut take: Vec<(usize, usize)> = Vec::new();
                 let mut used = 0usize;
                 let mut in_vram = vec![false; cfg.n_layer * n_expert];

@@ -874,6 +874,19 @@ Decode right after a 1k-token prefill: 95 tok/s (token-by-token prompt: 103), 90
     constraint mixed in; per-request decode 5-12 tok/s cold, 14-16 warm. The RAM tier default is now 100 GiB (the
     server runs alone: 13 GB stay available on the 120 GiB box; `MemoryMax=118G`). Lesson: after stopping a
     server, CUDA's teardown of the pinned mappings holds the VRAM for 10-30 s; the next job must wait for it.
+  - **Long context.** 16,384 forced tokens of the routing trace in windows of 64, then 64 single steps at 16k:
+    no faults, no NaN. Prefill cost rises with position (23 ms per token at 1k, 28 at 4k, 42 at 8k, 46 at 12k)
+    and the decode tail at 16k runs 52.7 ms per token against 32 at 1k. The pool carries most of the rise: its
+    time per token went from 32 to 46 ms as the VRAM share drifted from 66% to 56% through the corpus's changing
+    topics (the adaptive tier chases); a GPU-only run at 16k separates the GPU's part. The server at a 32k context
+    with 3 slots ran out of VRAM at load (the per-slot stores are 1 GB there and the expert tier took its full 21
+    GiB budget first): the tier now takes at most what the context, slots and scratch leave, less 1.5 GiB. New:
+    `tools/ds-checks.sh` runs the engine's regression checks (exact and production agreement with the reference,
+    windows against single steps, tokenizer against llama.cpp) in one command.
+    GPU-only at 16k: prefill windows 3.1 ms per token at 1k to 3.8 at 12k, but a single decode step 24.1 ms
+    against 13.7 at a short context: about 10 of the 53 ms per token at 16k are GPU-side context growth, the
+    rest the pool; being profiled (the difference of two profiles, with and without the 64-step tail).
+    `tools/ds-checks.sh` first run: every number reproduced in 3 minutes.
 
 ## Not yet
 
