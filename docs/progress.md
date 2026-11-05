@@ -897,6 +897,41 @@ Decode right after a 1k-token prefill: 95 tok/s (token-by-token prompt: 103), 90
     from a fixed set (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128: the decoders, then prompt tokens up to the
     largest width the prompts can fill), the warm-up captures one token per decoding slot and the prompt chunk,
     and the scheduler statistics print the width histogram.
+  - **CPU pool + DMA-staged GPU share of the missing experts** (`QX_DS_STAGE_SHARE` in eighths, `QX_DS_STAGE_CAP`
+    records of staging VRAM, `QX_DS_STAGE_STREAMS`). The post kernel sends a share of the RAM-resident misses to a
+    staged list; the driver copies those records into a VRAM staging area (reused per job: the GPU finished the
+    previous job's staged kernels before it posted this one) while the pool computes its share, writes the slot
+    addresses behind the copies, and releases a staged-done word; the GPU waits on it and runs the same expert
+    kernels over the staged slots; the combine reads GPU outputs for resident and staged selections. Results stay
+    bit-identical (128/128). First measurement, one copy stream and one copy per selection: decode unchanged at
+    31.9 ms (a staged expert costs 0.7 ms of DMA at 14 GB/s against the pool's 0.22, so the balance point is a
+    small share) and prefill windows copy-bound (an expert selected by several tokens was copied several times:
+    1.4 s per 64-token window at the end). Now one copy per distinct record and four copy streams; re-measured.
+    With one copy per distinct record and four copy streams: decode 31.2 ms at a 4/8 share (from 32.0: the DMA
+    per expert still exceeds the pool's 0.22 ms at one token), **prefill windows of 64 at the end of 1024 tokens:
+    21.8 ms per token without staging, 17.0 at 3/8, 14.7 at 4/8, 13.3 at 5/8 (75 tok/s)**, the staging wait near
+    zero (the pool remains the limit, so larger shares are being tried). The share is now per window kind:
+    `QX_DS_STAGE_SHARE` (default 6) for windows of 8 tokens and more, `QX_DS_STAGE_SHARE_DECODE` (default 3) for
+    single steps; the staging area holds `QX_DS_STAGE_CAP` (96) records of the largest size.
+    Sweep with the 96-record area, windows of 64 at the end of 1024 tokens: 6/8 **11.8 ms per token (85 tok/s)**,
+    7/8 11.8, 8/8 11.6 (the pool then only serves NVMe misses; the limit moves to the copies and the GPU's expert
+    kernels). Windows of 128 do worse (14.6: a window's distinct experts exceed the staging area, the rest go to
+    the pool), so 64 stays the prompt chunk. Decode with the 3/8 default: 31.4 ms. **Prefill 21.8 -> 11.8 ms per
+    token (1.85x) for about 1 GiB of staging VRAM**; the results stay bit-identical.
+  - **An intermittent hang, found with a debugger (2026-11-04).** `tools/ds-checks.sh` hung in its windows-of-8
+    run about one time in three inside the script and never standalone: GPU at 100%, one thread at 100% CPU,
+    the main thread asleep. Attached as root (`sudo -n gdb -p PID -batch -ex "thread apply all bt"`; `ptrace_scope`
+    is 1): the spinning thread was CubeCL's server thread (CubeCL names it `DSD-0-0`) inside `cuModuleLoadData`
+    from `load_transpiled`, i.e. compiling and loading a kernel the 8-token window launched for the first time;
+    the main thread was blocked submitting the next launch to it; the device was spinning in `qx_moe_wait` for the
+    driver's answer; the driver's copies wait for the context lock the module load holds. A module load while a
+    host-waiting kernel is in flight is a documented CUDA hazard. (A first reading blamed the driver thread's own
+    first copies and added `CUDA_MODULE_LOADING=EAGER` plus a copy warm-up before `Driver::start` returns; both are
+    kept as cheap hygiene, but the hang persisted, three of three, which is what forced the full thread dump.)
+    Fix: the first window of each width runs a dry pass first (`qx_moe_post` with bit 32 of its width word set
+    posts no job and zeroes the slot lists, the wait kernels return at once), with positions clamped so the
+    compressed-store kernels are launched too, then the device is drained; every kernel of that width is compiled
+    and loaded before any job exists. The dry pass writes the ring and store positions the real pass rewrites.
 
 ## Not yet
 

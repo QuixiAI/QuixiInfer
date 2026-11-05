@@ -25,6 +25,10 @@ pub struct Shared {
     pub promo_ns: AtomicU64,
     /// Selections the GPU computed in place from device-mapped RAM.
     pub mapped_hits: AtomicU64,
+    /// Selections staged into VRAM by DMA for the GPU, and the time the driver waited for those copies after
+    /// its pool share.
+    pub staged_hits: AtomicU64,
+    pub stage_ns: AtomicU64,
     /// Set by the host after each token (the sampled token is known): the driver may run its promotions.
     pub tokens_done: AtomicU64,
     /// A request for the live ranking (every expert, hottest first: VRAM residents, then RAM, then NVMe, each by
@@ -54,6 +58,12 @@ pub struct Host {
     pub rtable: Vec<u64>,
     /// Whether the GPU reads RAM records in place (then evicted places are quarantined two ticks).
     pub gpu_reads_ram: bool,
+    /// The VRAM staging area for DMA-staged experts (`stage_cap` records of the largest size, reused per job)
+    /// and the device array the staged slot addresses go to.
+    pub stage_base: u64,
+    pub stage_cap: usize,
+    pub slots_stg_dev: u64,
+    pub slots_all_dev: u64,
     pub arena_ptr: u64,
     /// VRAM slots by size class: (bytes, free addresses); the holder of each slot.
     pub classes: Vec<(usize, Vec<u64>)>,
@@ -89,12 +99,19 @@ impl Driver {
             fetch_ns: Default::default(),
             promo_ns: Default::default(),
             mapped_hits: Default::default(),
+            staged_hits: Default::default(),
+            stage_ns: Default::default(),
             tokens_done: Default::default(),
             profile_req: AtomicBool::new(false),
             profile: std::sync::Mutex::new(None),
         });
         let sh = shared.clone();
-        let thread = std::thread::spawn(move || run(sh, host, cpus));
+        // the thread finishes its CUDA set-up (streams, events, pinned words) before any window can post a job:
+        // a host allocation that synchronizes with the device would otherwise deadlock against the first post
+        // kernel spinning on the mailbox
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || run(sh, host, cpus, ready_tx));
+        let _ = ready_rx.recv();
         Self { shared, thread: Some(thread) }
     }
 }
@@ -129,6 +146,10 @@ struct Loop {
     /// RAM places taken from evicted records, free again two ticks later (a window in flight may read them in
     /// place): (free at tick, class, place).
     ram_quarantine: std::collections::VecDeque<(u64, usize, usize)>,
+    /// The staging copies' streams (round robin: one copy engine queue is 14 GB/s, several approach the link) and
+    /// an event per stream.
+    stage_streams: Vec<cudarc::driver::sys::CUstream>,
+    stage_events: Vec<cudarc::driver::sys::CUevent>,
 }
 
 impl Loop {
@@ -140,6 +161,22 @@ impl Loop {
             cudarc::driver::sys::cuMemcpyHtoDAsync_v2(self.host.table_dev + 8 * g as u64, self.words.ptr.add(i * 8) as *const _, 8, self.stream).result().expect("table write");
         }
         self.host.table[g] = v;
+    }
+
+    /// Writes one u64 to device memory on the copy stream (from the pinned words ring).
+    fn write_word(&mut self, dst: u64, v: u64) {
+        let st = self.stream;
+        self.write_word_on(st, dst, v);
+    }
+
+    /// `write_word` on a given stream.
+    fn write_word_on(&mut self, stream: cudarc::driver::sys::CUstream, dst: u64, v: u64) {
+        let i = self.word_next;
+        self.word_next = (self.word_next + 1) % (self.words.bytes / 8);
+        self.words.slice::<u64>(i * 8, 1)[0] = v;
+        unsafe {
+            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dst, self.words.ptr.add(i * 8) as *const _, 8, stream).result().expect("device word write");
+        }
     }
 
     /// Writes the RAM table's entry for `g` (the mapped address of its place, or 0) on the copy stream.
@@ -160,18 +197,72 @@ impl Loop {
         let l = *mb.slice::<u32>(MB_LAYER, 1).first().unwrap() as usize;
         let nm = *mb.slice::<u32>(MB_NMISS, 1).first().unwrap() as usize;
         let nmap = *mb.slice::<u32>(mailbox::MB_NMAP, 1).first().unwrap() as usize;
+        let nstage = *mb.slice::<u32>(mailbox::MB_NSTAGE, 1).first().unwrap() as usize;
         let ntok = (*mb.slice::<u32>(MB_NTOK, 1).first().unwrap() as usize).max(1);
         let kpt = (*mb.slice::<u32>(MB_KPT, 1).first().unwrap() as usize).max(1);
-        let ids: Vec<i32> = mb.slice::<i32>(MB_IDS, nm).to_vec();
-        let kidx: Vec<i32> = mb.slice::<i32>(MB_KIDX, nm).to_vec();
+        let mut ids: Vec<i32> = mb.slice::<i32>(MB_IDS, nm).to_vec();
+        let mut kidx: Vec<i32> = mb.slice::<i32>(MB_KIDX, nm).to_vec();
         // every routed expert of this layer scores (the post kernel lists them all)
         let all: Vec<i32> = mb.slice::<i32>(MB_ALL_OFF, ntok * kpt).to_vec();
         let ne = self.host.n_expert;
         for &e in &all {
             self.host.score[l * ne + e as usize] += 1.0;
         }
-        sh.vram_hits.fetch_add((all.len() - nm - nmap) as u64, Ordering::Relaxed);
+        sh.vram_hits.fetch_add((all.len() - nm - nmap - nstage) as u64, Ordering::Relaxed);
         sh.mapped_hits.fetch_add(nmap as u64, Ordering::Relaxed);
+        sh.staged_hits.fetch_add(nstage as u64, Ordering::Relaxed);
+        // the staged share: each record copied from its RAM place into the staging area on the copy stream, its
+        // address written to the staged slot array behind the copy, then the staged-done word once all landed
+        // (after the pool share below, so the copies overlap it). The area is reused per job: the GPU finished
+        // the previous job's staged kernels before it posted this one.
+        let mut staged: Vec<usize> = Vec::new();
+        let mut used_streams: Vec<usize> = Vec::new();
+        if nstage > 0 {
+            let sids: Vec<i32> = mb.slice::<i32>(mailbox::MB_SIDS, nstage).to_vec();
+            let skidx: Vec<i32> = mb.slice::<i32>(mailbox::MB_SKIDX, nstage).to_vec();
+            let ne = self.host.n_expert;
+            let mut off = 0u64;
+            // one copy per distinct record (a window selects an expert for several tokens): (slot, its stream)
+            let mut placed: std::collections::HashMap<usize, (u64, usize)> = Default::default();
+            let mut next_stream = 0usize;
+            for (&e, &a) in sids.iter().zip(&skidx) {
+                let g = l * ne + e as usize;
+                let (dst, si) = match placed.get(&g) {
+                    Some(&p) => p,
+                    None => {
+                        if !self.host.store.in_ram(g) {
+                            // evicted between the post and now: the pool computes it, and the combine takes its row
+                            ids.push(e);
+                            kidx.push(a);
+                            self.write_word(self.host.slots_all_dev + 8 * a as u64, 0);
+                            continue;
+                        }
+                        let nb = self.host.store.record_bytes(g);
+                        let dst = self.host.stage_base + off;
+                        off += nb as u64;
+                        let si = next_stream % self.stage_streams.len();
+                        next_stream += 1;
+                        if !used_streams.contains(&si) {
+                            used_streams.push(si);
+                        }
+                        let src = self.host.store.place[g] as *const u8;
+                        unsafe {
+                            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dst, src as *const _, nb, self.stage_streams[si]).result().expect("stage copy");
+                        }
+                        staged.push(g);
+                        placed.insert(g, (dst, si));
+                        (dst, si)
+                    }
+                };
+                let st = self.stage_streams[si];
+                self.write_word_on(st, self.host.slots_stg_dev + 8 * a as u64, dst);
+            }
+            for &si in &used_streams {
+                unsafe { cudarc::driver::result::event::record(self.stage_events[si], self.stage_streams[si]).expect("event record") };
+            }
+            self.missed.extend_from_slice(&staged);
+        }
+        let nm = ids.len();
         if nm > 0 {
             let t0 = std::time::Instant::now();
             let gs: Vec<usize> = ids.iter().map(|&e| l * ne + e as usize).collect();
@@ -201,6 +292,14 @@ impl Loop {
                 self.pool.run_multi(lf.fmt, &xr, self.host.ff, lf.gate_row_bytes, lf.down_row_bytes, &nvme, y);
             }
             sh.pool_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        if nstage > 0 {
+            let tw = std::time::Instant::now();
+            for &si in &used_streams {
+                unsafe { cudarc::driver::result::event::synchronize(self.stage_events[si]).expect("stage copies") };
+            }
+            sh.stage_ns.fetch_add(tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            mb.atomic_u64(mailbox::MB_STG_DONE).store(seq, Ordering::Release);
         }
         mb.atomic_u64(MB_DONE).store(seq, Ordering::Release);
     }
@@ -375,14 +474,38 @@ impl Loop {
 /// The mailbox offset of the "all routed experts" list (`MB_ALL` in qx_sys.cuh).
 const MB_ALL_OFF: usize = mailbox::MB_ALL;
 
-fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>) {
+fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Sender<()>) {
     qx_gpu::mem::bind();
     let pool = Pool::new(&cpus);
     let stream = unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("copy stream");
     let copy_event = cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("copy event");
-    let mut lp = Loop { host, pool, stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default() };
+    let n_stage_streams: usize = std::env::var("QX_DS_STAGE_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 8);
+    let stage_streams: Vec<cudarc::driver::sys::CUstream> = (0..n_stage_streams).map(|_| unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("stage stream")).collect();
+    let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
+    let mut lp = Loop { host, pool, stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events };
+    // exercise every copy path once before a window can wait on this thread: whatever the CUDA driver
+    // loads or allocates on a stream's first copy then happens while the device is idle
+    let scratch = qx_gpu::mem::DeviceBuf::new(64);
+    for si in 0..lp.stage_streams.len() {
+        let st = lp.stage_streams[si];
+        lp.write_word_on(st, scratch.ptr, 0);
+        unsafe {
+            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(scratch.ptr + 8, lp.words.ptr as *const _, 8, st).result().expect("warm copy");
+            cudarc::driver::result::event::record(lp.stage_events[si], st).expect("event record");
+            cudarc::driver::result::event::synchronize(lp.stage_events[si]).expect("warm copy");
+        }
+    }
+    lp.write_word(scratch.ptr, 0);
+    unsafe {
+        cudarc::driver::result::event::record(lp.copy_event, lp.stream).expect("event record");
+        cudarc::driver::result::event::synchronize(lp.copy_event).expect("warm copy");
+    }
+    let _ = ready.send(());
     let mut last_job = 0u64;
     let mut idle = 0u32;
+    let mut idle_since = std::time::Instant::now();
+    let mut idle_reported = false;
+    let verbose = std::env::var("QX_DS_VERBOSE").is_ok();
     loop {
         if sh.stop.load(Ordering::Relaxed) {
             return;
@@ -415,12 +538,20 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>) {
         }
         if worked {
             idle = 0;
+            idle_since = std::time::Instant::now();
+            idle_reported = false;
         } else {
             idle += 1;
             if idle < 2_000_000 {
                 std::hint::spin_loop();
             } else {
                 std::thread::sleep(std::time::Duration::from_micros(20));
+            }
+            // QX_DS_VERBOSE: a long idle while a window is in flight is a stuck mailbox; print its state once
+            if verbose && !idle_reported && idle_since.elapsed().as_secs() >= 15 {
+                idle_reported = true;
+                let w = |o: usize| *sh.mb.slice::<u32>(o, 1).first().unwrap();
+                eprintln!("driver idle 15 s: MB_SEQ {} MB_DONE {} MB_STG_DONE {} last_job {} layer {} nmiss {} nstage {} tokens_done {}", sh.mb.atomic_u64(MB_SEQ).load(Ordering::Acquire), sh.mb.atomic_u64(MB_DONE).load(Ordering::Acquire), sh.mb.atomic_u64(mailbox::MB_STG_DONE).load(Ordering::Acquire), last_job, w(MB_LAYER), w(MB_NMISS), w(mailbox::MB_NSTAGE), sh.tokens_done.load(Ordering::Acquire));
             }
         }
     }

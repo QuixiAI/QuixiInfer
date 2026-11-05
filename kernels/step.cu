@@ -123,43 +123,78 @@ extern "C" __global__ void qx_sample_greedy(const u64* info) {
 /// [7] layer, [8] k, [9] E, [10] slots out (u64 x selections), [11] x qs out (i8 x E per token), [12] x d out
 /// (f32 x E/256 per token), [13] tokens in the window (0: 1): selection a = t * k + j, token t's x at t * E,
 /// [14] RAM table (u64 per expert: the device-mapped address of its pinned record, or 0; 0: none), [15] the share
-/// of RAM-resident misses the GPU computes in place, in eighths (every RAM miss counts round robin).
+/// of RAM-resident misses the GPU computes in place, in eighths (every RAM miss counts round robin), [16] the
+/// share of RAM-resident misses the driver stages into VRAM by DMA for the GPU (eighths; takes precedence),
+/// [17] slots_all out (u64 x selections: nonzero where the GPU produces the output, staged ones marked 1),
+/// [18] slots_stg out (zeroed here; the driver writes the staged addresses), [19] the most staged selections.
 /// Grid: one block of 256 threads per token. Block 0 scans the selections and posts the job; every block copies
 /// (when the CPU has work) and quantizes its token's x; block 0 publishes the job once all have. Step words [7]
 /// (the job whose scan is out) and [8] (blocks done with it) order them; all blocks of a window are resident
 /// together, so the waits are safe.
 extern "C" __global__ void qx_moe_post(const u64* info) {
     u8* mb = reinterpret_cast<u8*>(info[0]);
-    const u32 E = (u32)info[9], T = info[13] ? (u32)info[13] : 1, A = T * (u32)info[8], tk = blockIdx.x;
+    // info[13]: the window width in the low word; bit 32 set = a dry run (the engine's compile pass for a new
+    // width): no job is posted, every slot list is zeroed and the wait kernels find nothing to wait for
+    const u32 T = (u32)info[13] ? (u32)info[13] : 1;
+    const bool dry = (info[13] >> 32) != 0;
+    const u32 E = (u32)info[9], A = T * (u32)info[8], tk = blockIdx.x;
     u32* st = reinterpret_cast<u32*>(info[6]);
     volatile u32* vst = st;
     const u64 prev = *reinterpret_cast<const u64*>(st + 4);
     __shared__ u32 s_n;
     if (threadIdx.x == 0) {
-        if (tk == 0) {
+        if (dry) {
+            if (tk == 0) {
+                u64* slots = reinterpret_cast<u64*>(info[10]);
+                u64* slots_all = info[17] ? reinterpret_cast<u64*>(info[17]) : nullptr;
+                u64* slots_stg = info[18] ? reinterpret_cast<u64*>(info[18]) : nullptr;
+                for (u32 j = 0; j < A; ++j) {
+                    slots[j] = 0;
+                    if (slots_all) slots_all[j] = 0;
+                    if (slots_stg) slots_stg[j] = 0;
+                }
+                vst[11] = 0;
+                vst[6] = 0;
+                __threadfence();
+            }
+            s_n = 0;
+        } else if (tk == 0) {
             // The mailbox has one slot: wait until the CPU has answered the previous job before overwriting it. A job
             // with no misses is not waited for when posted, so this is where its answer is collected.
             while (ld_acquire_sys(reinterpret_cast<const u64*>(mb + MB_DONE)) < prev) {
             }
             const u64* table = reinterpret_cast<const u64*>(info[1]) + info[2];
             const u64* rtable = info[14] ? reinterpret_cast<const u64*>(info[14]) + info[2] : nullptr;
-            const u32 share = (u32)info[15];
+            const u32 share = (u32)info[15], sshare = (u32)info[16], scap = (u32)info[19];
             const i32* ids = reinterpret_cast<const i32*>(info[3]);
-            u32 n = 0, nmap = 0, nram = vst[9];  // the RAM-miss round robin persists across layers and windows
+            u32 n = 0, nmap = 0, ns = 0, nram = vst[9];  // the RAM-miss round robin persists across layers and windows
             u64* slots = reinterpret_cast<u64*>(info[10]);
+            u64* slots_all = info[17] ? reinterpret_cast<u64*>(info[17]) : nullptr;
+            u64* slots_stg = info[18] ? reinterpret_cast<u64*>(info[18]) : nullptr;
             i32* all = reinterpret_cast<i32*>(mb + MB_ALL(E));
             for (u32 j = 0; j < A; ++j) {
                 u64 slot = *reinterpret_cast<const volatile u64*>(&table[ids[j]]);
+                bool staged = false;
                 if (slot == 0 && rtable) {
                     const u64 ram = *reinterpret_cast<const volatile u64*>(&rtable[ids[j]]);
-                    if (ram && (nram++ % 8) < share) {
-                        slot = ram;
-                        ++nmap;
+                    if (ram) {
+                        const u32 turn = nram++ % 8;
+                        if (sshare && slots_stg && ns < scap && turn < sshare) {
+                            staged = true;
+                            reinterpret_cast<i32*>(mb + MB_SIDS)[ns] = ids[j];
+                            reinterpret_cast<i32*>(mb + MB_SKIDX)[ns] = (i32)j;
+                            ++ns;
+                        } else if (!sshare && turn < share) {
+                            slot = ram;
+                            ++nmap;
+                        }
                     }
                 }
                 slots[j] = slot;
+                if (slots_all) slots_all[j] = staged ? 1 : slot;
+                if (slots_stg) slots_stg[j] = 0;
                 all[j] = ids[j];
-                if (slot == 0) {
+                if (slot == 0 && !staged) {
                     reinterpret_cast<i32*>(mb + MB_IDS)[n] = ids[j];
                     reinterpret_cast<i32*>(mb + MB_KIDX)[n] = (i32)j;
                     ++n;
@@ -170,7 +205,9 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
             *reinterpret_cast<u32*>(mb + MB_NTOK) = T;
             *reinterpret_cast<u32*>(mb + MB_KPT) = (u32)info[8];
             *reinterpret_cast<u32*>(mb + MB_NMAP) = nmap;
+            *reinterpret_cast<u32*>(mb + MB_NSTAGE) = ns;
             vst[9] = nram;
+            vst[11] = ns;
             vst[6] = n;
             __threadfence();
             vst[7] = (u32)(prev + 1);
@@ -233,6 +270,16 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
             __threadfence_system();
             st_release_sys(reinterpret_cast<u64*>(mb + MB_SEQ), seq);
         }
+    }
+}
+
+/// Waits until the driver has staged the current job's records into VRAM and written their slot addresses,
+/// unless the job staged nothing. info: [0] mailbox, [1] step state. One thread.
+extern "C" __global__ void qx_moe_wait_staged(const u64* info) {
+    if (reinterpret_cast<const u32*>(info[1])[11] == 0) return;
+    const u64 seq = *reinterpret_cast<const u64*>(reinterpret_cast<const u32*>(info[1]) + 4);
+    const u64* done = reinterpret_cast<const u64*>(reinterpret_cast<const u8*>(info[0]) + MB_STG_DONE);
+    while (ld_acquire_sys(done) < seq) {
     }
 }
 

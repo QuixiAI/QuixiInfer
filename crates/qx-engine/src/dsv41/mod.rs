@@ -21,6 +21,11 @@ use std::os::unix::fs::FileExt;
 /// The three expert tiers behind the DeepSeek path: a VRAM arena of whole records filled by rank (static for
 /// now), the RAM tier and NVMe through `ExpertStore`, plus the device buffers the expert kernels use.
 pub struct Tiers {
+    /// The DMA staging area for the GPU's share of RAM-resident misses, its capacity in records, and the share.
+    stage: DeviceBuf,
+    stage_cap: usize,
+    stage_share: u64,
+    stage_share_decode: u64,
     pub store: crate::tiers::ExpertStore,
     arena: DeviceBuf,
     /// Per global expert: its VRAM address or 0.
@@ -205,6 +210,16 @@ pub struct AsyncBufs {
     /// (`QX_DS_GPU_SHARE`, default 0: measured at about 7 GB/s, six times slower per expert than the pool).
     rtable_dev: DeviceBuf,
     gpu_share: u64,
+    /// The share (eighths) of RAM-resident misses the driver stages into VRAM by DMA for the GPU's expert kernels
+    /// (`QX_DS_STAGE_SHARE`), the staging area (`stage_cap` records of the largest size, reused per job), and the
+    /// slot arrays: `slots_all` (nonzero where the GPU produces the output) and `slots_stg` (the staged addresses,
+    /// written by the driver).
+    stage_share: u64,
+    stage_share_decode: u64,
+    stage_cap: usize,
+    _stage: DeviceBuf,
+    slots_all: DeviceBuf,
+    slots_stg: DeviceBuf,
     step: DeviceBuf,
     slots: DeviceBuf,
     gpu_out: DeviceBuf,
@@ -250,6 +265,9 @@ pub struct DsEngine<'a> {
     pub slots: usize,
     /// The captured token (asynchronous mode), and whether the warm-up run before its capture happened.
     graphs: Vec<Option<cubecl_runtime::client::Graph>>,
+    /// Per width: whether its compile pass ran (see `forward_segments`); `warm` marks that pass while it runs.
+    warmed: Vec<bool>,
+    warm: bool,
     /// Seconds in the last forward: all, experts (pool + GPU experts), the host's Engram row gather.
     pub t_forward: f64,
     pub t_engram: f64,
@@ -561,6 +579,14 @@ impl<'a> DsEngine<'a> {
                 // VRAM: the hottest records that fit; a slot per record at its own size
                 // the expert tier takes at most what the context, slots and scratch left (everything else is
                 // allocated by now), less headroom for the runtime's pools and the window graphs
+                // the staging area for DMA-staged experts comes first (its slots are of the largest record)
+                // the share for prompt windows (8 tokens and more) and for decode steps; both in eighths
+                let knob = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d).min(8);
+                let stage_share = knob("QX_DS_STAGE_SHARE", 6);
+                let stage_share_decode = knob("QX_DS_STAGE_SHARE_DECODE", 3);
+                let stage_cap: usize = if stage_share > 0 || stage_share_decode > 0 { std::env::var("QX_DS_STAGE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(96) } else { 1 };
+                let max_rec = (0..cfg.n_layer).map(|l| pack.experts.record[l] as usize).max().unwrap_or(0);
+                let stage = DeviceBuf::new(stage_cap * max_rec.max(256));
                 let want = (vram_gib * 1073741824.0) as usize;
                 let (free, _) = qx_gpu::mem::mem_info();
                 let budget = want.min(free.saturating_sub(1536 << 20));
@@ -625,6 +651,10 @@ impl<'a> DsEngine<'a> {
                 let k = cfg.n_expert_used;
                 let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
                 let tiers = Tiers {
+                    stage,
+                    stage_cap,
+                    stage_share,
+                    stage_share_decode,
                     store,
                     arena,
                     table,
@@ -663,6 +693,8 @@ impl<'a> DsEngine<'a> {
                 let rtable: Vec<u64> = (0..t.table.len()).map(|g| t.store.ram_device_addr(g)).collect();
                 let rtable_dev = DeviceBuf::from_slice(&rtable);
                 let gpu_share: u64 = std::env::var("QX_DS_GPU_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0u64).min(8);
+                let slots_all = DeviceBuf::new(cfg.n_expert_used * DS_TMAX * 8);
+                let slots_stg = DeviceBuf::new(cfg.n_expert_used * DS_TMAX * 8);
                 let host = driver::Host {
                     store: t.store,
                     table_dev: table_dev.ptr,
@@ -670,6 +702,10 @@ impl<'a> DsEngine<'a> {
                     rtable_dev: rtable_dev.ptr,
                     rtable,
                     gpu_reads_ram: gpu_share > 0,
+                    stage_base: t.stage.ptr,
+                    stage_cap: t.stage_cap,
+                    slots_stg_dev: slots_stg.ptr,
+                    slots_all_dev: slots_all.ptr,
                     arena_ptr: t.arena.ptr,
                     classes: t.classes,
                     layer_class: t.layer_class,
@@ -684,7 +720,7 @@ impl<'a> DsEngine<'a> {
                     n_embd: E,
                     ff: cfg.ff_exp,
                 };
-                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
+                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_cap: t.stage_cap, _stage: t.stage, slots_all, slots_stg, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
                 abufs.step.zero();
                 let d = driver::Driver::start(host, cpus.clone());
                 (None, Some(d), Some(abufs))
@@ -719,6 +755,8 @@ impl<'a> DsEngine<'a> {
             history: vec![vec![Vec::new(); cfg.n_layer]; slots],
             hist_flushed: vec![0; slots],
             graphs: (0..=DS_TMAX).map(|_| None).collect(),
+            warmed: vec![false; DS_TMAX + 1],
+            warm: false,
             t_engram: 0.0,
             t_phase: [0.0; 5],
             t_forward: 0.0,
@@ -881,7 +919,7 @@ impl<'a> DsEngine<'a> {
         if let Some(d) = &self.driver {
             let sh = &d.shared;
             let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
-            return Some(format!("  vram {} pcie {} ram {} nvme {} promos vram {} ram {} ({:.0} ms, pool {:.0} ms of which fetch {:.0})", g(&sh.vram_hits), g(&sh.mapped_hits), g(&sh.ram_hits), g(&sh.nvme_misses), g(&sh.vram_promos), g(&sh.ram_promos), g(&sh.promo_ns) as f64 / 1e6, g(&sh.pool_ns) as f64 / 1e6, g(&sh.fetch_ns) as f64 / 1e6));
+            return Some(format!("  vram {} staged {} pcie {} ram {} nvme {} promos vram {} ram {} ({:.0} ms, pool {:.0} ms of which fetch {:.0}, stage wait {:.0})", g(&sh.vram_hits), g(&sh.staged_hits), g(&sh.mapped_hits), g(&sh.ram_hits), g(&sh.nvme_misses), g(&sh.vram_promos), g(&sh.ram_promos), g(&sh.promo_ns) as f64 / 1e6, g(&sh.pool_ns) as f64 / 1e6, g(&sh.fetch_ns) as f64 / 1e6, g(&sh.stage_ns) as f64 / 1e6));
         }
         self.tiers.as_ref().map(|t| {
             let t = t.borrow();
@@ -1196,6 +1234,24 @@ impl<'a> DsEngine<'a> {
         // running: prepare, eager run and recording stay together, as CubeCL keeps one prepared capture per stream.
         let tp = std::time::Instant::now();
         let max_ratio = c.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
+        // The first window of a width runs once as a dry pass: CubeCL compiles and loads a kernel on its first
+        // launch, and a module load while an expert job is in flight deadlocks (the load waits for the device,
+        // the device spins in a wait kernel for the driver, the driver's copies wait for the context lock the
+        // load holds; seen as CubeCL's server thread in cuModuleLoadData with the GPU at 100%). The dry pass
+        // launches the width's whole kernel set (positions clamped so the compressed-store kernels are included;
+        // each kernel bounds itself by the true positions in `s.pos`) with the expert job replaced by zeroed slot
+        // lists, then the device is drained. It writes the same ring and store positions the real pass rewrites.
+        if self.driver.is_some() && !self.warmed[t] {
+            if let Some(d) = &self.driver {
+                d.shared.mb.slice::<f32>(crate::mailbox::mb_y(E), crate::mailbox::AMAX * E).fill(0.0);
+            }
+            self.warm = true;
+            let p = max_ratio - 1;
+            self.launch_window(t, pos_min.max(p), pos_max.max(p), None);
+            self.warm = false;
+            self.gpu.sync();
+            self.warmed[t] = true;
+        }
         let eligible = self.driver.is_some() && act.is_none() && pos_min + 1 >= max_ratio && !std::env::var("QX_GRAPH").is_ok_and(|v| v == "0") && std::env::var("QX_DS_SYNC").is_err() && std::env::var("QX_DS_TRACE").is_err();
         if !eligible {
             self.launch_window(t, pos_min, pos_max, act);
@@ -1390,8 +1446,9 @@ impl<'a> DsEngine<'a> {
                 // the misses to the driver's mailbox (x quantized to Q8_K on the way), the residents on the GPU,
                 // then wait for the CPU's rows: no host involvement
                 let mb = d.shared.mb.dptr;
+                let stage_share = if t >= 8 { ab.stage_share } else { ab.stage_share_decode };
                 self.trace("qx_moe_post");
-                gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (tt, 1, 1), &[mb, ab.table_dev.ptr, (l * c.n_expert) as u64, self.s.ids.ptr, self.s.wts.ptr, self.s.x.ptr, ab.step.ptr, l as u64, k as u64, E as u64, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, t as u64, ab.rtable_dev.ptr, ab.gpu_share]);
+                gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (tt, 1, 1), &[mb, ab.table_dev.ptr, (l * c.n_expert) as u64, self.s.ids.ptr, self.s.wts.ptr, self.s.x.ptr, ab.step.ptr, l as u64, k as u64, E as u64, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, t as u64 | ((self.warm as u64) << 32), ab.rtable_dev.ptr, ab.gpu_share, stage_share, ab.slots_all.ptr, ab.slots_stg.ptr, ab.stage_cap as u64]);
                 self.trace_done();
                 self.dsync("post");
                 self.launch_resident(l, k, t, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, ab.gu.ptr, ab.gpu_out.ptr);
@@ -1399,12 +1456,20 @@ impl<'a> DsEngine<'a> {
                 // the shared expert while the pool works on the misses
                 self.k("qx_ds_silu_mul_clamp", 256, (((c.ff_exp * t) as u32).div_ceil(256), 1, 1), &[self.s.shg.ptr, self.s.shu.ptr, self.s.shh.ptr, (c.ff_exp * t) as u64, bits(c.clamp_shexp[l])]);
                 self.mgt(&w.g_shd, self.s.shh.ptr, c.ff_exp, t, "g_shd");
+                if stage_share > 0 {
+                    // the staged experts: their records and slot addresses land on the copy stream, then the
+                    // same kernels over the staged slot array (zero where nothing is staged)
+                    self.trace("qx_moe_wait_staged");
+                    gpu.run(STEP.kernel("qx_moe_wait_staged", CubeDim::new_1d(1)), (1, 1, 1), &[mb, ab.step.ptr]);
+                    self.trace_done();
+                    self.launch_resident(l, k, t, ab.slots_stg.ptr, ab.xq.ptr, ab.xd.ptr, ab.gu.ptr, ab.gpu_out.ptr);
+                }
                 self.trace("qx_moe_wait");
                 gpu.run(STEP.kernel("qx_moe_wait", CubeDim::new_1d(1)), (1, 1, 1), &[mb, ab.step.ptr]);
                 self.trace_done();
                 self.dsync("wait");
                 shexp_done = true;
-                (ab.gpu_out.ptr, mb + crate::mailbox::mb_y(E) as u64, ab.slots.ptr)
+                (ab.gpu_out.ptr, mb + crate::mailbox::mb_y(E) as u64, ab.slots_all.ptr)
             } else {
                 assert!(t == 1, "the host-driven expert paths take one token");
                 gpu.sync();

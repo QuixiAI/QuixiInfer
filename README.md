@@ -177,9 +177,10 @@ Stop the service before benchmarking: two engines cannot both pin the experts.
 The same binary serves [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)
 at UD-IQ2_XXS (284 B parameters, 280 GiB of weights) on the same machine, with the experts in three tiers: about
 21 GiB in VRAM, about 100 GiB pinned in RAM (the server is meant to run alone on the box; about 13 GiB stay free
-for the system), the rest read from the pack on NVMe as routed. Decode runs at about
-30 tokens/s, prompts at 45-50 tokens/s, one request at a time; a request sharing a prefix with the previous one
-continues from it. See `docs/deepseek41-plan.md` and `docs/progress.md`.
+for the system), the rest read from the pack on NVMe as routed. Decode runs at about 31 tokens/s and prompts at
+about 85 tokens/s (the missing experts split between the CPU pool and DMA-staged GPU slots), several requests at
+once over sequence slots, a request sharing a prefix with an earlier one continuing from it, structured outputs
+through the same grammar engine as the Qwen path. See `docs/deepseek41-plan.md` and `docs/progress.md`.
 
 ```sh
 # the pack from the six GGUF shards (pass the first), once
@@ -196,8 +197,9 @@ systemd-run --user --scope -p MemoryMax=118G -p MemorySwapMax=0 -- \
 `--profile` ranks the experts the tiers are filled with at start (`golden/profile-dsv41.txt` comes from a routing
 trace of a mixed corpus); `--profile-out` writes the live ranking after requests, and a start finding that file loads from it
 instead. `--window` sets the prompt chunk (64 tokens by default, up to 128). The chat template and
-tokenizer come from the GGUF (tokenization checked against llama.cpp). Structured outputs and several requests at
-once are not available for this model yet.
+tokenizer come from the GGUF (tokenization checked against llama.cpp). `--slots` (2) sets how many requests run at
+once; `QX_DS_STAGE_SHARE` (6, eighths) and `QX_DS_STAGE_SHARE_DECODE` (3) set how many of the RAM-resident missing
+experts the GPU takes by DMA staging in prompt windows and in decode steps.
 
 ### Settings
 

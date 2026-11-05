@@ -21,10 +21,14 @@ pub const MB_NMISS: usize = 132;
 pub const MB_NTOK: usize = 136;
 pub const MB_KPT: usize = 140;
 pub const MB_NMAP: usize = 144;
+pub const MB_NSTAGE: usize = 148;
+pub const MB_STG_DONE: usize = 192;
+pub const MB_SIDS: usize = 15616;
+pub const MB_SKIDX: usize = 20736;
 pub const MB_IDS: usize = 256;
 pub const MB_KIDX: usize = 5376;
 pub const MB_ALL: usize = 10496;
-pub const MB_X: usize = 16384;
+pub const MB_X: usize = 32768;
 /// AMAX rows of E floats: the unweighted output of the missing expert with selection index a at row a.
 pub fn mb_y(e: usize) -> usize {
     MB_X + 4 * TMAX * e

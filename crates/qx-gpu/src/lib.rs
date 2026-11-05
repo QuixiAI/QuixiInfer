@@ -22,6 +22,14 @@ pub const DEFAULT_CUDA_ROOT: &str = "/usr/local/cuda-13.1";
 /// Call this first in `main`, before any thread starts. `QX_NVRTC_DIR` overrides the directory.
 pub fn init() {
     use std::os::unix::process::CommandExt;
+    // Load every module's kernels when the module loads: a lazy per-kernel load under a kernel that
+    // spins waiting for the host is a documented deadlock hazard. Our modules hold one kernel each, so
+    // eager loading costs nothing (the module loads themselves are kept away from in-flight jobs by the
+    // DeepSeek engine's compile pass per window width).
+    if std::env::var_os("CUDA_MODULE_LOADING").is_none() {
+        // before any thread exists besides main (`init` is the first call in `main`)
+        unsafe { std::env::set_var("CUDA_MODULE_LOADING", "EAGER") };
+    }
     let dir = std::env::var("QX_NVRTC_DIR").unwrap_or_else(|_| DEFAULT_NVRTC_DIR.to_string());
     let root = std::env::var("QX_CUDA_ROOT").unwrap_or_else(|_| DEFAULT_CUDA_ROOT.to_string());
     let cur = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();

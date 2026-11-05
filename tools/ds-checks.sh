@@ -14,11 +14,17 @@ export QX_DS_PACK=${QX_DS_PACK:-$D/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp}
 T=${TMPDIR:-/tmp}/ds-checks.$$; mkdir -p "$T"; trap 'rm -rf "$T"' EXIT
 B=target/release/qx-ds-check
 [ -x $B ] || cargo build --release -p qx-engine --bin qx-ds-check --bin qx-tok >/dev/null
+# a process that pinned the RAM tier takes 10-30 s to tear down after it exits and holds its VRAM meanwhile
+gpu_free() { until [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)" -lt 1000 ]; do sleep 2; done; }
+gpu_free
 echo "1. exact f32 vs reference:      $(env -u QX_DS_PACK QX_MGEMV_INT8=0 QX_EXACT_EXPERTS=1 QX_REF_COMPAT=0 $B "$M" golden/out-dsv41/p0.tokens 6 2>&1 | grep '^positions')"
+gpu_free
 echo "2. production vs reference:     $(QX_DS_VRAM=20 QX_DS_RAM=60 QX_REF_COMPAT=engine $B "$M" golden/out-dsv41/p1.tokens 59 2>&1 | grep '^positions')"
 B0="QX_DS_VRAM=20 QX_DS_RAM=60 QX_DS_BENCH=0 QX_DS_ADAPT=0"
+gpu_free
 env $B0 QX_DS_DUMP_LOGITS="$T/t1.bin" $B "$M" golden/data/route1k.tokens 128 >/dev/null 2>&1
 for W in 8 64; do
+  gpu_free
   env $B0 QX_DS_WINDOW=$W QX_DS_DUMP_LOGITS="$T/w$W.bin" $B "$M" golden/data/route1k.tokens 128 >/dev/null 2>&1
   echo "3. windows of $W vs single steps: $(python3 -I tools/cmp_logits.py "$T/t1.bin" "$T/w$W.bin" 129280 | grep identical)"
 done
