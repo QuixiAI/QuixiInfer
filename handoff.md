@@ -20,9 +20,11 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   so DSpark-style drafting breaks even at 41-46% acceptance and gains 6% at 75%: backlog family 6 is DEFERRED.
   Steady decode at 16k is 36 ms per token, not 53 (the old figure averaged a graph capture). Windows of 5 are
   125/128 bit-identical to single steps (open, `findings.md`).
-- **Candidate in the tree:** the window staged share (6/8) applies from width 2 (`QX_DS_STAGE_WIDE_MIN`, was 8):
-  -4.7% at width 2, -8.2% at width 4 on the forced bench. Its serve3 A/B (`serve-widemin8` against
-  `serve-widemin2`, 3 repeats each) was queued right after the baseline; read `perf/results/2026-11-06/` for it.
+- **Kept:** the window staged share (6/8) applies from width 2 (`QX_DS_STAGE_WIDE_MIN`, was 8): -4.7% at width 2,
+  -8.2% at width 4 on the forced bench; serve3 -2.9%, within noise. The serve case's RAM tier is 95 GiB (serve3
+  -5.4% against 90); PROMOS=64, STAGE_SHARE=4 and STAGE_CAP=192 measured flat (notebook). The set B baseline was
+  re-taken at the 95 GiB serve tier (`baseline-setb-ram95`); if `perf/baselines/.../run.json` still says
+  `serve:QX_DS_RAM=90`, that run did not finish: re-run `perf/harness/bench.sh --check` and promote it.
 - **Two bugs found by the serve case, both fixed in the working tree:**
   1. A capture race: the driver thread's `cuEventSynchronize`/`cuEventQuery` during a global-mode graph capture
      panicked the server's warm-up. Fix: `Shared::capture` mutex plus a device drain before recording

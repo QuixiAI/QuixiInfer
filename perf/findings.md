@@ -87,9 +87,10 @@ that GEMV. The first diagnosis, glibc arena fragmentation, was wrong: pinning ma
 64 MiB heaps but not the growth. Fixed by warming every width, sealing the kernel set (a later compile aborts),
 and a 2.5 GiB headroom (notebook, "a kernel that could not load"). The rules that follow:
 
-- A 100 GiB RAM tier is the forced bench's setting, where the process is 104-110 GB. **The server runs at 90 GiB**
-  in the harness: with the fix it would fit at 100 (111 GB RSS), but 9 GB of headroom on a box that also runs the
-  agent is the wrong side of safe, and the serve case is about per-request behaviour, not the tier's last 10 GiB.
+- A 100 GiB RAM tier is the forced bench's setting, where the process is 104-110 GB. **The server runs at 95 GiB**
+  in the harness (about 106 GB RSS): at 100 it would be 111 GB, the wrong side of safe on a box that also runs the
+  agent. 95 against 90 measured serve3 -5.4% and serve1 -5.0% (2026-11-06): residency is the serving lever, so
+  the tier is worth its last safe gigabytes.
 - **`MemoryMax=112G`, never 118G, for anything that pins the tier.** At 118G the box's global OOM killer fires
   before the cgroup's, and that is the case that takes the agent harness down. At 112G the cgroup kills only the
   offender; `OOMPolicy=continue` keeps the surrounding script alive to record it.

@@ -48,7 +48,10 @@ invented one. The aggregate score lives in `scoreboard.md`.
   pool 96 of which NVMe wait 31 and staging wait 13.6; host overhead under 1 ms. Shares VRAM 61 / staged 24 / RAM
   11 / NVMe 3.9%. Residency it is. Running: `QX_DS_PROMOS=64`, `QX_DS_STAGE_SHARE=4` on the serve case. Next
   code lever: family 3's store sizing (VRAM back to the tier), then per-layer NVMe prefetch if the wait is
-  latency-bound. Also open: prefix reuse reports 0 on repeated prompts.
+  latency-bound. **Results:** PROMOS=64 flat, STAGE_SHARE=4 flat, RAM tier 95 GiB -5.4% (kept as the serve
+  setting). Store sizing killed on arithmetic (family 3); NVMe reads are already at the drive's rate per record
+  and the next layer's routing is unknown, so no prefetch lever. What remains for serving is structural:
+  per-request hot sets (three conversations route wider than one), or more memory. Prefix reuse reporting 0 is by design: `worker_ds` reuses a shared prefix only from 64 tokens, and loadgen's prompts are 40-46 tokens; not a bug.
 - **Kill criteria:** the gap is still unexplained by counters after two measurement passes. A residency change
   that does not lift the `serve` per-request decode by 8% also fires the kill.
 
@@ -69,6 +72,12 @@ invented one. The aggregate score lives in `scoreboard.md`.
   1. Size the stores by ratio, keeping parking and unparking in step: parking copies `pos / ratio` rows.
   2. Run `bench.sh` with `QX_DS_VRAM` at the freed amount and in the serving case.
 - **Kill criteria:** decode improves by less than 3% at the freed VRAM, or the change breaks bit-identity.
+- **Store sizing killed on arithmetic, 2026-11-06.** Only the four KV source layers (2, 8, 14, 20) hold compressed
+  stores, not every layer: 4 layers x 3 slots x 8,192 rows x 640 floats x 4 B = 240 MiB in all, so sizing by the
+  ratio returns about 0.2 GiB, about 20 records, under half a percent of the tier. Not worth the code. The
+  staging area (0.9 GiB) is shared with prompt windows, which need it. What does move serving residency, from
+  the serve3 decomposition: the RAM tier (90 against the forced bench's 100: `serve-ram95` queued) and the
+  promotion rate (`serve-promos64` running).
 
 ### 4. Long-context step costs
 

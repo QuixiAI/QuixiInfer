@@ -40,20 +40,21 @@ After appending, run `python3 perf/harness/perf_diff.py index perf/optimization_
 
 | date | entry | verdict | line |
 |---|---|---|--:|
-| 2026-11-05 | DeepSeek history before the harness | RECORDED | 59 |
-| 2026-11-05 | Performance scaffolding | LANDED | 78 |
-| 2026-11-05 | First harness baseline | RECORDED | 101 |
-| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 121 |
-| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 134 |
-| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 149 |
-| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 168 |
-| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 191 |
-| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 221 |
-| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 248 |
-| 2026-11-06 | First set B baseline | RECORDED | 280 |
-| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 309 |
-| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 329 |
-| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 351 |
+| 2026-11-05 | DeepSeek history before the harness | RECORDED | 60 |
+| 2026-11-05 | Performance scaffolding | LANDED | 79 |
+| 2026-11-05 | First harness baseline | RECORDED | 102 |
+| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 122 |
+| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 135 |
+| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 150 |
+| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 169 |
+| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 192 |
+| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 222 |
+| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 249 |
+| 2026-11-06 | First set B baseline | RECORDED | 281 |
+| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 310 |
+| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 330 |
+| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 352 |
+| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 388 |
 <!-- qx:index:end -->
 
 ## 2026-11-05: DeepSeek history before the harness — RECORDED
@@ -381,5 +382,29 @@ when prompts repeat: prefix reuse is not firing in this pattern (open).
 Decision: family 2's next experiments are residency knobs on the serve case, one factor each, 3 repeats: `QX_DS_PROMOS=64`
 (RAM promotions catch up faster), then `QX_DS_STAGE_SHARE=4` (less staging wait at width 3). Both queued. The code
 lever behind them is family 3 (store sizing returns about 1.8 GiB of VRAM to the tier).
-Open questions: why prefix reuse reports 0; whether NVMe wait is latency-bound per layer (then issuing layer
+Open questions: (prefix reuse reports 0 because the worker reuses only prefixes of 64 tokens or more, and these prompts are 40-46: by design) whether NVMe wait is latency-bound per layer (then issuing layer
 l+1's reads before layer l's RAM compute finishes is the lever) or bandwidth-bound (then only residency helps).
+
+## 2026-11-06: Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings)
+
+Status: three one-factor serve runs against the set B baseline's serve rows (95.24 / 40.49 ms per token at 0.9% /
+3.8% spread), 3 repeats each, same binary, run back to back on an idle box.
+
+| change | serve3 | serve1 | serve3 change | spreads | NVMe share | verdict |
+|---|--:|--:|--:|--:|--:|---|
+| `QX_DS_PROMOS=64` (promotions per token doubled) | 95.24 | 40.98 | 0.0% | 0.9% / 3.8% | 3.8% (was 3.9%) | REJECTED: the promotion counters barely moved (7,296 VRAM, 13,873 RAM against 7,095 / 13,357); the rate is not what limits residency |
+| `QX_DS_STAGE_SHARE=4` (window share 4/8 instead of 6/8, so less staging wait at width 3) | 96.15 | 39.53 | +1.0% | 2.9% / 5.7% | | REJECTED: within noise both ways; the 13.6 ms of staging wait per step is not on the critical path |
+| RAM tier 95 GiB instead of 90 (`QX_PERF_SERVE_RAM`) | **90.09** | **38.46** | **-5.4%** | 2.7% / 3.2% | | KEPT: outside both spreads, past the 3% bar; a settings change, so the serve case's standard tier is 95 from now |
+
+Why 95 and not 100: at 100 the server is 111 GB RSS on the 120 GiB box next to the agent (the day's OOM
+history is in "Operating envelope"); at 95 it is about 106 GB, under the forced bench's 110. The tier is now part
+of the recorded settings (`serve:QX_DS_RAM=95` in run.json), so a run at another tier refuses to diff.
+Decision: the set B baseline is re-taken at the new setting (`baseline-setb-ram95`, running) and replaces the
+first; the scoreboard notes the settings change. The lever behind all three results is the same: the serve step
+is pool-bound on NVMe latency and VRAM share, and only residency moves it. With residency knobs exhausted, the
+remaining serving levers are structural: per-slot or per-request expert hot sets (three conversations route
+wider than one), or a larger box.
+Rejected alternatives: chunked NVMe reads (a record is one 9.4 MiB O_DIRECT read already at the drive's rate,
+1.3-1.4 ms; the per-layer wait is that read minus the overlapped RAM compute); issuing the next layer's reads
+early (its routing is not known until this layer finishes).
+Open questions: none for these knobs.

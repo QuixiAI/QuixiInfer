@@ -104,9 +104,10 @@ two quick cases; those rows are marked in the scoreboard and are not comparable 
   case set.
 - **Repeats.** Use three per case by default. The median decides, and min, max and spread show the noise. A
   decode-only effect needs five repeats: decode's spread is about 6%.
-- **The serve settings differ from the forced bench on purpose.** The server runs a 90 GiB RAM tier
-  (`QX_PERF_SERVE_RAM`), not 100: at 100 its RSS is 111 GB on the 120 GiB box and it OOMs under load (see
-  `findings.md`, "Operating envelope"). Its VRAM expert budget is what the context, the slots and the scratch
+- **The serve settings differ from the forced bench on purpose.** The server runs a 95 GiB RAM tier
+  (`QX_PERF_SERVE_RAM`, recorded in `run.json` as `serve:QX_DS_RAM=95`), not 100: at 100 its RSS is 111 GB on
+  the 120 GiB box next to the agent (see `findings.md`, "Operating envelope"); 95 against 90 measured serve3
+  -5.4%. Its VRAM expert budget is what the context, the slots and the scratch
   leave of the 20 GiB, and its windows mix slots. That is the production shape; the forced bench is the engine's
   ceiling. The gap between `serve1` and `decode` is itself a finding.
 

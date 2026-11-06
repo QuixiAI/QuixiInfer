@@ -73,6 +73,7 @@ PORT=${QX_PERF_PORT:-8089}
 # the standard settings every recorded DeepSeek number since 2026-11-04 used; change them only with a note in the
 # scoreboard (scores are comparable only at the same settings)
 BASE=(QX_DS_PACK="$PACK" QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1)
+SERVE_RAM=${QX_PERF_SERVE_RAM:-95}   # the serve case's RAM tier (GiB); see serve_case
 # the tokenizer check (ds-checks line 4) needs llama.cpp's tokenizer binary; without it the check is reported as
 # incomplete, not as passed
 : "${QX_LLAMA_TOKENIZE:=$HOME/git/llama.cpp-dsv41/build-tok/bin/llama-tokenize}"
@@ -145,10 +146,12 @@ for c in "${CASE_LIST[@]}"; do [ -n "${ARGS[$c]+x}" ] || { echo "unknown case $c
 # Greedy sampling, so the replies and their lengths repeat from run to run.
 serve_case() {
   local r=$1 slog="$RUN/logs/serve-$r.server.log" log="$RUN/logs/serve-$r.log"
-  # QX_DS_RAM=90 for the server, not the forced bench's 100: at 100 the server's RSS is 111 GB on a 120 GiB box
-  # (102.5 GB pinned tier, 1.9 GB anonymous, 6.7 GB file-backed), and under memory pressure its anonymous memory
-  # grows to 9-15 GB until an OOM kill (2026-11-06, perf/findings.md "Operating envelope"). The later env entry wins.
-  local srv=(env "${BASE[@]}" QX_DS_RAM="${QX_PERF_SERVE_RAM:-90}" QX_SCHED_STATS=1 "${EXTRA[@]}" $SERVER serve --model "$M" --pack "$PACK"
+  # QX_DS_RAM=95 for the server, not the forced bench's 100: at 100 the server's RSS is 111 GB on a 120 GiB box
+  # (102.5 GB pinned tier, 1.9 GB anonymous, 6.7 GB file-backed), the wrong side of safe next to the agent; at 95
+  # it is about 106 GB. 95 against 90 measured serve3 -5.4% and serve1 -5.0% (2026-11-06, outside the spreads):
+  # the serving gap is residency. The tier is part of the recorded settings, so runs at different tiers refuse to
+  # compare. The later env entry wins.
+  local srv=(env "${BASE[@]}" QX_DS_RAM="${SERVE_RAM}" QX_SCHED_STATS=1 "${EXTRA[@]}" $SERVER serve --model "$M" --pack "$PACK"
              --ctx 8192 --slots 3 --window 64 --host 127.0.0.1 --port "$PORT")
   cmds+=("${srv[*]} ; python3 tools/loadgen.py --url http://127.0.0.1:$PORT/v1 --levels 1,3 --rounds 2 --max-tokens 256 --temperature 0 --warmup 6")
   "${srv[@]}" > "$slog" 2>&1 &
@@ -198,7 +201,7 @@ for r in $(seq 1 "$REPEATS"); do
   done
 done
 
-python3 -I - "$RUN" "$LABEL" "$REPEATS" "$CASES" "$check" "${EXTRA[*]:-}" "${BASE[*]}" "${cmds[@]}" <<'EOF'
+python3 -I - "$RUN" "$LABEL" "$REPEATS" "$CASES" "$check" "${EXTRA[*]:-}" "${BASE[*]} serve:QX_DS_RAM=$SERVE_RAM" "${cmds[@]}" <<'EOF'
 import json, os, subprocess, sys, datetime, platform, hashlib
 run, label, repeats, cases, check, extra, base, *cmds = sys.argv[1:]
 def sh(*a):

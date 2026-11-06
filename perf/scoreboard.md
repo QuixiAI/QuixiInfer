@@ -10,8 +10,10 @@ or settings change.
 Case sets so far:
 
 - **Set A (to 2026-11-05):** `decode` and `prefill64`, last 32 tokens of route1k 1024.
-- **Set B (from 2026-11-06):** set A plus `long16k` (the 64-step decode tail after 16,384 tokens in windows of 64)
-  and `serve3` (per-request decode under `loadgen.py` at concurrency 3, 3 slots). See `perf.md`, "The Metrics".
+- **Set B (from 2026-11-06):** set A plus `long16k` (the last 32 single steps of a 64-step tail after 16,384 tokens
+  in windows of 64) and `serve3` (per-request decode under `loadgen.py` at concurrency 3, 3 slots). See `perf.md`,
+  "The Metrics". The serve tier was 90 GiB in the first set B row and is 95 GiB from the second (a measured
+  -5.4% on serve3; the tier is in the recorded settings).
   Set B scores are larger than set A's, since the two new cases are the slow regimes; a set B score is not
   comparable with a set A one. `perf_diff.py` refuses to record a run that does not cover set B.
 
