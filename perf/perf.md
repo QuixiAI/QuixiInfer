@@ -72,33 +72,50 @@ counters below show which stage is.
 
 ## The Metrics
 
-The **standard benchmark** (`perf/harness/bench.sh`) runs `qx-ds-check` in forced mode on
-`golden/data/route1k.tokens`, a DeepSeek-tokenized mixed text of 1,024 tokens. It uses fixed settings:
+The **standard benchmark** (`perf/harness/bench.sh`) runs the engine on the vendored token files in
+`perf/data/` (`route1k.tokens`, 1,024 tokens of a DeepSeek-tokenized mixed text, and `route16k.tokens`, its 16k
+continuation), and the server under `tools/loadgen.py`. Every engine uses the fixed settings
 `QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1`.
 
 | case | what runs | metric |
 |---|---|---|
 | `decode` | 1,024 single steps | **ms per token over the last 32** (steady state, tiers warm) |
 | `prefill64` | 16 windows of 64 tokens | **ms per token over the last 32** (the last window, at position 960-1023) |
-| `prefill32`, `prefill128` | the same at other widths | optional, for width experiments |
+| `long16k` | 16,384 tokens in windows of 64, then 64 single steps | **ms per token over the last 32 single steps** (steady decode at 16k; the tail's first step pays the width-1 capture, 0.85-1.5 s, so the 64-step mean is recorded as `tail_ms_per_token` but not scored) |
+| `long16k-prefill` | the same run | the windows' ms per token without the tail (prefill averaged over 0-16k); recorded, not scored |
+| `serve3` | `quixiinfer serve --slots 3 --ctx 8192 --window 64`, 6 unmeasured requests, then `loadgen.py` at concurrency 1 and 3, 2 rounds of 256 greedy tokens | **ms per token of per-request decode at concurrency 3** (1000 / per-request tok/s) |
+| `serve1` | the same session | the concurrency-1 number; recorded, not scored |
+| `prefill2`, `prefill4`, `prefill8`, `prefill32`, `prefill128` | windows of other widths | optional, for width experiments; the narrow ones are the verify-window costs of backlog family 6 |
+
+The **standard set** is `decode`, `prefill64`, `long16k` and `serve3` (`STANDARD_CASES` in `perf_diff.py`). A
+scoreboard row or a promoted baseline must cover all four; `perf_diff.py` refuses otherwise. `bench.sh --quick`
+runs `decode` and `prefill64` only (about 5 minutes) for screening: `gate` compares it case by case and reports
+the score over the common cases, but it cannot be recorded or promoted. Up to 2026-11-05 the standard set was the
+two quick cases; those rows are marked in the scoreboard and are not comparable with later ones.
 
 - **Why the last 32.** The tiers adapt over the first few hundred tokens, and the first window of each width
   pays a one-time compile and capture cost. The mean over all 1,024 tokens is recorded too, and it is the right
   number for warm-up work.
-- **The score** is the geometric mean of the cases' median ms per token: the one hill-climbable number, recorded
-  in `scoreboard.md`. Lower is better. It is comparable only at the same host fingerprint, settings and case set.
-- **Repeats.** Use three per case by default. The median decides, and min, max and spread show the noise.
+- **Why these four.** `decode` and `prefill64` are the engine's two steady regimes at a short context. `long16k`
+  holds the long-context cost that grows with position (backlog family 4), and `serve3` the serving gap between
+  per-request decode and the forced bench (family 2). Before them, neither was decidable.
+- **The score** is the geometric mean of the standard cases' median ms per token: the one hill-climbable number,
+  recorded in `scoreboard.md`. Lower is better. It is comparable only at the same host fingerprint, settings and
+  case set.
+- **Repeats.** Use three per case by default. The median decides, and min, max and spread show the noise. A
+  decode-only effect needs five repeats: decode's spread is about 6%.
+- **The serve settings differ from the forced bench on purpose.** The server runs a 90 GiB RAM tier
+  (`QX_PERF_SERVE_RAM`), not 100: at 100 its RSS is 111 GB on the 120 GiB box and it OOMs under load (see
+  `findings.md`, "Operating envelope"). Its VRAM expert budget is what the context, the slots and the scratch
+  leave of the 20 GiB, and its windows mix slots. That is the production shape; the forced bench is the engine's
+  ceiling. The gap between `serve1` and `decode` is itself a finding.
 
 **Secondary metrics.** Measure these when the change targets them, and record them in the notebook:
 
-- **Long context.** Run `golden/data/route16k.tokens` with windows, then a decode tail (`QX_DS_WINDOW=64
-  QX_DS_TAIL=64`). Prefill and decode costs rise with position: in 2026-11-04 measurements, about 23 ms per token
-  for prefill at 1k against 46 at 12k, and 32 ms for decode at 1k against 53 at 16k.
-- **Serving.** Start `quixiinfer serve` with `--slots`, then measure with `tools/loadgen.py` for concurrency
-  levels and `tools/longprompt.py` for one long prompt. Per-request decode in serving still trails the forced
-  bench, at 14-17 tok/s warm against 31. Short answers live in the warm-up regime.
+- **One long prompt** through the server: `tools/longprompt.py`.
 - **Cold start and warm-up.** The mean over all 1,024 tokens, and the first request after a start with and
   without `--profile-out`.
+- **Time to first token** in serving: the `ttft_med_s` and `ttft_p90_s` fields of the `serve*` rows.
 
 ## Host Reality
 
@@ -206,9 +223,11 @@ three concurrent requests, a repeat for prefix reuse, and a `json_object` reques
 ## Measurement Harness
 
 ```bash
-# a measurement (3 repeats of decode and prefill64; correctness first)
+# a full measurement (3 repeats of decode, prefill64, long16k and serve; correctness first): about 75 minutes
 perf/harness/bench.sh --label <what> --check
-# an experiment: knobs passed to every engine run (recorded in run.json)
+# a screening run (decode and prefill64 only): about 5 minutes, plus the check
+perf/harness/bench.sh --label <what> --quick
+# an experiment: knobs passed to every engine run, the server included (recorded in run.json)
 perf/harness/bench.sh --label stage7 -- QX_DS_STAGE_SHARE=7
 # compare, gate against the host's committed baseline, score
 python3 perf/harness/perf_diff.py diff perf/results/<date>/<base> perf/results/<date>/<cand>
@@ -222,8 +241,11 @@ python3 perf/harness/perf_diff.py index perf/optimization_status.md
 
 `bench.sh` re-executes itself inside a `MemoryMax=118G` scope unless it is already capped. It waits for the GPU
 to be free before every engine run, gates on cargo's exit status, and takes git provenance when the run starts:
-the commit, the modified files, and the working-tree diff, saved as `working-tree.diff`. A standard run takes
-about 20-25 minutes with `--check`. To keep it off the agent's foreground, run it as a user service:
+the commit, the modified files, and the working-tree diff, saved as `working-tree.diff`. A full run takes about
+75 minutes with `--check` (long16k is 10 minutes a repeat, serve about 5); `--quick` takes about 5 plus the check.
+The serve case starts the server on port 8089 (`QX_PERF_PORT`), waits for its warm-up line, drives it with
+`tools/loadgen.py`, then kills it by PID and waits for the GPU to be released. Its server log is
+`logs/serve-N.server.log`. To keep a run off the agent's foreground, run it as a user service:
 
 ```bash
 systemd-run --user --unit qx-perf-<label> -p MemoryMax=118G -p MemorySwapMax=0 --working-directory=$PWD \
@@ -361,10 +383,12 @@ continuous batching, slot count against VRAM, and prefix reuse and parking.
 
 ## Open Items
 
-1. **The token files are not in git.** `golden/data/` is git-ignored, so `route1k.tokens` and `route16k.tokens`
-   exist only on this box. Vendor them, or record how to regenerate them, before anyone benchmarks elsewhere.
-2. **Serving and long-context cases in the harness.** `bench.sh` covers the forced decode and prefill only. Add a
-   `long16k` case, and a serving case that drives `quixiinfer serve` with `tools/loadgen.py`.
+1. ~~The token files are not in git.~~ Vendored in `perf/data/` on 2026-11-06. `tools/ds-checks.sh` still reads
+   the larger reference files from the git-ignored `golden/data/`, so the correctness gate runs only where those
+   exist.
+2. ~~Serving and long-context cases in the harness.~~ `long16k` and `serve` landed on 2026-11-06. Still open: the
+   serve case has no engine counters (the server log holds the per-step prints, but `parse` does not read them
+   yet), and `serve3`'s noise level is unknown until the first baseline's repeats.
 3. **Re-measure the rooflines** in Host Reality on the current driver and kernel. They date from October, partly
    on the Qwen setup.
 4. **An nsys recipe** for a 64-token window and a decode step, with the kernel table recorded in the notebook.

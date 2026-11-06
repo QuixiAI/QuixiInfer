@@ -199,7 +199,10 @@ trace of a mixed corpus); `--profile-out` writes the live ranking after requests
 instead. `--window` sets the prompt chunk (64 tokens by default, up to 128). The chat template and
 tokenizer come from the GGUF (tokenization checked against llama.cpp). `--slots` (2) sets how many requests run at
 once; `QX_DS_STAGE_SHARE` (6, eighths) and `QX_DS_STAGE_SHARE_DECODE` (3) set how many of the RAM-resident missing
-experts the GPU takes by DMA staging in prompt windows and in decode steps.
+experts the GPU takes by DMA staging in windows and in single decode steps; `QX_DS_STAGE_WIDE_MIN` (2) is the
+window width from which the window share applies. The expert tier leaves `QX_DS_VRAM_RESERVE_MIB` (2560) of
+device memory for the kernel modules and the window graphs; the warm-up line reports what is left, and a kernel
+that would need compiling after the warm-up aborts the server (it means a module failed to load).
 
 ### Settings
 

@@ -29,6 +29,7 @@ fn argmax(x: &[f32]) -> usize {
 }
 
 fn main() -> anyhow::Result<()> {
+    qx_engine::tune_host_allocator();
     if std::env::var("QX_REF_COMPAT").is_err() {
         // before any thread exists: the reference reads it once
         unsafe { std::env::set_var("QX_REF_COMPAT", "experts") };

@@ -26,6 +26,7 @@ pub struct Tiers {
     stage_cap: usize,
     stage_share: u64,
     stage_share_decode: u64,
+    stage_wide_min: usize,
     pub store: crate::tiers::ExpertStore,
     arena: DeviceBuf,
     /// Per global expert: its VRAM address or 0.
@@ -202,6 +203,22 @@ struct State {
     pos: Vec<usize>,
 }
 
+/// A sequence moved out of its slot (`DsEngine::park`): what `unpark` needs to continue it in any slot.
+pub struct Parked {
+    pub tokens: Vec<u32>,
+    /// Per layer: the used rows of its compressed store (empty for layers without one).
+    stores: Vec<Vec<f32>>,
+    /// Per layer: the latents of every position.
+    history: Vec<Vec<f32>>,
+}
+
+impl Parked {
+    /// Host bytes held.
+    pub fn bytes(&self) -> usize {
+        4 * (self.tokens.len() + self.stores.iter().map(Vec::len).sum::<usize>() + self.history.iter().map(Vec::len).sum::<usize>())
+    }
+}
+
 /// The device side of the tiers in the asynchronous mode (the host side lives in the driver thread).
 pub struct AsyncBufs {
     _arena: DeviceBuf,
@@ -216,6 +233,8 @@ pub struct AsyncBufs {
     /// written by the driver).
     stage_share: u64,
     stage_share_decode: u64,
+    /// Windows of this width or more use `stage_share`; narrower ones `stage_share_decode`.
+    stage_wide_min: usize,
     stage_cap: usize,
     _stage: DeviceBuf,
     slots_all: DeviceBuf,
@@ -246,6 +265,8 @@ pub struct DsEngine<'a> {
     /// Key chunks of 12 per token in the split attention: window plus selected rows.
     attn_chunks: usize,
     ring_w: usize,
+    /// Positions each slot's compressed stores hold (rows of a store: `max_ctx`, of which `pos / ratio` are used).
+    max_ctx: usize,
     pub exact_experts: bool,
     /// The tiers when loaded from a pack; else the experts are read from the GGUF by the pool.
     pub tiers: Option<std::cell::RefCell<Tiers>>,
@@ -584,12 +605,22 @@ impl<'a> DsEngine<'a> {
                 let knob = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d).min(8);
                 let stage_share = knob("QX_DS_STAGE_SHARE", 6);
                 let stage_share_decode = knob("QX_DS_STAGE_SHARE_DECODE", 3);
+                // The window share applies from width 2 (QX_DS_STAGE_WIDE_MIN; it was 8 until 2026-11-06): at widths
+                // 2 and 4 the 6/8 share measured 4.7% and 8.2% faster per position than 3/8, outside the noise
+                // (perf/optimization_status.md). Width 1 keeps the decode share: a staged expert's DMA costs about 0.7
+                // ms against the pool's 0.22 when it serves one token, and 4/8 measured flat there.
+                let stage_wide_min: usize = std::env::var("QX_DS_STAGE_WIDE_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2).max(1);
                 let stage_cap: usize = if stage_share > 0 || stage_share_decode > 0 { std::env::var("QX_DS_STAGE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(96) } else { 1 };
                 let max_rec = (0..cfg.n_layer).map(|l| pack.experts.record[l] as usize).max().unwrap_or(0);
                 let stage = DeviceBuf::new(stage_cap * max_rec.max(256));
                 let want = (vram_gib * 1073741824.0) as usize;
                 let (free, _) = qx_gpu::mem::mem_info();
-                let budget = want.min(free.saturating_sub(1536 << 20));
+                // The headroom must hold what comes after the tier: CubeCL's pools, every kernel module, and one
+                // instantiated graph per window width (14 in a server). 1.5 GiB was not enough on 2026-11-06: a module
+                // first loaded after the graphs failed with CUDA_ERROR_OUT_OF_MEMORY (see the warm-up's free-memory
+                // line in the server log, and QX_DS_VRAM_RESERVE_MIB to adjust).
+                let reserve_mib: usize = std::env::var("QX_DS_VRAM_RESERVE_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(2560);
+                let budget = want.min(free.saturating_sub(reserve_mib << 20));
                 if budget < want {
                     eprintln!("tiers: VRAM budget cut from {:.1} to {:.1} GiB: the context and slots take the rest", vram_gib, budget as f64 / 1073741824.0);
                 }
@@ -655,6 +686,7 @@ impl<'a> DsEngine<'a> {
                     stage_cap,
                     stage_share,
                     stage_share_decode,
+                    stage_wide_min,
                     store,
                     arena,
                     table,
@@ -720,7 +752,7 @@ impl<'a> DsEngine<'a> {
                     n_embd: E,
                     ff: cfg.ff_exp,
                 };
-                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_cap: t.stage_cap, _stage: t.stage, slots_all, slots_stg, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
+                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_wide_min: t.stage_wide_min, stage_cap: t.stage_cap, _stage: t.stage, slots_all, slots_stg, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
                 abufs.step.zero();
                 let d = driver::Driver::start(host, cpus.clone());
                 (None, Some(d), Some(abufs))
@@ -746,6 +778,7 @@ impl<'a> DsEngine<'a> {
             max_rows: max_ctx,
             attn_chunks: (cfg.n_swa + cfg.idx_top_k).div_ceil(12),
             ring_w,
+            max_ctx,
             exact_experts: false,
             tiers: tiers.map(std::cell::RefCell::new),
             driver,
@@ -1136,6 +1169,58 @@ impl<'a> DsEngine<'a> {
         self.hist_flushed[slot] = p;
     }
 
+    /// Moves slot `slot`'s sequence out to host memory and leaves the slot empty (as after `reset`): its tokens,
+    /// its latent history (moved, not copied) and the used rows of its compressed stores (`pos / ratio` per
+    /// store). `unpark` puts it back into any slot. The ring and the pending pairs are not kept: a restore goes
+    /// through `rewind`, which rebuilds the attention window from the history at a group boundary, where no group
+    /// is pending.
+    pub fn park(&mut self, slot: usize) -> Parked {
+        self.flush_history(slot);
+        self.gpu.sync();
+        let pos = self.st.pos[slot];
+        let row = self.cfg.head_dim + self.cfg.idx_dim;
+        let mut stores = Vec::with_capacity(self.cfg.n_layer);
+        for l in 0..self.cfg.n_layer {
+            stores.push(match &self.st.stores[l] {
+                Some((store, _, _, _)) => {
+                    let rows = pos / self.cfg.ratio[l].max(1) as usize;
+                    store.download_at::<f32>(slot * self.max_ctx * row * 4, rows * row)
+                }
+                None => Vec::new(),
+            });
+        }
+        let mut history = std::mem::take(&mut self.history[slot]);
+        for h in history.iter_mut() {
+            h.truncate(pos * self.cfg.head_dim);
+        }
+        self.history[slot] = vec![Vec::new(); self.cfg.n_layer];
+        let tokens = std::mem::take(&mut self.st.tokens[slot]);
+        self.st.pos[slot] = 0;
+        self.hist_flushed[slot] = 0;
+        Parked { tokens, stores, history }
+    }
+
+    /// Puts a parked sequence into slot `slot` (whatever the slot held is dropped) and rewinds it to `upto`, a
+    /// group boundary at most its length (the longest prefix a new prompt shares with it). Exact: the restored
+    /// slot computes what the slot that was parked would have.
+    pub fn unpark(&mut self, slot: usize, p: Parked, upto: usize) {
+        self.gpu.sync();
+        let pos = p.tokens.len();
+        assert!(upto <= pos, "unpark past the parked length");
+        let row = self.cfg.head_dim + self.cfg.idx_dim;
+        for l in 0..self.cfg.n_layer {
+            if let Some((store, _, _, _)) = &self.st.stores[l] {
+                let rows = (upto.div_ceil(self.cfg.ratio[l].max(1) as usize)).min(p.stores[l].len() / row);
+                store.upload_at(slot * self.max_ctx * row * 4, &p.stores[l][..rows * row]);
+            }
+        }
+        self.history[slot] = p.history;
+        self.st.tokens[slot] = p.tokens;
+        self.st.pos[slot] = pos;
+        self.hist_flushed[slot] = pos;
+        self.rewind(slot, upto);
+    }
+
     /// One token of slot 0 at its position; returns its logits. `act` receives named activations (each one syncs).
     pub fn forward(&mut self, tok: u32, act: Option<&mut dyn FnMut(&str, Vec<f32>)>) -> Vec<f32> {
         self.forward_segments(&[(0, tok)], act)
@@ -1261,9 +1346,15 @@ impl<'a> DsEngine<'a> {
         } else {
             self.gpu.client.graph_prepare().expect("graph_prepare");
             self.launch_window(t, pos_min, pos_max, None);
+            // Drain the eager run, so no expert job is in flight while the device records nothing, then keep the
+            // driver out of its event syncs for the recording (see `Shared::capture`).
+            self.gpu.sync();
+            let shared = self.driver.as_ref().map(|d| d.shared.clone());
+            let not_capturing = shared.as_ref().map(|s| s.capture.lock().unwrap());
             self.gpu.client.start_capture().expect("start_capture");
             self.launch_window(t, pos_min, pos_max, None);
             let g = self.gpu.client.stop_capture().expect("stop_capture");
+            drop(not_capturing);
             if std::env::var("QX_DS_VERBOSE").is_ok() {
                 eprintln!("window graph ({t} tokens) captured at position {pos_min}");
             }
@@ -1446,7 +1537,7 @@ impl<'a> DsEngine<'a> {
                 // the misses to the driver's mailbox (x quantized to Q8_K on the way), the residents on the GPU,
                 // then wait for the CPU's rows: no host involvement
                 let mb = d.shared.mb.dptr;
-                let stage_share = if t >= 8 { ab.stage_share } else { ab.stage_share_decode };
+                let stage_share = if t >= ab.stage_wide_min { ab.stage_share } else { ab.stage_share_decode };
                 self.trace("qx_moe_post");
                 gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (tt, 1, 1), &[mb, ab.table_dev.ptr, (l * c.n_expert) as u64, self.s.ids.ptr, self.s.wts.ptr, self.s.x.ptr, ab.step.ptr, l as u64, k as u64, E as u64, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, t as u64 | ((self.warm as u64) << 32), ab.rtable_dev.ptr, ab.gpu_share, stage_share, ab.slots_all.ptr, ab.slots_stg.ptr, ab.stage_cap as u64]);
                 self.trace_done();

@@ -35,6 +35,9 @@ SCHEMA = 1
 LOW_RISK_BAR = 0.03      # a low-risk change must beat the baseline median by this much
 COMPLEX_BAR = 0.08       # a complexity-adding change by this much
 SPREAD_LIMIT = 0.10      # (max - min) / median above this: the case is too noisy to decide anything
+# the case set a scoreboard row or a promoted baseline must cover (bench.sh's default); a run with fewer cases is a
+# screening run: it can be diffed against the baseline case by case, not recorded or promoted without --partial
+STANDARD_CASES = ("decode", "prefill64", "long16k", "serve3")
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -55,8 +58,36 @@ RE_PHASES = re.compile(r"phases per step \(last \d+\): uploads " + NUM + r" ms, 
                        + NUM + r", history flush " + NUM + r", logits download " + NUM)
 
 
-def parse_log(text):
-    row = {"metric": "ms_per_token_last32", "unit": "ms/token", "value": None}
+# QX_DS_TAIL: single steps after the windows (decode at the context the windows built)
+RE_TAIL = re.compile(r"^decode tail of (\d+) single steps at position (\d+)\+: " + NUM + r" ms per token", re.M)
+RE_TAIL_PHASES = re.compile(r"phases per step: engram " + NUM + r" ms, uploads " + NUM + r", launch/replay " + NUM
+                            + r", device wait " + NUM + r", history flush " + NUM + r", logits download " + NUM)
+# tools/loadgen.py's table: conc reqs tokens prompt wall agg per-req ttft_med ttft_p90
+RE_LOADGEN = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+" + NUM + r"\s+" + NUM + r"\s+" + NUM + r"\s+" + NUM + r"\s+" + NUM + r"\s*$", re.M)
+
+
+def parse_log(text, metric="last32"):
+    """One results row from an engine log. `metric` picks the number that becomes `value`:
+    last32    ms per token over the last 32 tokens (decode and prefill windows alike)
+    tail      the QX_DS_TAIL single steps' ms per token (decode at a long context)
+    prefill   the windows' ms per token with the tail removed (prefill at a long context)
+    serve:C   from a loadgen table: 1000 / per-request decode tok/s at concurrency C"""
+    row = {"metric": {"last32": "ms_per_token_last32", "tail": "ms_per_token_tail", "prefill": "ms_per_token_windows"}
+           .get(metric, "ms_per_token_per_request"), "unit": "ms/token", "value": None}
+    if metric.startswith("serve:"):
+        want = int(metric.split(":", 1)[1])
+        for m in RE_LOADGEN.finditer(text):
+            if int(m.group(1)) == want:
+                per_req = float(m.group(7))
+                row.update(kind="serve", concurrency=want, requests=int(m.group(2)), tokens=int(m.group(3)),
+                           prompt_tokens=int(m.group(4)), wall_s=float(m.group(5)), agg_tok_s=float(m.group(6)),
+                           per_req_tok_s=per_req, ttft_med_s=float(m.group(8)), ttft_p90_s=float(m.group(9)),
+                           value=round(1000.0 / per_req, 2) if per_req > 0 else None)
+        row["nan"] = False
+        row["panicked"] = "panicked" in text or "Traceback" in text
+        if row["value"]:
+            row["tok_s"] = round(1000.0 / row["value"], 2)
+        return row
     m = RE_DECODE.search(text)
     if m:
         row.update(kind="decode", tokens=int(m.group(1)), mean_ms_per_token=float(m.group(2)), value=float(m.group(4)))
@@ -64,6 +95,23 @@ def parse_log(text):
     if m:
         row.update(kind="windows", window=int(m.group(1)), tokens=int(m.group(2)), mean_ms_per_token=float(m.group(3)),
                    value=float(m.group(5)))
+    t = RE_TAIL.search(text)
+    if t:
+        row.update(tail_steps=int(t.group(1)), tail_position=int(t.group(2)), tail_ms_per_token=float(t.group(3)))
+        tp = RE_TAIL_PHASES.search(text)
+        if tp:
+            row["tail_phases_ms"] = dict(zip(["engram", "uploads", "launch_replay", "device_wait", "history_flush",
+                                              "logits_download"], map(float, tp.groups())))
+        n, tn = row.get("tokens", 0), int(t.group(1))
+        if n > tn and row.get("mean_ms_per_token"):
+            # the windows' own mean: the whole run's time less the tail's, over the windowed tokens
+            row["windows_ms_per_token"] = round((row["mean_ms_per_token"] * n - float(t.group(3)) * tn) / (n - tn), 2)
+    if metric == "tail":
+        row["value"] = row.get("tail_ms_per_token")
+        row["kind"] = "tail"
+    elif metric == "prefill":
+        row["value"] = row.get("windows_ms_per_token")
+        row["kind"] = "windows-prefill"
     last = None
     for last in RE_POS.finditer(text):
         pass
@@ -86,8 +134,15 @@ def parse_log(text):
 def cmd_parse(a):
     text = Path(a.log).read_text(errors="replace")
     row = {"schema": SCHEMA, "case": a.case, "repeat": a.repeat, "exit": a.exit, "log": str(a.log)}
-    row.update(parse_log(text))
+    row.update(parse_log(text, a.metric))
     print(json.dumps(row))
+
+
+def case_set_note(rows):
+    """None when the run covers the standard case set; otherwise a sentence naming what is missing or extra."""
+    have = {r["case"] for r in rows}
+    missing = [c for c in STANDARD_CASES if c not in have]
+    return f"partial case set: missing {', '.join(missing)} (standard: {', '.join(STANDARD_CASES)})" if missing else None
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -138,8 +193,15 @@ def per_case(rows):
 
 
 def score_of(stats):
-    meds = [s["median"] for s in stats.values() if "median" in s]
-    if not meds or len(meds) != len(stats):
+    """The geometric mean of the standard cases' medians when the run has them all; of every case the run has
+    otherwise (a screening run compares on its own cases). Companion rows such as long16k-prefill and serve1 are
+    recorded, never scored. None when a case failed."""
+    if all(c in stats for c in STANDARD_CASES):
+        picked = {c: stats[c] for c in STANDARD_CASES}
+    else:
+        picked = stats
+    meds = [s["median"] for s in picked.values() if "median" in s]
+    if not meds or len(meds) != len(picked):
         return None
     return math.exp(sum(math.log(m) for m in meds) / len(meds))
 
@@ -166,6 +228,9 @@ def cmd_summarize(a):
             print(f"| {c} | 0/{s['n']} | failed | | | | | | |")
     sc = score_of(st)
     print(f"\nscore (geomean of the case medians, ms/token): **{sc:.3f}**" if sc else "\nscore: n/a (a case failed)")
+    note = case_set_note(rows)
+    if note:
+        print(f"\nNOTE: {note}; this score is not comparable with the scoreboard's")
 
 
 def cmd_validate(a):
@@ -221,9 +286,12 @@ def diff(base_dir, cand_dir):
             v = "REGRESSION"
             regress = True
         print(f"| {c} | {b:.2f} | {n:.2f} | {-100 * gain:+.1f}% | {100 * noise:.1f}% | {v} |")
-    sb, sc = score_of(bs), score_of(cs)
+    # the score over the cases both runs have: a screening run (bench.sh --quick) compares on its own cases only
+    common = {c: s for c, s in bs.items() if c in cs and "median" in s and "median" in cs[c]}
+    sb, sc = score_of(common), score_of({c: cs[c] for c in common})
     if sb and sc:
-        print(f"\nscore {sb:.3f} -> {sc:.3f} ({100 * (sc - sb) / sb:+.1f}%)")
+        tag = "" if len(common) == len(bs) else f" over {', '.join(common)} only"
+        print(f"\nscore {sb:.3f} -> {sc:.3f} ({100 * (sc - sb) / sb:+.1f}%){tag}")
     if cinfo.get("correctness") != "pass":
         print(f"candidate correctness: {cinfo.get('correctness', 'unknown')} (landing needs pass)")
     return regress
@@ -246,6 +314,9 @@ def cmd_promote(a):
     rows, info = load(a.run)
     if info.get("correctness") != "pass":
         die("refusing to promote a run without a passing correctness check (bench.sh --check)", 1)
+    note = case_set_note(rows)
+    if note and not a.partial:
+        die(f"refusing to promote a {note}; a baseline must cover every standard case (--partial overrides)", 1)
     dst = ROOT / "perf" / "baselines" / fingerprint(info)
     dst.mkdir(parents=True, exist_ok=True)
     src = Path(a.run)
@@ -268,9 +339,14 @@ def cmd_score(a):
     if a.record:
         if info.get("correctness") != "pass" and not a.force:
             die("refusing to record a score without a passing correctness check (use --force for a non-landing note)", 1)
+        note = case_set_note(rows)
+        if note and not a.partial:
+            die(f"refusing to record a {note}; scores are comparable only over the standard set (--partial overrides, "
+                "and the note must say which cases the row covers)", 1)
         path = Path(a.record)
         text = path.read_text()
-        cases = " ".join(f"{c} {s['median']:.2f}" for c, s in st.items())
+        scored = [c for c in STANDARD_CASES if c in st] or list(st)
+        cases = " ".join(f"{c} {st[c]['median']:.2f}" for c in scored if "median" in st[c])
         g = info.get("git", {})
         commit = g.get("commit", "?") + ("+wt" if g.get("dirty") else "")
         line = (f"| {info.get('date', '?')[:10]} | {sc:.3f} | {cases} | {fingerprint(info)} | {commit} | "
@@ -333,14 +409,15 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("parse"); s.add_argument("log"); s.add_argument("--case", required=True)
-    s.add_argument("--repeat", type=int, required=True); s.add_argument("--exit", type=int, default=0); s.set_defaults(f=cmd_parse)
-    for name, f in (("summarize", cmd_summarize), ("validate", cmd_validate), ("gate", cmd_gate), ("promote", cmd_promote),
-                    ("entry", cmd_entry)):
+    s.add_argument("--repeat", type=int, required=True); s.add_argument("--exit", type=int, default=0)
+    s.add_argument("--metric", default="last32", help="last32 | tail | prefill | serve:C (see parse_log)"); s.set_defaults(f=cmd_parse)
+    for name, f in (("summarize", cmd_summarize), ("validate", cmd_validate), ("gate", cmd_gate), ("entry", cmd_entry)):
         s = sub.add_parser(name); s.add_argument("run"); s.set_defaults(f=f)
+    s = sub.add_parser("promote"); s.add_argument("run"); s.add_argument("--partial", action="store_true"); s.set_defaults(f=cmd_promote)
     s = sub.add_parser("fingerprint"); s.add_argument("run"); s.set_defaults(f=lambda a: print(fingerprint(load(a.run)[1])))
     s = sub.add_parser("diff"); s.add_argument("base"); s.add_argument("cand"); s.set_defaults(f=cmd_diff)
     s = sub.add_parser("score"); s.add_argument("run"); s.add_argument("--record"); s.add_argument("--note")
-    s.add_argument("--force", action="store_true"); s.set_defaults(f=cmd_score)
+    s.add_argument("--force", action="store_true"); s.add_argument("--partial", action="store_true"); s.set_defaults(f=cmd_score)
     s = sub.add_parser("index"); s.add_argument("notebook"); s.set_defaults(f=cmd_index)
     a = p.parse_args()
     a.f(a)

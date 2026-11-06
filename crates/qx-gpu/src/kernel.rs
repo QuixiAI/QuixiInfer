@@ -69,6 +69,17 @@ pub struct CudaSource {
     pub cube_dim: CubeDim,
 }
 
+/// Set by `seal()`: every kernel the process will ever launch has been compiled and loaded, so a later compile is
+/// a bug (see `CudaSource::source`).
+pub static SEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declares the kernel set complete. A server calls this after its warm-up has launched every window width it
+/// can schedule; from then on a kernel that needs compiling aborts the process instead of silently launching
+/// nothing.
+pub fn seal() {
+    SEALED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl KernelMetadata for CudaSource {
     fn id(&self) -> KernelId {
         KernelId::new::<CudaSource>().info((self.module.name, self.entry, self.module.source_hash, self.cube_dim))
@@ -84,6 +95,23 @@ impl CubeKernel for CudaSource {
         KernelDefinition { body: Scope::root(settings.clone()), settings, info: Info::default() }
     }
     fn source(&self) -> Option<PrecompiledSource> {
+        // CubeCL asks for the source only when the kernel id is not loaded yet, i.e. on an NVRTC compile. Each
+        // compile costs about a second and leaks about 63 MiB of host memory inside NVRTC (2026-11-06), so a
+        // steady state must never see this line. Worse, CubeCL reports a failed compile or module load only on
+        // the buffers a launch binds, and these launches bind none: a kernel that cannot be loaded (the server
+        // ran out of VRAM for the module after its graphs were captured, 2026-11-06) is retried on every launch
+        // and the window silently runs without it. After `seal()` a compile is therefore fatal.
+        if SEALED.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "fatal: kernel {}.cu {} (block {:?}) needs compiling after the kernel set was sealed: it was not warmed \
+                 up, or its module failed to load (out of device memory?) and CubeCL is retrying it on every launch",
+                self.module.name, self.entry, self.cube_dim
+            );
+            std::process::abort();
+        }
+        if std::env::var("QX_DS_VERBOSE").is_ok() {
+            eprintln!("nvrtc compile: {}.cu {} (block {:?})", self.module.name, self.entry, self.cube_dim);
+        }
         Some(PrecompiledSource {
             source: self.module.source.to_string(),
             entrypoint_name: self.entry.to_string(),

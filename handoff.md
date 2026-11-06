@@ -7,6 +7,42 @@ UD-IQ2_XXS in QuixiInfer on this box, as fast as possible. The results must stay
 The box has an RTX 5090 (32 GB), a Ryzen 9950X (16 cores), 120 GiB of RAM and a 4 TB NVMe root. The experts live in
 three tiers: VRAM, pinned RAM and the NVMe pack.
 
+## Update 2026-11-06
+
+- **The user set an autonomous optimization loop:** `goal-prompt.md` at the repo root is the directive (read it
+  first). It runs experiments through `perf/`, keeps only measured wins, and records everything.
+- **Harness set B.** `perf/harness/bench.sh` now runs `decode`, `prefill64`, `long16k` and `serve` by default
+  (`--quick` for the first two); token files are vendored in `perf/data/`. `perf_diff.py` refuses to record or
+  promote a partial case set. Set A and set B scores are not comparable (`perf/scoreboard.md`). **The set B
+  baseline is recorded: 34.327** (decode 33.1, prefill64 12.1, long16k 36.4, serve3 95.2 ms per token), promoted
+  to `perf/baselines/rtx-5090_ryzen-9-9950x_121g/`.
+- **Measured today, no code change:** narrow windows cost 23.6 / 19.4 / 15.7 ms per position at widths 2 / 4 / 8,
+  so DSpark-style drafting breaks even at 41-46% acceptance and gains 6% at 75%: backlog family 6 is DEFERRED.
+  Steady decode at 16k is 36 ms per token, not 53 (the old figure averaged a graph capture). Windows of 5 are
+  125/128 bit-identical to single steps (open, `findings.md`).
+- **Candidate in the tree:** the window staged share (6/8) applies from width 2 (`QX_DS_STAGE_WIDE_MIN`, was 8):
+  -4.7% at width 2, -8.2% at width 4 on the forced bench. Its serve3 A/B (`serve-widemin8` against
+  `serve-widemin2`, 3 repeats each) was queued right after the baseline; read `perf/results/2026-11-06/` for it.
+- **Two bugs found by the serve case, both fixed in the working tree:**
+  1. A capture race: the driver thread's `cuEventSynchronize`/`cuEventQuery` during a global-mode graph capture
+     panicked the server's warm-up. Fix: `Shared::capture` mutex plus a device drain before recording
+     (`dsv41/driver.rs`, `dsv41/mod.rs`; `docs/progress.md` 2026-11-06).
+  2. Host memory: under serving load the server's anonymous memory grew at 330 MB/s until an OOM kill (at a
+     118G cap the *global* OOM killer). Real cause (after a wrong first diagnosis of glibc fragmentation): the
+     width-6 kernel `qx_mgemv_t6` was not in the warm-up, and when it first compiled mid-serving its module
+     could not load (`CUDA_ERROR_OUT_OF_MEMORY`: the tier left 1.5 GiB and the graphs took 1.2); CubeCL retried
+     on every launch (63 MiB of NVRTC host memory each) and the window ran without the GEMV. Fix: the server
+     warms every width in `WIDTHS`, `qx_gpu::kernel::seal()` makes any later compile abort, the VRAM headroom is
+     2.5 GiB (`QX_DS_VRAM_RESERVE_MIB`), and `QX_DS_VERBOSE` logs compiles. `tune_host_allocator()` (pinned malloc
+     thresholds) stays as hygiene. Rules in `perf/findings.md` "Operating envelope": serve at 90 GiB,
+     `MemoryMax=112G` with `OOMPolicy=continue`, launch heavy runs detached (`nohup setsid`), never as the
+     session's tracked background tasks (its memory guard kills them when the pinned tier leaves little free RAM).
+- The Qwen `quixiinfer.service` was found crash-looping every 10 s (18,742 restarts, `status=200/CHDIR`) and was
+  stopped with `sudo systemctl stop`; it stays enabled, as before.
+- Ideation from `~/git/{colibri,Strata,basalt,DeepInfer}` is in `perf/backlog.md` families 6 and 7 and in
+  `perf/findings.md` "Rejected elsewhere". The first long shot is the narrow-window measurement for DSpark-style
+  drafting (family 6); the UD-IQ2_XXS GGUF has no MTP tensors, so a drafter would need a separate download.
+
 ## Update 2026-11-05
 
 - The verified work described below is now committed and pushed as `f359604`. The small slowdown was noise.

@@ -932,6 +932,43 @@ Decode right after a 1k-token prefill: 95 tok/s (token-by-token prompt: 103), 90
     posts no job and zeroes the slot lists, the wait kernels return at once), with positions clamped so the
     compressed-store kernels are launched too, then the device is drained; every kernel of that width is compiled
     and loaded before any job exists. The dry pass writes the ring and store positions the real pass rewrites.
+  - **A capture race in the server's warm-up (2026-11-06).** The first `serve` case of the new performance
+    harness (`perf/`) panicked in `quixiinfer serve`'s warm-up: `stage copies:
+    CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED (operation not permitted when stream is capturing)` on the driver
+    thread, then `cuStreamEndCapture: CUDA_ERROR_STREAM_CAPTURE_INVALIDATED` on the engine thread. CubeCL begins
+    its captures in `CU_STREAM_CAPTURE_MODE_GLOBAL`, under which a `cuEventSynchronize` or `cuEventQuery` from
+    any other thread is refused and poisons the capture. The driver makes those calls after its staging copies
+    and before reusing its promotion buffers; the engine recorded a width's graph right after launching its eager
+    run, with the driver mid-job, and the server's warm-up captures ten widths back to back. The forced bench
+    captures one width per run and never hit it. Fix: `Shared::capture`, a mutex the engine holds from
+    `start_capture` to `stop_capture` and the driver takes around each event sync or query (a capture never waits
+    for the driver, so neither side can deadlock), and a device drain between the eager run and the recording so
+    no expert job is in flight while nothing executes. Warm-up then captures all ten widths in 7.6 s. Measured
+    the same morning with the harness: per-request decode 26.3 tok/s at one request and 11.5 at three.
+  - **The server grew to an OOM under load: a kernel that could not load (2026-11-06).** The harness's serve case
+    killed the box's memory twice: the server's anonymous memory grew at about 330 MB/s under `loadgen.py`
+    (intermittently), 14.7 GB when the global OOM killer took it, 22.7 GB inside a 112G scope at a 90 GiB tier.
+    The forced bench and single requests never grow. A first diagnosis blamed glibc arena fragmentation (62 heaps
+    of 64 MiB at 5 GB); pinning malloc's thresholds (`qx_engine::tune_host_allocator()`, kept as hygiene) removed
+    the heaps but a later repeat still grew. `malloc_stats()` under gdb then showed the memory *live*, and a gdb
+    breakpoint on large `mmap` calls backtraced every one to `nvrtcCompileProgram` from CubeCL's `compile_failed`.
+    A compile log line in `CudaSource::source()` named the kernel, `mgemv.cu qx_mgemv_t6`, compiled 49 times in a
+    minute; a locally patched CubeCL printed why: `cuModuleLoadData: CUDA_ERROR_OUT_OF_MEMORY`. The tier had left
+    1.5 GiB of VRAM, the warm-up's graphs took 1.2 GiB of it (about 100 MB each), and width 6 (three decoders and
+    three prompt tokens) was not warmed, so its kernel first compiled mid-serving with no device memory left for
+    the module. CubeCL reports a failed load only on the buffers a launch binds, and ours bind none: it retried on
+    every launch (a second of NVRTC and 63 MiB of host memory each) and the window ran **without that GEMV**.
+    `--slots 6` reproduces it deterministically (113 failures of 114, 0.1 tok/s). Fix: the server warms every
+    width in `WIDTHS`; `qx_gpu::kernel::seal()` after warm-up makes any later compile abort with the kernel's
+    name; the VRAM headroom is 2.5 GiB (`QX_DS_VRAM_RESERVE_MIB`) and the warm-up line prints what is left;
+    `QX_DS_VERBOSE` logs every compile. After the fix the 6-slot reproducer ran 61 width-6 windows with no
+    compiles and flat memory. Operating rules from the same day: run anything that pins the tier under
+    `MemoryMax=112G` (118G lets the global killer fire first) with `OOMPolicy=continue`; the harness serves at a
+    90 GiB tier.
+  - **Performance scaffolding (2026-11-05/06).** `perf/` holds the handbook, the notebook, the findings and
+    backlog, the scoreboard and the harness (`perf/harness/bench.sh`, `perf_diff.py`). The standard case set is
+    now `decode`, `prefill64`, `long16k` (16,384 tokens in windows of 64, then a 64-step tail) and `serve3`
+    (`loadgen.py` at concurrency 3 on 3 slots); the token files are vendored in `perf/data/`.
 
 ## Not yet
 

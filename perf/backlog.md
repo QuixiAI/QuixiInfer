@@ -24,6 +24,9 @@ invented one. The aggregate score lives in `scoreboard.md`.
   3. Take a baseline.
 - **Kill criteria:** none, since this is prerequisite work. It concludes when both cases run three repeats with a
   spread under 10%.
+- **Concluded 2026-11-06.** Both cases run 3/3: long16k spread 0.5% (after moving its metric to the last 32
+  steps), serve3 0.9%. Set B baseline recorded at 34.327. The cases found two serving bugs on the way (notebook).
+  Still open from this family: engine counters for the serve rows.
 
 ### 2. The serving gap: per-request decode at about half the forced bench
 
@@ -69,6 +72,10 @@ invented one. The aggregate score lives in `scoreboard.md`.
   - Prefill windows go from 3.1 to 3.8 ms per token GPU-only.
   - The pool carries most of the end-to-end rise, at 46 ms per token for prefill at 12k (2026-11-04, the 16k
     entry).
+  - **Corrected 2026-11-06 by the harness:** steady decode at 16k is 35-37 ms per token (the 53 was
+    capture-contaminated), so the decode rise from 1k is about 10%, not 65%. Prefill averaged over 0-16k is 19.5
+    against 12.3 at 1k: the long-context cost is mostly in prefill, and that is where this family should look
+    first (the per-window cost by position is in the `pos N:` lines of the long16k logs).
 - **Hypothesis:** the GPU part is attention over 128 window rows plus 512 selected rows, and indexer scoring
   linear in the visible compressed rows; an nsys kernel table will name it. The pool part needs explaining first:
   the expert count per token should not depend on position.
@@ -89,10 +96,75 @@ invented one. The aggregate score lives in `scoreboard.md`.
 - **Kill criteria:** no width and capacity setting beats 11.8 by 8%. Prefill is then copy-bound at about 14-25 GB/s,
   and further gains need the NVMe tier changed.
 
-## Parked
+### 6. Long shot: the economics of a verify window (DSpark-style drafting), measurement first
 
-- **Speculative decoding (DSpark / MTP) for throughput.** Rejected on analysis in `findings.md`. Re-open only with a
-  measured routing overlap between consecutive tokens.
+- **Parent result:** `findings.md` rejected speculative decoding on analysis (different tokens route to different
+  experts, so a decode window does not cut pool bytes per token). Three neighbours measured otherwise:
+  - Strata's user report of the same UD-IQ2_XXS-class model on an RTX 4090 48 GB with 128 GiB RAM: 16-22 tok/s
+    with `--dspark auto` (which chose off) against **40.2 tok/s with `--dspark on --dspark-conf 0.65`**
+    (`~/git/Strata/docs/DEEPSEEK41.md`, one report). Strata's own 3060 box: +2-13%.
+  - colibri's CPU engine: 17% faster with drafting and an acceptance guard at 60%, slower with the guard off
+    (`~/git/colibri/docs/deepseek-v41.md`, "DSpark"). Their lesson: stopping pays as much as starting.
+  - DeepInfer ships `DEEPINFER_USE_NEXTN_DECODE=5` with a confidence head that schedules verification.
+- **Why it might work here anyway:** our prefill64 runs 11.9 ms per token against decode's 32: windows are 2.7x
+  cheaper per position because the staged GPU share and the pool's one-read-per-window amortize the experts. A
+  verify window of 1 + 5 drafts is a window of 6; what matters is the ms per position of a *narrow* window, which
+  was never measured (`WIDTHS` has 2, 3, 4, 6, 8, but the harness only ran 32-128).
+- **Measurement (no engine change, about 15 minutes):** `bench.sh --cases prefill2,prefill4,prefill8` once
+  those cases exist (one line each in `bench.sh`'s table). With `w_T` the ms per token of a window of T tokens, a
+  round of T positions accepting `a` drafts on average costs `T * w_T` for `1 + a` tokens, so drafting pays when
+  `T * w_T / (1 + a) < 32`. At T = 6 and w_6 = 15, break-even is a = 1.8 of 5 (36%); at w_6 = 25, a = 3.7 (74%).
+  Record the break-even curve in `findings.md` either way.
+- **Blockers if the curve says go:** the UD-IQ2_XXS GGUF carries no MTP tensors (all six shards scanned on
+  2026-11-06: blocks 0-39 only). The drafter is a separate Unsloth DSpark Q8_0 GGUF of about 8 GB, not on the box
+  (ask before downloading). Then: the head's three stages (window-only attention over the main stream's keys, 128
+  own experts, 3 per token), rollback of the SWA ring, the compressor's group slots and the index-key slot for
+  rejected drafts (colibri documents all three), greedy acceptance first, an acceptance guard like colibri's.
+  That is weeks, not days; the measurement decides whether to start.
+- **Kill criteria:** w_6 above 27 ms per token (break-even acceptance above 80%), or Strata's acceptance numbers
+  for this quant turn out below the break-even.
+- **Measured 2026-11-06 (notebook, "Narrow-window cost per position"): DEFERRED.** w_2 = 23.6, w_4 = 19.4,
+  w_8 = 15.7 ms per position; break-even acceptance 41-46% before the drafter's cost; a 6% gain at 75% acceptance,
+  19% at 85%. Not a kill, since 85% acceptance is plausible for MTP heads, but not worth weeks without a measured
+  acceptance for this quant, and the drafter weights are not on the box. Re-open with: a measured per-position
+  acceptance of 80% or more, or w_4 under 15 ms per position from window-side work (the staged share at widths
+  2-4 is measured next).
+
+### 7. Ideas from the neighbours, not yet ranked
+
+Read on 2026-11-06 from `~/git/{colibri,Strata,basalt,DeepInfer}`. Each needs a translation to this box before it
+becomes a family.
+
+- **Wider prompt chunks on a layer-major path** (Strata: `--prefill-chunk 8192` gave 11-15% at 4k-32k prompts, a
+  "layer-major" path for long prompts). Ours: windows of 128 lost to 64 only because of the 96-record staging
+  area. Family 5's `STAGE_CAP` sweep should go to 192 and 384 with windows of 128, and beyond that a layer-major
+  chunk of 256-1024 tokens would read each expert once per chunk from the pool. The pool is compute-bound past
+  128 tokens per expert (4 TMAC/s), so the gain has a ceiling; compute it before building.
+- **Grouped expert kernels with the window's activations staged in shared memory** (Strata EXPDEC, bit-identical,
+  cut the per-extra-token cost of a resident expert by about 60% on a 2080 Ti). Prefill64 is partly bound by our
+  GPU expert kernels over `slots`/`slots_stg`; an nsys table of a 64-token window names whether the multi-GEMV's
+  per-token cost is the issue.
+- **Batched DMA submission** (`cudaMemcpyBatchAsync`, Strata): submission latency -83%, transfer time -1.3%, no
+  tokens-per-second gain established. Low value for us: 96 records over 4 streams is not submission-bound.
+- **Adaptive tier cadence** (basalt): rounds every window matter far more than round size; 160 swaps against 96
+  was within noise; a saved profile helps a cold start only slightly on one card. Ours promotes every token
+  already (`QX_DS_PROMOS=32`). The transferable part is for family 2: a profile seeded from the live
+  `--profile-out`, measured with `serve3` repeats.
+- **Reads issued as one batch per step, depth 8, O_DIRECT** (colibri). Ours already batches io_uring reads per
+  layer; the NVMe share at steady state is 1.8% of routed experts. Only the serving cold start is read-bound.
+- **The first-touch floor** (colibri: a 16-token turn touches 3,371 distinct experts; no cache size removes the
+  first read of each). For serving this is what the profile seed and parked prefixes address, nothing else.
+- **Host memory** (ours, 2026-11-06, `findings.md` "Operating envelope"): the anonymous growth was NVRTC retrying
+  a kernel whose module could not load for lack of VRAM, and is fixed. What remains: the 6.7 GB of file-backed resident pages at idle (the GGUF mmap kept
+  warm after load, or CUDA's device mappings; `pmap -x` on the idle server says). If they are the GGUF's, dropping
+  them after load (`madvise(DONTNEED)`, or reading the dense weights into VRAM without keeping the map) returns
+  6.7 GB to the RAM tier, about 700 more resident experts. Also: the pool's `vec![0f32; ff]` per expert per token
+  is allocator churn a per-thread scratch would remove.
+- **SWA bounded replay** (DeepInfer `YOCO_PREFILL_TRUNCATION_MODE=compact`, keep 140 tokens): recompute only a
+  bounded suffix when a decoder's state is rebuilt. Ours rebuilds the ring from the host latent history in
+  `rewind`; the equivalent is already in place, but a measurement of `rewind`'s cost at 16k belongs to family 4.
+
+## Parked
 - **Parking idle sequences in host memory** (work in progress, 2026-11-05). This is a serving capability: prefix
   reuse across more conversations than slots. It is not a speed change to the standard benchmark. Its
   measurement belongs to the `serve` case: time to first token on a returning conversation.

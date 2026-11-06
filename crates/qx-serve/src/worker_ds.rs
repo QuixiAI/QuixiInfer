@@ -188,13 +188,13 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         // decoding slot, and the prompt chunk); the other widths of WIDTHS are captured on first use
         {
             let t0 = std::time::Instant::now();
-            // one token per decoding slot, and the prompt chunk widths up to `window`
-            let mut widths: Vec<usize> = (1..=eng.slots.min(4)).collect();
-            let chunks: Vec<usize> = WIDTHS.iter().copied().filter(|&w| w >= 8 && w <= window && !widths.contains(&w)).collect();
-            widths.extend(chunks);
-            if !widths.contains(&window) {
-                widths.push(window);
-            }
+            // Every width the scheduler below can produce: the largest entry of WIDTHS at or under the decoders
+            // plus the prompt tokens on offer, which several prompts arriving together take up to DS_TMAX. Every
+            // one of them must compile and capture now (about 100 MB of device memory per graph): a kernel first
+            // needed later may find no device memory left for its module once the graphs are instantiated
+            // (2026-11-06: width 6, qx_mgemv_t6, failed to load with CUDA_ERROR_OUT_OF_MEMORY on every launch and
+            // the windows ran without it), and `seal()` below turns any later compile into an abort.
+            let widths: Vec<usize> = WIDTHS.iter().copied().filter(|&w| w <= DS_TMAX).collect();
             let toks = vec![0u32; 2 * DS_TMAX];
             eng.reset(0);
             let _ = eng.forward_window(&toks[..2], None); // positions 0-1: the stores' first rows, before any capture
@@ -202,7 +202,14 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 let _ = eng.forward_window(&toks[..w], None);
             }
             eng.reset(0);
-            eprintln!("quixiinfer: warm-up {:.1}s (graphs for windows of {widths:?})", t0.elapsed().as_secs_f64());
+            qx_gpu::kernel::seal();
+            let (free, total) = qx_gpu::mem::mem_info();
+            eprintln!(
+                "quixiinfer: warm-up {:.1}s (graphs for windows of {widths:?}); device memory free after warm-up: {:.2} GiB of {:.2}",
+                t0.elapsed().as_secs_f64(),
+                free as f64 / 2f64.powi(30),
+                total as f64 / 2f64.powi(30)
+            );
         }
         let mut width_hist: std::collections::BTreeMap<usize, usize> = Default::default();
         let prefix_on = !std::env::var("QX_DS_PREFIX").is_ok_and(|v| v == "0");

@@ -298,6 +298,7 @@ fn usage() -> ! {
 }
 
 fn main() -> Result<()> {
+    qx_engine::tune_host_allocator();
     qx_gpu::init();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {

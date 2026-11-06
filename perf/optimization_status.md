@@ -40,9 +40,17 @@ After appending, run `python3 perf/harness/perf_diff.py index perf/optimization_
 
 | date | entry | verdict | line |
 |---|---|---|--:|
-| 2026-11-05 | DeepSeek history before the harness | RECORDED | 48 |
-| 2026-11-05 | Performance scaffolding | LANDED | 67 |
-| 2026-11-05 | First harness baseline | RECORDED | 90 |
+| 2026-11-05 | DeepSeek history before the harness | RECORDED | 56 |
+| 2026-11-05 | Performance scaffolding | LANDED | 75 |
+| 2026-11-05 | First harness baseline | RECORDED | 98 |
+| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 118 |
+| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 131 |
+| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 146 |
+| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 165 |
+| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 188 |
+| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 218 |
+| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 245 |
+| 2026-11-06 | First set B baseline | RECORDED | 277 |
 <!-- qx:index:end -->
 
 ## 2026-11-05: DeepSeek history before the harness — RECORDED
@@ -106,3 +114,191 @@ Decode is the noisy case. Three runs earlier the same day measured 31.2-33.1, so
 6% gain before the noise rule lets it count. Prefill64 is tight, so 3% is decidable there.
 Open questions: what drives decode's spread? Candidates are NVMe timing (the fetch counter) and promotion timing.
 Compare the counters of the 31.4 and 33.2 repeats in the run directory's logs before the next decode experiment.
+
+## 2026-11-06: Harness set B: long16k and serve cases, vendored token files — LANDED
+
+Status: landed tooling (backlog family 1, concluded with the baseline below).
+Change: `bench.sh` runs `decode`, `prefill64`, `long16k` (16,384 tokens in windows of 64, then a 64-step tail) and
+`serve` (3 slots, ctx 8192, `loadgen.py` at concurrency 1 and 3 after 6 unmeasured requests, greedy, 256 tokens)
+by default, `--quick` for the first two. `perf_diff.py parse --metric` reads the tail and loadgen formats;
+`STANDARD_CASES` gates `promote` and `score --record`. `perf/data/` holds `route1k.tokens` and `route16k.tokens`.
+Correctness: unchanged engine; `tools/ds-checks.sh` passed on the runs below (and `bench.sh` now defaults
+`QX_LLAMA_TOKENIZE`, without which the tokenizer line is silently missing and the gate reports `incomplete`).
+Decision: landed. What the first runs found is in the next three entries; the set B baseline is recorded once it
+runs clean three times.
+Open questions: the serve rows have no engine counters yet (the server log holds them).
+
+## 2026-11-06: The serve case found a capture race in the server's warm-up (bug fix) — LANDED
+
+Status: landed.
+Symptom: the first `serve` repeat panicked in warm-up, `stage copies: CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`, then
+`cuStreamEndCapture: CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`.
+Cause: CubeCL captures in global mode; the driver thread's `cuEventSynchronize`/`cuEventQuery` (after staging
+copies, before reusing promotion buffers) are illegal from any thread during such a capture. The engine recorded
+each width right after its eager run with the driver mid-job; the server captures ten widths back to back.
+Change: `Shared::capture` mutex held by the engine across start/stop capture and taken by the driver around each
+event sync or query; a device drain between the eager run and the recording. `dsv41/driver.rs`, `dsv41/mod.rs`.
+Correctness: `tools/ds-checks.sh` pass, all five lines exact, on the fixed tree (twice).
+Effect: warm-up captures all ten widths in 7.3-8.7 s; no change to the forced cases (decode 32.7 against 32.0 the
+day before, prefill64 12.3 against 11.9: both inside the recorded noise).
+Decision: landed as a correctness fix; no speed claim.
+
+## 2026-11-06: long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 — RECORDED
+
+Status: measurement; metric definition changed before the first set B baseline was recorded.
+Run: `baseline-setb` at git 0dc3dbd + working tree, host rtx-5090_ryzen-9-9950x_121g, 3 repeats, standard settings.
+
+| long16k repeat | tail step 0 (width-1 capture) | 64-step tail mean | last 32 steps | windows mean 0-16k |
+|---|--:|--:|--:|--:|
+| 1 | 1457 ms | 60.4 | 37.5 | 20.0 |
+| 2 | 1488 ms | 59.4 | 35.7 | 19.5 |
+| 3 | 849 ms | 49.1 | 35.3 | 19.5 |
+
+The tail's first single step pays the width-1 graph capture (0.85-1.5 s, varying), which moved the 64-step mean
+by 11 ms per token while the steady steps did not move. `long16k` now scores the last 32 steps, like `decode`.
+Counters: device wait 35-37 ms per steady step at 16k; pool 14.4 ms per token over the run; per-window prefill
+cost is not monotonic in position (13.6 ms per token at 4k, 23.1 at 8k, 19.1 at 12k), so it follows the text's
+routing, not the context length.
+Decision: belief changed in `findings.md` and backlog family 4: the end-to-end decode rise from 1k to 16k is about
+10% (32.7 to 35-37), and the long-context cost is in prefill (19.5 against 12.3 ms per token).
+
+## 2026-11-06: The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) — LANDED
+
+Status: landed.
+Symptom: under serving load the server's anonymous memory grew at about 330 MB/s, intermittently (2 of 4 identical
+runs), until the kernel killed it: 14.7 GB at a 118G scope (the *global* OOM killer, the agent-harness-killing
+case), 22.7 GB at a 90 GiB tier inside a 112G scope. The forced bench (one slot) never grows; `quixiinfer run`
+with 1 or 3 slots never grows; five server probes without the pattern never grew.
+Diagnosis: a reproducer (`loadgen.py --warmup 6`, then concurrency 3, three rounds) grows every time. At 5.2 GB
+anonymous, `/proc/PID/maps` held 62 regions of exactly 64 MiB (3.96 GB): glibc malloc arena heaps. glibc raises
+its mmap threshold dynamically when a chunk above it is freed; the serving load frees 0.5-1.5 MB buffers every
+step (the logits download, each request's logits copy) on several threads, after which those sizes come from the
+arenas and freed arena memory is rarely at a heap's top.
+Change: `qx_engine::tune_host_allocator()` pins `M_MMAP_THRESHOLD` at 128 KiB and `M_TRIM_THRESHOLD` at 256 KiB,
+called first in `quixiinfer` and `qx-ds-check`. The env-knob experiment (`MALLOC_MMAP_THRESHOLD_=131072
+MALLOC_TRIM_THRESHOLD_=262144`) and the built binary both ran the reproducer three rounds at 1.82 GB flat.
+Correctness: no numerical change possible (allocator parameters only); `tools/ds-checks.sh` runs with the fixed
+binaries in the set B baseline.
+Decision: landed as a robustness fix. Speed: not a target; the set B baseline that follows measures it.
+Rejected alternatives: `MALLOC_ARENA_MAX` (adds lock contention for the 16 pool threads; not needed); a different
+global allocator (a new dependency, offline; reconsider if arena growth reappears elsewhere).
+Open questions: the pool's per-expert scratch allocations (`vec![0f32; ff]` per expert per token) are churn that a
+preallocated per-thread buffer would remove; a small cleanup, not a speed claim.
+
+## 2026-11-06: Narrow-window cost per position: the economics of DSpark-style drafting — RECORDED
+
+Status: measurement for backlog family 6 (long shot), no engine change.
+Bottleneck hypothesis: a verify window of T positions is cheaper per position than T single steps because the
+pool reads each expert once per window and the staged GPU share takes misses; whether drafting can pay depends on
+how much cheaper at T = 2-8, which the harness never measured.
+Run: `narrow-windows` at git 0dc3dbd + working tree (capture-lock and allocator fixes), host
+rtx-5090_ryzen-9-9950x_121g, 3 repeats, standard settings, route1k 1024 tokens, `--cases prefill2,prefill4,prefill8`.
+
+| window T | ms per position (last 32) | spread | T x w_T, ms per window | break-even accepted drafts of T-1 | acceptance needed |
+|--:|--:|--:|--:|--:|--:|
+| 1 (decode) | 32.7 | 2.8% | 32.7 | | |
+| 2 | 23.6 | 0.8% | 47.2 | 0.44 of 1 | 44% |
+| 4 | 19.4 | 3.1% | 77.6 | 1.37 of 3 | 46% |
+| 8 | 15.7 | 1.9% | 125.6 | 2.84 of 7 | 41% |
+
+Break-even excludes the drafter's own cost (colibri: about a fifth of a main token, so about 6.5 ms per round
+here). With it, and a per-position acceptance p (geometric acceptance of k drafts: sum of p^k): at p = 75%, T = 4
+gives 2.73 tokens per 84 ms = 30.8 ms per token, a 6% gain; T = 6 and T = 8 give none. At p = 85%, T = 4 gives
+3.18 tokens per 84 ms = 26.4 ms per token, a 19% gain. Strata's 2x on a 4090/128 GiB box started from a 16-22 tok/s
+single step; ours is 30.6 tok/s, and the window stays pool-bound on the union of the positions' experts.
+Counters that explain it: at T = 8 the staged share rises from 3/8 to 6/8 (staged 44.5k against 21.3k selections,
+pool 10.2 against 14.5-14.8 ms per token); at T = 2 and 4 the decode share applies. That is a lever on w_2 and
+w_4 that does not need a drafter: `QX_DS_STAGE_SHARE_DECODE=6` is measured next.
+Decision: family 6 DEFERRED. Drafting needs a measured per-position acceptance of 80% or more on the target
+workloads to be worth weeks of work, and the drafter weights are not on the box. The verify-window cost curve is
+recorded in `findings.md`; it also bounds any other multi-position decode scheme.
+Open questions: w_T with a 6/8 staged share at T = 2-4; the actual MTP acceptance of this quant (needs the
+Unsloth DSpark GGUF, about 8 GB, and the head implemented: ask before downloading).
+
+## 2026-11-06: Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) — CANDIDATE
+
+Status: candidate; knob measured, and the default changed in the tree (`QX_DS_STAGE_WIDE_MIN`, default 2, was a
+hard-coded 8). It lands when `serve3` confirms it against the same binary at `QX_DS_STAGE_WIDE_MIN=8`.
+Bottleneck hypothesis: at widths 2-7 the engine uses the decode staged share (3/8) although the window share
+(6/8) already pays at 8; the narrow-window counters showed the pool at 14.5-14.8 ms per token at T = 2 and 4
+against 10.2 at T = 8, where the staged share doubles.
+Change (one factor): `QX_DS_STAGE_SHARE_DECODE=6` on `prefill2,prefill4`.
+Correctness: not run for a knob sweep (the staged path is bit-identical by construction; the full check runs
+with the default change).
+Run: `narrow-share6` against `narrow-windows`, same tree, host rtx-5090_ryzen-9-9950x_121g, 3 repeats each.
+
+| case | baseline median | this run median | change | spreads (base / this) |
+|---|--:|--:|--:|--:|
+| prefill2 | 23.6 | 22.5 | -4.7% | 0.8% / 2.7% |
+| prefill4 | 19.4 | 17.8 | -8.2% | 3.1% / 0.6% |
+
+Counters: pool 14.8 to 10.1 ms per token at T = 2, 14.5 to 10.4 at T = 4; the stage wait rose (the copies now
+carry more), so the balance point for narrow windows sits at or above 6/8, not at 3/8.
+Decision: both clear the 3% low-risk bar outside the noise; prefill4 clears the 8% bar. Width 1 keeps 3/8 (a 4/8
+decode share measured no gain on 2026-11-04, and a staged expert's DMA costs 0.7 ms against the pool's 0.22 when
+it serves one token). The change to make: apply the window share from width 2, not 8. It reaches the scoreboard
+through `serve3` (decode windows of 3 decoders), which needs the serve case to run clean first (the memory leak
+being chased in the next entry).
+Rejected alternatives: raising the decode share for width 1 too (measured flat on 2026-11-04).
+Open questions: 5/8 or 7/8 at widths 2-4; the stage wait suggests the copies are now the limit at T = 2.
+
+## 2026-11-06: The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal — LANDED
+
+Status: landed; supersedes the diagnosis in "glibc arena fragmentation" above (the allocator pinning stays, it is
+harmless and it removed the arena growth, but it was not the cause).
+Symptom, restated: with the allocator fixed, a serve repeat still grew to 22.7 GB anonymous and was killed.
+`malloc_stats()` under gdb showed 4.1 of 4.2 GB *in use* (live, not fragmentation), in 63 MiB chunks. A gdb
+breakpoint on large `mmap` calls backtraced every one of them to `nvrtcCompileProgram`, called from CubeCL's
+`compile_failed` on every launch of one kernel. A compile log line in `CudaSource::source()` named it:
+`mgemv.cu qx_mgemv_t6`, 49 compiles in a minute, all other kernels once. A locally patched CubeCL printed the
+error: **`cuModuleLoadData: CUDA_ERROR_OUT_OF_MEMORY`**.
+Cause: the server fills its VRAM expert tier to within 1.5 GiB of free device memory, then the warm-up captures
+one graph per window width (about 100 MB each, 1.2 GiB for 12 widths). Width 6 (three decoders plus three prompt
+tokens, or 8+6 chunks of width 14) was not in the warm-up set, so its kernel first compiled mid-serving, when no
+device memory was left for the module. CubeCL reports a failed load only on the buffers a launch binds, and these
+launches bind none, so it retried on every launch (a second of NVRTC and 63 MiB of host memory each time) and the
+window ran *without that GEMV*. Deterministic reproduction: `--slots 6` (every decode window is width 6): 113
+failures of 114 attempts, 0.1 tok/s, output not to be trusted. The forced bench never hit it because it compiles
+everything before any graph exists and runs one slot. Intermittent in the harness because width 6 depends on
+scheduling.
+Change: (1) the server warms every width in `WIDTHS` (widths up to DS_TMAX arise when several prompts arrive at
+once); (2) `qx_gpu::kernel::seal()` after warm-up: a compile after the seal aborts the process with the kernel's
+name instead of serving wrong logits; (3) the tier's VRAM headroom is 2.5 GiB (`QX_DS_VRAM_RESERVE_MIB`, was a
+hard-coded 1.5), and the warm-up line prints the free device memory afterwards (0.96 GiB with 12 widths at 6
+slots). (4) `CudaSource::source()` logs every NVRTC compile under `QX_DS_VERBOSE`.
+Correctness: the 6-slot reproducer after the fix: 61 width-6 windows, 0 compiles after warm-up, 0 failures, host
+memory flat at 2.0 GB, 12.6 tok/s aggregate. `tools/ds-checks.sh` runs in the set B baseline that follows.
+Cost: the serving VRAM tier loses 1 GiB (about 100 records) to the larger headroom; the forced cases are
+unaffected (their budget is not headroom-bound). `serve3` measures it.
+Rejected alternatives: binding a dummy buffer so CubeCL would taint something (breaks the kernels' signature);
+vendoring a patched CubeCL that reports load errors (a maintenance burden; the seal covers the failure mode).
+Open questions: upstream CubeCL could report a module-load failure regardless of bindings; worth an issue.
+
+## 2026-11-06: First set B baseline — RECORDED
+
+Status: baseline promoted to `perf/baselines/rtx-5090_ryzen-9-9950x_121g/` (replaces the set A baseline of
+2026-11-05, which stays in the scoreboard as history).
+Correctness: `tools/ds-checks.sh` pass, all five lines exact.
+Run: `baseline-setb` (results/2026-11-06/baseline-setb-064445) at git 0dc3dbd + working tree 5a3b184bd7eb (the
+tree committed right after this entry), host rtx-5090_ryzen-9-9950x_121g, driver 595.99.02, 3 repeats, standard
+settings; the server at a 90 GiB RAM tier and a 2.5 GiB VRAM headroom.
+
+| case | median ms/token | tok/s | min | max | spread | note |
+|---|--:|--:|--:|--:|--:|---|
+| decode | **33.1** | 30.2 | 32.9 | 33.9 | 3.0% | set A measured 32.0 and 32.7 on the same code paths: inside the day's noise |
+| prefill64 | **12.1** | 82.6 | 12.0 | 12.6 | 5.0% | |
+| long16k | **36.4** | 27.5 | 36.2 | 36.4 | 0.5% | last 32 single steps at 16k; the tail's first step (width-1 capture) excluded |
+| long16k-prefill | 20.9 | 47.9 | 20.3 | 21.0 | 3.4% | recorded, not scored |
+| serve1 | 40.5 | 24.7 | 40.5 | 42.0 | 3.8% | recorded, not scored |
+| serve3 | **95.2** | 10.5 | 94.3 | 95.2 | 0.9% | per-request decode at concurrency 3 |
+
+Score: **34.327** (set B, the geomean of decode, prefill64, long16k and serve3; not comparable with set A's 19.514).
+Counters: decode pool 15.6 ms per token over the run; long16k pool 15.6; prefill64 13.9.
+What this baseline includes against f359604: the capture-race fix, the warm-up of every width with the sealed
+kernel set and the 2.5 GiB headroom, the window staged share from width 2 (`QX_DS_STAGE_WIDE_MIN`), and the
+pinned malloc thresholds. The first three are correctness fixes; the fourth is measured on prefill2/4 and its
+serve3 effect is measured next (A/B against `QX_DS_STAGE_WIDE_MIN=8` on the same binary).
+Open questions: serve3's per-request decode is 2.9x the forced decode step (95 against 33 ms): three decoders in
+one window should cost about a width-3 window (about 23 ms per position at width 2, 19 at width 4, so roughly 60
+ms per step, 20 per token), yet each request sees 95 ms per token. Family 2's first measurement should split a
+serve3 step with the server's counters (the `sched:` and `req:` lines) rather than guess.

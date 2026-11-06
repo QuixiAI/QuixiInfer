@@ -35,6 +35,12 @@ pub struct Shared {
     /// decayed score), answered by the driver into `profile`.
     pub profile_req: AtomicBool,
     pub profile: std::sync::Mutex<Option<Vec<(usize, usize)>>>,
+    /// Held by the engine thread while it records a CUDA graph. CubeCL captures in global mode, under which a
+    /// `cuEventSynchronize` or `cuEventQuery` from any other thread fails with CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED
+    /// and invalidates the capture (seen in the server's warm-up, where nine widths are captured back to back while
+    /// the previous window's promotion copies are still in flight). The driver takes this lock around each such
+    /// call; a capture never waits for the driver, so neither side can deadlock.
+    pub capture: std::sync::Mutex<()>,
 }
 
 /// Per layer: the expert formats and record geometry.
@@ -104,6 +110,7 @@ impl Driver {
             tokens_done: Default::default(),
             profile_req: AtomicBool::new(false),
             profile: std::sync::Mutex::new(None),
+            capture: std::sync::Mutex::new(()),
         });
         let sh = shared.clone();
         // the thread finishes its CUDA set-up (streams, events, pinned words) before any window can post a job:
@@ -295,9 +302,11 @@ impl Loop {
         }
         if nstage > 0 {
             let tw = std::time::Instant::now();
+            let _not_capturing = sh.capture.lock().unwrap();
             for &si in &used_streams {
                 unsafe { cudarc::driver::result::event::synchronize(self.stage_events[si]).expect("stage copies") };
             }
+            drop(_not_capturing);
             sh.stage_ns.fetch_add(tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
             mb.atomic_u64(mailbox::MB_STG_DONE).store(seq, Ordering::Release);
         }
@@ -348,7 +357,7 @@ impl Loop {
         // the copies and the new entries. Queued behind the copies, a zero could land after the slot's two-tick
         // quarantine had expired and the slot been refilled: the GPU would read a slot being overwritten.
         // While the previous tick's copies are still in flight no new ones are issued (the driver never blocks).
-        self.finish_copies(false);
+        self.finish_copies(sh, false);
         let vram_ok = self.inflight.is_empty();
         let mut plan: Vec<(usize, u64)> = Vec::new();
         for &g in cand.iter() {
@@ -407,10 +416,11 @@ impl Loop {
     }
 
     /// Clears the in-flight set once the copies landed (`wait` blocks for them).
-    fn finish_copies(&mut self, wait: bool) {
+    fn finish_copies(&mut self, sh: &Shared, wait: bool) {
         if self.inflight.is_empty() {
             return;
         }
+        let _not_capturing = sh.capture.lock().unwrap();
         let done = if wait {
             unsafe { cudarc::driver::result::event::synchronize(self.copy_event).expect("event sync") };
             true
@@ -435,7 +445,7 @@ impl Loop {
         }
         let g = self.pending_ram.pop().unwrap();
         let t0 = std::time::Instant::now();
-        self.finish_copies(false);
+        self.finish_copies(sh, false);
         let ne = self.host.n_expert;
         let c = self.host.layer_class[g / ne];
         if self.host.store.free_places()[c] == 0 {
