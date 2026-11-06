@@ -40,22 +40,25 @@ After appending, run `python3 perf/harness/perf_diff.py index perf/optimization_
 
 | date | entry | verdict | line |
 |---|---|---|--:|
-| 2026-11-05 | DeepSeek history before the harness | RECORDED | 61 |
-| 2026-11-05 | Performance scaffolding | LANDED | 80 |
-| 2026-11-05 | First harness baseline | RECORDED | 103 |
-| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 123 |
-| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 136 |
-| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 151 |
-| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 170 |
-| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 193 |
-| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 223 |
-| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 250 |
-| 2026-11-06 | First set B baseline | RECORDED | 282 |
-| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 311 |
-| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 331 |
-| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 353 |
-| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 389 |
-| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 413 |
+| 2026-11-05 | DeepSeek history before the harness | RECORDED | 64 |
+| 2026-11-05 | Performance scaffolding | LANDED | 83 |
+| 2026-11-05 | First harness baseline | RECORDED | 106 |
+| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 126 |
+| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 139 |
+| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 154 |
+| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 173 |
+| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 196 |
+| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 226 |
+| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 253 |
+| 2026-11-06 | First set B baseline | RECORDED | 285 |
+| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 314 |
+| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 334 |
+| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 356 |
+| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 392 |
+| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 416 |
+| 2026-11-06 | nsys kernel tables of a decode run and a 64-token window run | RECORDED | 439 |
+| 2026-11-06 | Full staged share with a 256-record area at windows of 128: prefill 10.8 ms per token | CANDIDATE | 471 |
+| 2026-11-06 | The 128-chunk bundle on long16k and on the serve case — MIXED, kept as an opt-in | UNLABELED | 498 |
 <!-- qx:index:end -->
 
 ## 2026-11-05: DeepSeek history before the harness — RECORDED
@@ -432,3 +435,86 @@ as a warning (it blocked this run on `long16k-prefill` at exactly 10.0%); scored
 Open questions: long16k's own spread (4.6%) and its companion's (10%) are the pool's residency drift through the
 corpus; for family 4 that drift *is* the long-context cost, and a profile-seeded tier or a per-text hot set would
 be the experiment.
+
+## 2026-11-06: nsys kernel tables of a decode run and a 64-token window run — RECORDED
+
+Status: measurement (`nsys profile -t cuda --cuda-graph-trace=node`, forced bench, 192 tokens each, so cold tiers;
+the shares are what matter, not the absolute times, which carry the profiler's overhead: decode 57 ms per token
+under nsys against 33, windows 49 against 12).
+
+Decode (192 steps, 420,731 kernel launches, 6.97 s of GPU time):
+
+| kernel | share of GPU time | launches per step | mean | per step |
+|---|--:|--:|--:|--:|
+| `qx_moe_wait` + `qx_moe_wait_staged` (the GPU waiting for the driver) | 52% | 80 | 208-260 us | 18.8 ms |
+| `qx_mgemv` (the dense GEMVs: attention projections, shared expert, router) | 18.5% | 530 | 12.7 us | **6.7 ms** |
+| expert gate/up and down kernels (the VRAM-resident experts) | about 12% | 150 | 26-35 us | 4.5 ms |
+| `qx_rms_groups` | 3.6% | 242 | 5.3 us | 1.3 ms |
+| `qx_ds_attn_part` + merge | about 3% | 80 | 19 us | 1.1 ms |
+
+Window of 64 (3 windows, 33,624 launches, 8.8 s): `qx_moe_wait_staged` 86.7%; `qx_mgemv_t8` 5.2% (1.5 ms per
+token); expert kernels about 5%; attention 1.3%. The GPU computes about 4.6 ms per token of a 12.3 ms window:
+it idles 60% of the time waiting for the pool and the staging copies.
+Reading: in decode the dense GEMVs are serial with the pool (layer l+1 cannot start before layer l's experts
+land), so their 6.7 ms is on the critical path of a 33 ms step. The dense weights a step reads are 6.5 GB (from
+the GGUF: `attn_output_b` 1.65 GB, `attn_q_b` 1.65, `attn_output_a` 1.32, the shared expert 1.33, the router 0.31,
+`attn_q_a` 0.26, `attn_kv` 0.10, the hc mixes 0.16; Q6_K and Q5_K mostly); at the 5090's 1.8 TB/s that is a 3.6
+ms floor, so `qx_mgemv` runs at about 54% of the memory peak, in 13 launches per layer. Reaching 90% of peak would
+be about -2.7 ms, -8% on decode and long16k, bit-identical by construction (same sums, better memory access). In windows the
+GPU is not the bottleneck, so the EXPDEC-style grouped-kernel idea of family 7 would not pay there until the pool
+and copy side is faster.
+Decision: new backlog family 8, dense GEMV efficiency at decode. First step: `qx-kbench` the decode's dense
+shapes for achieved GB/s per launch; the kill criterion is an achieved bandwidth already above 70% of peak.
+Open questions: how much of the 12.7 us mean is launch granularity (13 launches per layer) against memory time;
+whether the attention projections could share one launch (`MGemv` already takes several segments).
+
+## 2026-11-06: Full staged share with a 256-record area at windows of 128: prefill 10.8 ms per token — CANDIDATE
+
+Status: candidate; the untested combination after the cap sweep (family 5 reopened by its own data).
+Bottleneck hypothesis: at width 128 with room in the staging area (cap 192 made 128 tie 64), the pool is the
+remaining limit because 6/8 of the RAM misses still go to it; at 8/8 the GPU takes them all by DMA and the pool
+idles, and a 128-token window amortizes each copied record over twice the positions of a 64-token one.
+Change (two knobs together, as one setting bundle): `QX_DS_STAGE_SHARE=8 QX_DS_STAGE_CAP=256`, measured on
+`prefill64` and `prefill128`, 3 repeats, same binary (`share8-cap256`), against `stagecap96` and `stagecap192`.
+
+| case | cap 96, share 6 | cap 192, share 6 | cap 256, share 8 | spread | pool ms/token |
+|---|--:|--:|--:|--:|--:|
+| prefill64 | 12.30 | 12.40 | 12.40 | 0.8% | 14.3 / 11.0 / 6.7 |
+| prefill128 | 15.40 | 12.10 | **10.80** | 0.0% | 27.1 / 19.8 / 14.7 |
+
+Against the standard prompt chunk (prefill64 at 12.3): **-12.6%**, past the 8% bar, spreads under 1%. The 64-token
+window does not move: its time is the copies and the GPU expert kernels, as the window profile showed.
+Costs: the staging area grows from 0.9 to 2.4 GiB of VRAM (about 160 records less in the serving tier; nothing
+in the forced bench, whose tier is 20 GiB flat); the server's prompt chunk would be 128 instead of 64.
+Decision: CANDIDATE pending two measurements, queued: `long16k` under the bundle (its windows are the long-context
+prefill cost), and the serve case at `--window 128` under the bundle (does serve3's decode pay for the smaller
+tier, and does time to first token improve). If both hold, the bundle becomes the default (`QX_DS_STAGE_SHARE`,
+`QX_DS_STAGE_CAP`, `--window`) and the scoreboard notes the settings change; the `prefill64` case stays as the
+64-chunk reference and a `prefill128` row joins it.
+Rejected alternatives: cap 192 alone (a tie), share 8 at cap 96 (measured flat on 2026-11-04: the overflow fell
+to the pool).
+Open questions: cap 384 at width 128 (does any window still overflow?); the VRAM cost in serving.
+
+## 2026-11-06: The 128-chunk bundle on long16k and on the serve case — MIXED, kept as an opt-in
+
+Status: concludes the CANDIDATE above. Two runs under `QX_DS_STAGE_SHARE=8 QX_DS_STAGE_CAP=256`, 3 repeats each.
+
+| case | standard | bundle | change | spreads |
+|---|--:|--:|--:|--:|
+| long16k-prefill (prefill averaged over 0-16k, windows of 128 instead of 64) | 21.77 | **18.16** | **-16.6%** | 10.0% / 3.3% |
+| long16k (steady decode at 16k) | 37.30 | 38.70 | +3.8% | 4.6% / 4.4%, within noise |
+| serve3 (server `--window 128`, per-request decode at concurrency 3) | 90.91 | **100.00** | **+10.0%** | 0.0% / 1.0% |
+| serve1 | 39.53 | 39.84 | +0.8% | 3.1% / 0.8% |
+
+Reading: the forced prefill gains are real (short prompts -12.6%, a 16k prompt -16.6%), but in serving the
+2.4 GiB staging area comes out of the VRAM expert tier (about 160 records), and three concurrent decoders pay 10%
+for it; the serve case's prompts are 40-46 tokens, so they never see a 128-token window. A long-prompt workload
+would weigh this differently: a 16k prompt prefills in 298 s instead of 357 s.
+Decision: MIXED. The defaults stay (chunk 64, share 6/8, cap 96). The bundle is documented in the README as the
+long-prompt configuration, and the forced result goes to `findings.md` as the prefill ceiling of this design:
+prefill at 128 is 10.8 ms per token when the GPU takes every RAM miss, and the remaining time is the copies and
+the GPU expert kernels. A staging area that grows only while a wide window is in flight would give both; the
+VRAM would have to come from the tier dynamically, which the tier does not do today (backlog family 7 gets it).
+Rejected alternatives: making the bundle the serving default (serve3 +10%).
+Open questions: time to first token for long prompts under the bundle in serving (needs a long-prompt serve
+case, `tools/longprompt.py`); cap 384 at width 128.

@@ -110,9 +110,10 @@ invented one. The aggregate score lives in `scoreboard.md`.
 - **Kill criteria:** no width and capacity setting beats 11.8 by 8%. Prefill is then copy-bound at about 14-25 GB/s,
   and further gains need the NVMe tier changed.
 - **Killed 2026-11-06** (notebook, "Staging area 192 records"): cap 192 makes windows of 128 tie 64 (12.1 against
-  12.3) and does nothing at 64; nothing beats 64 by the bar. The remaining prefill lever is the GPU side of a
-  window (the grouped expert kernels and the staging copies), which belongs to family 7's EXPDEC-style idea with
-  an nsys table first.
+  12.3) and does nothing at 64. **Reopened and settled the same day:** share 8/8 with cap 256 at width 128 gives
+  10.8 ms per token (-12.6%) and a 16k prompt -16.6%, but the 2.4 GiB area costs serve3 +10%, so it is an opt-in
+  (README), not a default. What would give both is a staging area that borrows tier VRAM only while a wide
+  window runs (family 7).
 
 ### 6. Long shot: the economics of a verify window (DSpark-style drafting), measurement first
 
@@ -147,6 +148,31 @@ invented one. The aggregate score lives in `scoreboard.md`.
   acceptance for this quant, and the drafter weights are not on the box. Re-open with: a measured per-position
   acceptance of 80% or more, or w_4 under 15 ms per position from window-side work (the staged share at widths
   2-4 is measured next).
+
+### 8. Dense GEMV efficiency at decode (new 2026-11-06, from the nsys table)
+
+- **Parent result:** in a decode step the dense GEMVs (`qx_mgemv`: attention projections, shared expert,
+  router) take 6.7 ms across 530 launches, 13 per layer at 12.7 us each, and they are serial with the pool. A
+  step reads 6.5 GB of dense weights (Q6_K/Q5_K: `attn_output_b` and `attn_q_b` 1.65 GB each, `attn_output_a`
+  1.32, the shared expert 1.33), a 3.6 ms floor at 1.8 TB/s: the kernel runs at 54% of peak (notebook, "nsys
+  kernel tables").
+- **Hypothesis:** better memory access in `qx_mgemv` (vectorized row loads, the split-K choice per shape, fewer
+  and larger launches per layer) takes the dense time from 6.7 toward 4 ms; that is up to -8% on decode and
+  long16k, bit-identical because the sums do not change order within a row. `qx-kbench` has no DeepSeek shapes
+  yet: add a group of the four big tensors first.
+- **Per launch shape (the nsys sqlite, 192 decode steps):** grid 1024 x 8 launches per layer at 5.2 us each
+  (1.66 ms per step, 23% of the dense time: the small projections, router and mixes, at launch-latency size);
+  grid 5120 x 2 per layer at 21 us (1.70 ms: `attn_output_b` and the shared expert's down, split-K one row per
+  block); grid 4992 x 1 at 28 us (1.12 ms); grid 4096 at 30 us (0.96 ms); the output head once per step at 356 us
+  (540 MB: 1.5 TB/s, fine). The big matrices run at 1-1.4 TB/s; the eight small launches per layer are the
+  cheap target: one multi-segment `MGemv` launch per group of independent projections (q_a and kv_a read the same
+  normed input) would save most of their 1.66 ms, about -4% on decode.
+- **Next action:** read the layer sequence in `dsv41/mod.rs` for which of the eight small GEMVs per layer are
+  independent, fuse them into segment groups, check line 3 of `tools/ds-checks.sh` (segments do not change a
+  row's sum order), measure decode and long16k. `qx-kbench` has no DeepSeek shapes; the nsys sqlite per-grid
+  breakdown is the measurement for now.
+- **Kill criteria:** achieved bandwidth already above 70% of peak on the shapes that carry the time, or any
+  change that breaks `tools/ds-checks.sh` line 3.
 
 ### 7. Ideas from the neighbours, not yet ranked
 

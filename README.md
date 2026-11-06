@@ -202,7 +202,10 @@ once; `QX_DS_STAGE_SHARE` (6, eighths) and `QX_DS_STAGE_SHARE_DECODE` (3) set ho
 experts the GPU takes by DMA staging in windows and in single decode steps; `QX_DS_STAGE_WIDE_MIN` (2) is the
 window width from which the window share applies. The expert tier leaves `QX_DS_VRAM_RESERVE_MIB` (2560) of
 device memory for the kernel modules and the window graphs; the warm-up line reports what is left, and a kernel
-that would need compiling after the warm-up aborts the server (it means a module failed to load).
+that would need compiling after the warm-up aborts the server (it means a module failed to load). For long-prompt
+workloads, `--window 128` with `QX_DS_STAGE_SHARE=8 QX_DS_STAGE_CAP=256` prefills 13-17% faster (10.8 ms per token
+on a 1k prompt, 18.2 on a 16k one, against 12.3 and 21.8); the 2.4 GiB staging area it needs comes out of the
+VRAM expert tier, which costs about 10% of per-request decode at three concurrent requests, so it is not the default.
 
 ### Settings
 

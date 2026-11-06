@@ -41,6 +41,7 @@ were 20-21 GiB VRAM and 88-100 GiB RAM. The settings before 2026-11-04 differ fr
 | DMA-staged GPU share of RAM misses (6/8 windows, 3/8 decode, 96-record area, 4 streams, deduplicated) | prefill64 21.8 to 11.8 ms per token (1.85x), decode 31.4; bit-identical | 2026-11-04 |
 | Fixed window widths (`WIDTHS`) captured at server warm-up | removes 0.9 s capture stalls from requests | 2026-11-04 |
 | The window staged share (6/8) from width 2 instead of 8 (`QX_DS_STAGE_WIDE_MIN`) | -4.7% per position at width 2, -8.2% at width 4 (forced, outside noise); serve3 -2.9%, within noise: KEPT, not a scoreboard win | 2026-11-06 |
+| **The prefill ceiling of this design:** windows of 128 with the full staged share (8/8) and a 256-record area: 10.8 ms per token against 12.3 at the standard 64-chunk (-12.6%), a 16k prompt at 18.2 against 21.8 (-16.6%); the pool idles and the copies plus the GPU expert kernels set the time. Opt-in only: the 2.4 GiB area costs serve3 +10% at concurrency 3 | notebook, "128-chunk bundle" | 2026-11-06 |
 
 ## Correctness rules learned the hard way
 

@@ -74,6 +74,7 @@ PORT=${QX_PERF_PORT:-8089}
 # scoreboard (scores are comparable only at the same settings)
 BASE=(QX_DS_PACK="$PACK" QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1)
 SERVE_RAM=${QX_PERF_SERVE_RAM:-95}   # the serve case's RAM tier (GiB); see serve_case
+SERVE_WINDOW=${QX_PERF_SERVE_WINDOW:-64}   # the server's prompt chunk (--window); an experiment knob, recorded in the settings
 # the tokenizer check (ds-checks line 4) needs llama.cpp's tokenizer binary; without it the check is reported as
 # incomplete, not as passed
 : "${QX_LLAMA_TOKENIZE:=$HOME/git/llama.cpp-dsv41/build-tok/bin/llama-tokenize}"
@@ -152,7 +153,7 @@ serve_case() {
   # the serving gap is residency. The tier is part of the recorded settings, so runs at different tiers refuse to
   # compare. The later env entry wins.
   local srv=(env "${BASE[@]}" QX_DS_RAM="${SERVE_RAM}" QX_SCHED_STATS=1 "${EXTRA[@]}" $SERVER serve --model "$M" --pack "$PACK"
-             --ctx 8192 --slots 3 --window 64 --host 127.0.0.1 --port "$PORT")
+             --ctx 8192 --slots 3 --window "$SERVE_WINDOW" --host 127.0.0.1 --port "$PORT")
   cmds+=("${srv[*]} ; python3 tools/loadgen.py --url http://127.0.0.1:$PORT/v1 --levels 1,3 --rounds 2 --max-tokens 256 --temperature 0 --warmup 6")
   "${srv[@]}" > "$slog" 2>&1 &
   local pid=$! i=0 rc=1
@@ -201,7 +202,7 @@ for r in $(seq 1 "$REPEATS"); do
   done
 done
 
-python3 -I - "$RUN" "$LABEL" "$REPEATS" "$CASES" "$check" "${EXTRA[*]:-}" "${BASE[*]} serve:QX_DS_RAM=$SERVE_RAM" "${cmds[@]}" <<'EOF'
+python3 -I - "$RUN" "$LABEL" "$REPEATS" "$CASES" "$check" "${EXTRA[*]:-}" "${BASE[*]} serve:QX_DS_RAM=$SERVE_RAM serve:window=$SERVE_WINDOW" "${cmds[@]}" <<'EOF'
 import json, os, subprocess, sys, datetime, platform, hashlib
 run, label, repeats, cases, check, extra, base, *cmds = sys.argv[1:]
 def sh(*a):
