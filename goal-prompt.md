@@ -1,6 +1,31 @@
-Drive perf/scoreboard.md down for the DeepSeek-V4.1-Flash UD-IQ2_XXS engine through bold, well-measured experiments. Exactness is the floor, not the ceiling: be rigorous about measurement and adventurous about ideas.
+Maximize the performance of the DeepSeek-V4.1-Flash UD-IQ2_XXS engine at 256k context (priority set by the user on
+2026-11-06), through bold, well-measured experiments. Exactness is the floor, not the ceiling: be rigorous about
+measurement and adventurous about ideas.
 
-  ## Read first, every session
+## The objective, in order
+1. **Performance at 256k context**: the server at `--ctx 262144`. What counts, in ms per token: decode at a 256k
+   position; prefill of the last stretch of a 256k prompt (the position curve, not just the mean); per-request
+   decode and time to first token under concurrency at 256k. These are the standard cases ("set D") once the
+   tooling below exists; the scoreboard follows them.
+2. **No regression at short contexts**: decode and prefill128 at 1k, and serve3 at 8k, stay within noise of their
+   set C baseline (34.621: decode 34.0, prefill128 11.0, long16k 38.8, serve3 99.0). They are guards, not
+   targets.
+3. **Capability**: 256k must work with at least one slot on this box (it does: 15.4 GiB tier at one slot, 12.2 at
+   three) and must not grow host memory with context (it does not since `39c3bc0`).
+
+## Tooling first (do this before any 256k optimization)
+A 256k forced pass takes about an hour, so no experiment can afford three repeats of it. Build the state cache:
+`qx-ds-check` saves a slot's state after a pass (`QX_DS_SAVE_STATE=path`: tokens and the used compressed-store
+rows, what `park` produces, about 1.3 GB at 256k) and later runs resume from it (`QX_DS_LOAD_STATE=path`: upload
+the rows, replay the last window, then run the remaining tokens as windows or single steps). Verify once at scale
+that a resumed run is bit-identical to the straight pass over the same positions (as line 5 of ds-checks proves
+at 128). Then add the set D cases to `perf/harness/bench.sh`: `decode256k` (64 single steps from the 262,144
+state, last 32 scored), `prefill256k` (the last 16k tokens in windows of 128 from the 246k state, last 32 scored),
+`serve256k` (the server at `--ctx 262144 --slots 3`, loadgen at concurrency 1 and 3 with a long-prompt arm), and
+keep `decode`, `prefill128`, `serve3` as guards. Each case under 5 minutes a repeat. Take the set D baseline, note
+the case-set change in the scoreboard, and only then optimize.
+
+## Read first, every session
   perf/perf.md (rules), perf/findings.md (what is known and what was rejected, with the conditions for re-opening), perf/backlog.md, the last entries of perf/optimization_status.md, handoff.md (constraints, how to run things).
 
   ## Think wide before you pick
@@ -40,9 +65,16 @@ Drive perf/scoreboard.md down for the DeepSeek-V4.1-Flash UD-IQ2_XXS engine thro
 - Commits are pre-authorized ONLY for landed wins and their records, and docs-only rejection/backlog records. One-line summary, body with the numbers, trailer "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>".
 
 ## Where to start
-1. Short: finish harness coverage (long16k and serve cases, vendor the token files), re-baseline, record a scoreboard row noting the case-set change.
-2. Then alternate between the backlog's best-EV items (store sizing by max_ctx/ratio, STAGE_CAP sweep, serving gap, long context) and long shots drawn from the sources above. The first long shot I'd suggest: measure routing overlap between consecutive decode tokens and across layers, because that single number decides whether DSpark-style drafting or cross-token expert prefetch can ever pay here.
-3. The uncommitted parking work in dsv41/mod.rs is a serving feature; leave it unless the serving gap needs it.
+1. The state cache and set D (above). The forced 256k pass of 2026-11-06 (`perf/results` logs, `poscurve.py`) is
+   the first position curve; the state it would have saved must be regenerated once with the new tooling.
+2. Then the 256k levers, by expected value: what the indexer and the compressed-store scans cost per token at 256k
+   (nsys on a resumed decode step; the two-level candidate scan over 32k blocks and the `scores`/`bmax` buffers);
+   the tier's behaviour at 256k (the decay-per-token fix landed; measure the VRAM share along the curve and after
+   topic shifts); the staging area and chunk at long positions (the 128-chunk bundle is the default; does cap 256
+   still overflow at 256k?); serving at 256k with 3 slots (12.2 GiB tier: is per-request decode acceptable, and
+   does prefix reuse at 256 tokens pay?).
+3. Long shots still welcome at one in four: per-request expert hot sets; a staging area that borrows tier VRAM only
+   during wide windows; DSpark drafting only with a measured acceptance.
 
 ## Stop and report (do not ask otherwise)
 - Five consecutive REJECTED/INCONCLUSIVE experiments, excluding deliberate measurements.

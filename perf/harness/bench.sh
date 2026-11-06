@@ -33,7 +33,7 @@ ORIG_ARGS=("$@")
 
 LABEL=run
 REPEATS=3
-CASES=decode,prefill128,long16k,serve
+CASES=decode256k,prefill256k,serve256k,decode,prefill128,serve
 CHECK=0
 BUILD=1
 EXTRA=()
@@ -42,7 +42,7 @@ while [ $# -gt 0 ]; do
     --label) LABEL=$2; shift 2 ;;
     --repeats) REPEATS=$2; shift 2 ;;
     --cases) CASES=$2; shift 2 ;;
-    --quick) CASES=decode,prefill128; shift ;;
+    --quick) CASES=decode256k,prefill256k; shift ;;
     --check) CHECK=1; shift ;;
     --no-build) BUILD=0; shift ;;
     --) shift; EXTRA=("$@"); break ;;
@@ -67,6 +67,7 @@ M=${QX_DS_MODEL:-$D/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf}
 PACK=${QX_DS_PACK:-$D/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp}
 TOKENS=perf/data/route1k.tokens
 TOKENS16K=perf/data/route16k.tokens
+TOKENS256K=perf/data/wiki256k.tokens
 B=target/release/qx-ds-check
 SERVER=target/release/quixiinfer
 PORT=${QX_PERF_PORT:-8089}
@@ -80,7 +81,8 @@ SERVE_WINDOW=${QX_PERF_SERVE_WINDOW:-128}   # the server's prompt chunk (--windo
 : "${QX_LLAMA_TOKENIZE:=$HOME/git/llama.cpp-dsv41/build-tok/bin/llama-tokenize}"
 [ -x "$QX_LLAMA_TOKENIZE" ] && export QX_LLAMA_TOKENIZE || unset QX_LLAMA_TOKENIZE
 
-for f in "$M" "$PACK" "$TOKENS" "$TOKENS16K"; do [ -e "$f" ] || { echo "missing $f" >&2; exit 2; }; done
+for f in "$M" "$PACK" "$TOKENS" "$TOKENS16K" "$TOKENS256K"; do [ -e "$f" ] || { echo "missing $f" >&2; exit 2; }; done
+case ",$CASES," in *,decode256k,*|*,prefill256k,*) for f in $STATES/wiki256k-262144.state $STATES/wiki256k-245760.state; do [ -e "$f" ] || { echo "missing $f (perf/states/README.md says how to make it)" >&2; exit 2; }; done ;; esac
 
 gpu_used() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1; }
 gpu_free() { local i=0; until [ "$(gpu_used)" -lt 1000 ]; do sleep 2; i=$((i + 1)); [ $i -lt 90 ] || { echo "GPU still busy after 180 s" >&2; return 1; }; done; }
@@ -129,12 +131,18 @@ if [ $CHECK = 1 ]; then
 fi
 
 # forced-bench cases: extra env, token file, token count, timeout (s), and the metric perf_diff.py parse extracts
+# set D (2026-11-06, performance at 256k): decode256k resumes a saved 262,144-token state and runs the remaining
+# 64 tokens as single steps; prefill256k resumes the 245,760-token state and runs the last 16,384 tokens in windows
+# of 128; serve256k is the server at --ctx 262144. The states come from one full pass (perf/states/README.md).
+STATES=perf/states
 declare -A ARGS=( [decode]="" [prefill64]="QX_DS_WINDOW=64" [prefill32]="QX_DS_WINDOW=32" [prefill128]="QX_DS_WINDOW=128"
                   [prefill2]="QX_DS_WINDOW=2" [prefill4]="QX_DS_WINDOW=4" [prefill8]="QX_DS_WINDOW=8"
-                  [long16k]="QX_DS_WINDOW=128 QX_DS_TAIL=64" [serve]="" )
-declare -A TOKF=( [long16k]="$TOKENS16K" )
-declare -A COUNT=( [long16k]=16384 )
-declare -A TMO=( [long16k]=2400 )
+                  [long16k]="QX_DS_WINDOW=128 QX_DS_TAIL=64" [serve]="" [serve256k]=""
+                  [decode256k]="QX_DS_LOAD_STATE=$STATES/wiki256k-262144.state"
+                  [prefill256k]="QX_DS_WINDOW=128 QX_DS_LOAD_STATE=$STATES/wiki256k-245760.state" )
+declare -A TOKF=( [long16k]="$TOKENS16K" [decode256k]="$TOKENS256K" [prefill256k]="$TOKENS256K" )
+declare -A COUNT=( [long16k]=16384 [decode256k]=262208 [prefill256k]=262144 )
+declare -A TMO=( [long16k]=2400 [decode256k]=900 [prefill256k]=1500 )
 # long16k's metric is the last 32 of its 64 tail steps (perf_diff's default last32), not the tail's mean: the
 # first single step after the windows pays the width-1 graph capture, 0.85-1.5 s, which moved a 64-step mean
 # between 49 and 60 ms per token on 2026-11-06 while the steady steps sat at 35-37. The tail mean stays in the row
@@ -147,14 +155,14 @@ for c in "${CASE_LIST[@]}"; do [ -n "${ARGS[$c]+x}" ] || { echo "unknown case $c
 # unmeasured requests (the tiers adapt over the first requests, as they do over route1k's first hundred tokens).
 # Greedy sampling, so the replies and their lengths repeat from run to run.
 serve_case() {
-  local r=$1 slog="$RUN/logs/serve-$r.server.log" log="$RUN/logs/serve-$r.log"
+  local r=$1 name=${2:-serve} ctx=${3:-8192} slog="$RUN/logs/$name-$r.server.log" log="$RUN/logs/$name-$r.log"
   # QX_DS_RAM=95 for the server, not the forced bench's 100: at 100 the server's RSS is 111 GB on a 120 GiB box
   # (102.5 GB pinned tier, 1.9 GB anonymous, 6.7 GB file-backed), the wrong side of safe next to the agent; at 95
   # it is about 106 GB. 95 against 90 measured serve3 -5.4% and serve1 -5.0% (2026-11-06, outside the spreads):
   # the serving gap is residency. The tier is part of the recorded settings, so runs at different tiers refuse to
   # compare. The later env entry wins.
   local srv=(env "${BASE[@]}" QX_DS_RAM="${SERVE_RAM}" QX_SCHED_STATS=1 "${EXTRA[@]}" $SERVER serve --model "$M" --pack "$PACK"
-             --ctx 8192 --slots 3 --window "$SERVE_WINDOW" --host 127.0.0.1 --port "$PORT")
+             --ctx "$ctx" --slots 3 --window "$SERVE_WINDOW" --host 127.0.0.1 --port "$PORT")
   cmds+=("${srv[*]} ; python3 tools/loadgen.py --url http://127.0.0.1:$PORT/v1 --levels 1,3 --rounds 2 --max-tokens 256 --temperature 0 --warmup 6")
   "${srv[@]}" > "$slog" 2>&1 &
   local pid=$! i=0 rc=1
@@ -175,7 +183,7 @@ serve_case() {
   wait "$pid" 2>/dev/null || true
   [ $rc = 0 ] || echo "  exit $rc (see $log and $slog)"
   for cc in 1 3; do
-    python3 -I perf/harness/perf_diff.py parse "$log" --case "serve$cc" --repeat "$r" --exit "$rc" --metric "serve:$cc" >> "$RUN/results.jsonl"
+    python3 -I perf/harness/perf_diff.py parse "$log" --case "$name$cc" --repeat "$r" --exit "$rc" --metric "serve:$cc" >> "$RUN/results.jsonl"
   done
 }
 
@@ -184,7 +192,8 @@ for r in $(seq 1 "$REPEATS"); do
   for c in "${CASE_LIST[@]}"; do
     gpu_free
     echo "[$c $r/$REPEATS] $(date +%T)"
-    if [ "$c" = serve ]; then serve_case "$r"; continue; fi
+    if [ "$c" = serve ]; then serve_case "$r" serve 8192; continue; fi
+    if [ "$c" = serve256k ]; then serve_case "$r" serve256k 262144; continue; fi
     log="$RUN/logs/$c-$r.log"
     tokf=${TOKF[$c]:-$TOKENS}; count=${COUNT[$c]:-1024}; tmo=${TMO[$c]:-1200}; metric=${METRIC[$c]:-last32}
     # shellcheck disable=SC2206

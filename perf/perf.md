@@ -88,8 +88,19 @@ continuation), and the server under `tools/loadgen.py`. Every engine uses the fi
 | `serve1` | the same session | the concurrency-1 number; recorded, not scored |
 | `prefill2`, `prefill4`, `prefill8`, `prefill32`, `prefill128` | windows of other widths | optional, for width experiments; the narrow ones are the verify-window costs of backlog family 6 |
 
-The **standard set** is `decode`, `prefill128`, `long16k` and `serve3` (`STANDARD_CASES` in `perf_diff.py`; set
-C since 2026-11-06, when the 128-token chunk became the server's default: `prefill64` is optional now). A
+The **standard set** is **set D** (`STANDARD_CASES` in `perf_diff.py`, since the user made 256k performance the
+priority on 2026-11-06): `decode256k`, `prefill256k` and `serve256k3` are scored; `decode`, `prefill128` and `serve3`
+run in every full measurement as short-context guards (recorded, compared by `gate`, not scored). Set C
+(`decode`, `prefill128`, `long16k`, `serve3`) was the standard for one row; `long16k` and `prefill64` are optional.
+
+| set D case | what runs | metric |
+|---|---|---|
+| `decode256k` | resume the saved 262,144-token state of `wiki256k`, then 64 single steps | **ms per token over the last 32** (decode at 256k) |
+| `prefill256k` | resume the saved 245,760-token state, then the last 16,384 tokens in windows of 128 | **ms per token over the last 32** (prefill at 256k) |
+| `serve256k3` | the server at `--ctx 262144 --slots 3`, loadgen at concurrency 1 and 3 | **ms per token of per-request decode at concurrency 3** |
+
+The states are produced once by a full pass (`perf/states/README.md`); resuming replays the last window and is bit
+for bit the straight pass (verified at 192 and 384 positions, and on the 256k tail once). A
 scoreboard row or a promoted baseline must cover all four; `perf_diff.py` refuses otherwise. `bench.sh --quick`
 runs `decode` and `prefill64` only (about 5 minutes) for screening: `gate` compares it case by case and reports
 the score over the common cases, but it cannot be recorded or promoted. Up to 2026-11-05 the standard set was the

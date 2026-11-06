@@ -215,6 +215,54 @@ impl Parked {
     pub fn bytes(&self) -> usize {
         4 * (self.tokens.len() + self.stores.iter().map(Vec::len).sum::<usize>())
     }
+
+    /// Positions held.
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Writes the state to `path`: a magic, the tokens, then every layer's store rows (little-endian).
+    pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        f.write_all(b"QXPK0001")?;
+        f.write_all(&(self.tokens.len() as u64).to_le_bytes())?;
+        f.write_all(bytemuck::cast_slice(&self.tokens))?;
+        f.write_all(&(self.stores.len() as u64).to_le_bytes())?;
+        for s in &self.stores {
+            f.write_all(&(s.len() as u64).to_le_bytes())?;
+            f.write_all(bytemuck::cast_slice(s))?;
+        }
+        f.flush()
+    }
+
+    /// Reads a state `write` produced.
+    pub fn read(path: &std::path::Path) -> std::io::Result<Parked> {
+        use std::io::Read;
+        let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
+        let mut magic = [0u8; 8];
+        f.read_exact(&mut magic)?;
+        if &magic != b"QXPK0001" {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a QuixiInfer state file"));
+        }
+        let mut n = [0u8; 8];
+        let rd_len = |f: &mut std::io::BufReader<std::fs::File>, n: &mut [u8; 8]| -> std::io::Result<usize> {
+            f.read_exact(n)?;
+            Ok(u64::from_le_bytes(*n) as usize)
+        };
+        let nt = rd_len(&mut f, &mut n)?;
+        let mut tokens = vec![0u32; nt];
+        f.read_exact(bytemuck::cast_slice_mut(&mut tokens))?;
+        let nl = rd_len(&mut f, &mut n)?;
+        let mut stores = Vec::with_capacity(nl);
+        for _ in 0..nl {
+            let len = rd_len(&mut f, &mut n)?;
+            let mut v = vec![0f32; len];
+            f.read_exact(bytemuck::cast_slice_mut(&mut v))?;
+            stores.push(v);
+        }
+        Ok(Parked { tokens, stores })
+    }
 }
 
 /// The device side of the tiers in the asynchronous mode (the host side lives in the driver thread).
@@ -1168,6 +1216,14 @@ impl<'a> DsEngine<'a> {
     /// The ring and the pending pairs are not kept: a restore goes through `rewind`, which rebuilds the attention
     /// window by replay at a group boundary, where no group is pending.
     pub fn park(&mut self, slot: usize) -> Parked {
+        let p = self.snapshot(slot);
+        self.st.tokens[slot].clear();
+        self.st.pos[slot] = 0;
+        p
+    }
+
+    /// Slot `slot`'s state as `park` would take it, without emptying the slot: the tokens and the used store rows.
+    pub fn snapshot(&mut self, slot: usize) -> Parked {
         self.gpu.sync();
         let pos = self.st.pos[slot];
         let row = self.cfg.head_dim + self.cfg.idx_dim;
@@ -1182,8 +1238,7 @@ impl<'a> DsEngine<'a> {
                 None => Vec::new(),
             });
         }
-        let tokens = std::mem::take(&mut self.st.tokens[slot]);
-        self.st.pos[slot] = 0;
+        let tokens = self.st.tokens[slot].clone();
         Parked { tokens, stores }
     }
 

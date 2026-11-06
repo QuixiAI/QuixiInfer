@@ -185,6 +185,35 @@ invented one. The aggregate score lives in `scoreboard.md`.
 - **Kill criteria:** achieved bandwidth already above 70% of peak on the shapes that carry the time, or any
   change that breaks `tools/ds-checks.sh` line 3.
 
+### 9. 256k decode: the position-proportional GPU time (new 2026-11-06, the set D target)
+
+- **Parent result:** the first forced 256k pass (decay per token): prefill 14 ms per token at 24k rising to 28 at
+  246k, decode 56.3 ms per token at 262k against 34 at 1k, with the tier shares and the pool's time flat along the
+  curve: the growth is GPU-side and proportional to the visible context (notebook, "first forced 256k pass").
+- **Hypothesis:** the lightning indexer: per token and per indexer layer (eight), `qx_ds_idx_score` scores every
+  visible compressed row (one warp per row), `qx_ds_topk` selects the top 512 (one block of 1,024 threads, a
+  four-pass radix select over up to 262k scores) and the candidate path adds a block scan, a block top-k and a
+  mask; the arithmetic says 1-3 ms per token at 256k, the measurement says 22, so the kernels are far from their
+  bandwidth (the one-block top-k is the first suspect: a single SM streams 1-4 MB per call, eight to sixteen calls
+  per token).
+- **Next action:** the nsys kernel table of a resumed 256k decode step (queued); then the kernel that carries the
+  time: a multi-block top-k (per-block local selection, then a merge), or a threshold from the block maxima that
+  skips most rows, keeping the reference's tie rule (lowest index) so line 3 of ds-checks stays exact.
+- **Kill criteria:** the profile shows the time outside the indexer (then re-aim), or a change that breaks the
+  bit-identity of the selection.
+
+### 10. The per-step uploads synchronize the whole context (new 2026-11-06)
+
+- **Parent result:** the tail's phases at 256k: uploads 7 ms in the first single steps after the prefill, 1.4 ms
+  on average, against 0.2 at 1k. The three per-step uploads (token ids, positions, slots: a few hundred bytes) go
+  through `DeviceBuf::upload_at`, which does a synchronous copy and then `cuCtxSynchronize`, so each step waits
+  for the driver's in-flight promotion copies on the copy streams.
+- **Hypothesis:** writing the three small arrays into a device-mapped pinned buffer the kernels read directly (as
+  the mailbox does) removes the synchronize: up to 7 ms a step while the tier adapts, about 1.4 ms (2.5%) steady at
+  256k, and the same mechanism in serving after every prompt.
+- **Next action:** a mapped-buffer path for `tok`, `pos` and `slot`; measure `decode256k` and `serve256k3`.
+- **Kill criteria:** under 3% on both.
+
 ### 7. Ideas from the neighbours, not yet ranked
 
 Read on 2026-11-06 from `~/git/{colibri,Strata,basalt,DeepInfer}`. Each needs a translation to this box before it

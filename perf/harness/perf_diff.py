@@ -37,7 +37,8 @@ COMPLEX_BAR = 0.08       # a complexity-adding change by this much
 SPREAD_LIMIT = 0.10      # (max - min) / median above this: the case is too noisy to decide anything
 # the case set a scoreboard row or a promoted baseline must cover (bench.sh's default); a run with fewer cases is a
 # screening run: it can be diffed against the baseline case by case, not recorded or promoted without --partial
-STANDARD_CASES = ("decode", "prefill128", "long16k", "serve3")
+# set D (2026-11-06): the 256k cases are scored; decode, prefill128 and serve3 ride along as short-context guards
+STANDARD_CASES = ("decode256k", "prefill256k", "serve256k3")
 ROOT = Path(__file__).resolve().parents[2]
 
 

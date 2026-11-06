@@ -7,6 +7,17 @@ UD-IQ2_XXS in QuixiInfer on this box, as fast as possible. The results must stay
 The box has an RTX 5090 (32 GB), a Ryzen 9950X (16 cores), 120 GiB of RAM and a 4 TB NVMe root. The experts live in
 three tiers: VRAM, pinned RAM and the NVMe pack.
 
+## Update 2026-11-06, late afternoon: the priority is now performance at 256k context
+
+- The user reset the goal: maximize performance at 256k (`goal-prompt.md`, rewritten; read it first). Short-context
+  numbers (set C baseline 34.621) become guards. The queued set C re-take was cancelled; the decay fix's win is
+  recorded from its A/B (long16k 38.5 to 33.8).
+- The tooling the goal asks for first: `qx-ds-check` saving a slot's state (`QX_DS_SAVE_STATE`, at `QX_DS_SAVE_AT`
+  positions) and resuming from it (`QX_DS_LOAD_STATE`), so a 256k decode or late-prefill measurement takes minutes;
+  then set D in `bench.sh` (`decode256k`, `prefill256k`, `serve256k` plus the guards) and its baseline. States live
+  in `perf/states/` (git-ignored, about 1.3 GB each at 256k; regenerate with one full pass of
+  `perf/data/wiki256k.tokens`).
+
 ## Update 2026-11-06
 
 - **The user set an autonomous optimization loop:** `goal-prompt.md` at the repo root is the directive (read it

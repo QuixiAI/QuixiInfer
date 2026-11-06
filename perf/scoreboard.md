@@ -14,6 +14,11 @@ Case sets so far:
   in windows of 64) and `serve3` (per-request decode under `loadgen.py` at concurrency 3, 3 slots). See `perf.md`,
   "The Metrics". The serve tier was 90 GiB in the first set B row and is 95 GiB from the second (a measured
   -5.4% on serve3; the tier is in the recorded settings).
+- **Set D (from 2026-11-06, the user's priority: performance at 256k):** `decode256k` (64 single steps from a
+  saved 262,144-token state, last 32), `prefill256k` (the last 16k tokens of the 256k input in windows of 128
+  from a saved 245,760-token state, last 32), `serve256k` (the server at `--ctx 262144 --slots 3`), with
+  `decode`, `prefill128` and `serve3` kept as short-context guards. Set D scores are not comparable with earlier
+  sets.
 - **Set C (from 2026-11-06, the user's decision):** the 128-token prompt chunk with the full staged share (8/8)
   and a 256-record staging area is the default, so the standard prefill case is `prefill128`, `long16k` runs in
   windows of 128, and the server serves at `--window 128`. Set C scores are not comparable with set B's: prefill

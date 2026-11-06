@@ -59,10 +59,39 @@ fn main() -> anyhow::Result<()> {
         None => DsEngine::load(&g, max_ctx)?,
     };
     eng.exact_experts = std::env::var("QX_EXACT_EXPERTS").is_ok_and(|v| v == "1");
+    // QX_DS_LOAD_STATE=path: resume slot 0 from a saved state (its tokens must prefix the token file); the run then
+    // starts at that position. QX_DS_SAVE_STATE=path with QX_DS_SAVE_AT=P[,P..]: write `path-P.state` when the pass
+    // reaches P (default: the end). QX_DS_DUMP_FROM=N: dump logits rows from position N only.
+    let start = match std::env::var("QX_DS_LOAD_STATE") {
+        Ok(path) => {
+            let t0 = std::time::Instant::now();
+            let p = qx_engine::dsv41::Parked::read(std::path::Path::new(&path))?;
+            let n = p.len();
+            anyhow::ensure!(n <= toks.len() && toks[..n] == p.tokens[..], "the saved state's tokens do not prefix the token file");
+            eng.unpark(0, p, n);
+            eprintln!("resumed {n} positions from {path} in {:.2}s", t0.elapsed().as_secs_f64());
+            n
+        }
+        Err(_) => 0,
+    };
+    let save_state = std::env::var("QX_DS_SAVE_STATE").ok();
+    let save_at: Vec<usize> = std::env::var("QX_DS_SAVE_AT").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_else(|| vec![toks.len()]);
+    let dump_from: usize = std::env::var("QX_DS_DUMP_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut save_if_due = |eng: &mut DsEngine, p: usize| {
+        if let Some(path) = &save_state {
+            if save_at.contains(&p) {
+                let t0 = std::time::Instant::now();
+                let snap = eng.snapshot(0);
+                let file = format!("{path}-{p}.state");
+                snap.write(std::path::Path::new(&file)).expect("state write");
+                eprintln!("saved {p} positions ({:.2} GB) to {file} in {:.2}s", snap.bytes() as f64 / 1e9, t0.elapsed().as_secs_f64());
+            }
+        }
+    };
     // QX_DS_BENCH=N: no reference; run the prompt tokens, then N greedy tokens, and report the time per token.
     // N = 0: the forced tokens only (a text-independent benchmark), timing every forward.
     if let Some(n_gen) = std::env::var("QX_DS_BENCH").ok().and_then(|v| v.parse::<usize>().ok()) {
-        let mut tok = toks[0];
+        let mut tok = toks[start];
         let mut out_toks = Vec::new();
         let (mut t_all, mut t_exp, mut t_eng) = (0f64, 0f64, 0f64);
         let mut per_tok: Vec<f64> = Vec::new();
@@ -85,14 +114,17 @@ fn main() -> anyhow::Result<()> {
             let mut tail_times: Vec<f64> = Vec::new();
             let mut tail_phase = [0f64; 5];
             let mut tail_engram = 0f64;
-            let mut p = 0;
+            let mut p = start;
             while p < toks.len() {
+                save_if_due(&mut eng, p);
                 let cap = if p >= toks.len() - tail { 1 } else { window.min(toks.len() - tail - p) };
                 let w = &toks[p..(p + cap).min(toks.len())];
                 let logits = eng.forward_window(w, None);
                 let nv = logits.len() / w.len();
                 for (i, row) in logits.chunks(nv).enumerate() {
-                    dump_row(&mut dump_file, row);
+                    if p + i >= dump_from {
+                        dump_row(&mut dump_file, row);
+                    }
                     if !nan_seen && row.iter().any(|v| v.is_nan()) {
                         eprintln!("first NaN logits at position {}", p + i);
                         nan_seen = true;
@@ -122,6 +154,7 @@ fn main() -> anyhow::Result<()> {
             let last = &per_tok[n.saturating_sub(32)..];
             let last_ms = last.iter().sum::<f64>() * 1e3 / last.len().max(1) as f64;
             println!("windows of {window}: {} tokens, {:.1} ms per token ({:.1} ms engram gather), {:.1} tok/s; last {}: {:.1} ms per token, {:.1} tok/s; tokens {:?}", n, t_all * 1e3 / n as f64, t_eng * 1e3 / n as f64, n as f64 / t_all, last.len(), last_ms, 1e3 / last_ms, &out_toks[..out_toks.len().min(24)]);
+            save_if_due(&mut eng, toks.len());
             if !tail_times.is_empty() {
                 let m = tail_times.iter().sum::<f64>() * 1e3 / tail_times.len() as f64;
                 println!("decode tail of {} single steps at position {}+: {:.1} ms per token ({:.1} tok/s)", tail_times.len(), toks.len() - tail_times.len(), m, 1e3 / m);
@@ -135,7 +168,9 @@ fn main() -> anyhow::Result<()> {
         let rewind_to = std::env::var("QX_DS_REWIND").ok().and_then(|v| v.parse::<usize>().ok());
         let park_to = std::env::var("QX_DS_PARK").ok().and_then(|v| v.parse::<usize>().ok());
         let mut kept: Vec<Vec<f32>> = Vec::new();
-        for p in 0..total {
+        anyhow::ensure!(start == 0 || (rewind_to.is_none() && park_to.is_none()), "the rewind and park checks run from position 0");
+        for p in start..total {
+            save_if_due(&mut eng, p);
             // QX_DS_NANCHECK=1: run every forward with activation dumps and name the first NaN activation
             let nancheck = std::env::var("QX_DS_NANCHECK").is_ok_and(|v| v == "1");
             let mut first_nan: Option<String> = None;
@@ -146,7 +181,9 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             let logits = eng.forward(tok, if nancheck { Some(&mut cb) } else { None });
-            dump_row(&mut dump_file, &logits);
+            if p >= dump_from {
+                dump_row(&mut dump_file, &logits);
+            }
             if (rewind_to.is_some() || park_to.is_some()) && p < toks.len() {
                 kept.push(logits.clone());
             }
@@ -172,6 +209,7 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("pos {p}: {:.0} ms ({:.0} ms experts){tiers}", eng.t_forward * 1e3, eng.t_experts * 1e3);
             }
         }
+        save_if_due(&mut eng, total);
         for (what, target) in [("rewind", rewind_to), ("park/unpark", park_to)] {
             let Some(pp) = target else { continue };
             assert!(pp < toks.len(), "{what} target inside the prompt");
