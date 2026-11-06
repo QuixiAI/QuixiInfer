@@ -174,7 +174,9 @@ invented one. The aggregate score lives in `scoreboard.md`.
   every row's sum order stays what the exact-reference check pins. Expected gain: 17 us per layer of bandwidth
   plus seven launch gaps, 0.7-1.3 ms per step, 2-4% of decode: at or below the bar for a kernel change.
 - **DEFERRED 2026-11-06:** not worth the kernel change alone. Reopen if another launch fusion in the same layer
-  (the `g_x` group's small segments, the hc mixes) can ride along to clear 8%.
+  (the `g_x` group's small segments, the hc mixes) can ride along to clear 8%. **Blocked the same day:** the
+  one-launch version built but its PTX took the driver's JIT more than 12 minutes at module load (notebook, "stalled
+  in the driver's PTX JIT"); time `ptxas` offline before touching `mgemv.cu` again.
 - **Kill criteria:** achieved bandwidth already above 70% of peak on the shapes that carry the time, or any
   change that breaks `tools/ds-checks.sh` line 3.
 

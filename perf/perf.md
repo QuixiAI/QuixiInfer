@@ -80,14 +80,16 @@ continuation), and the server under `tools/loadgen.py`. Every engine uses the fi
 | case | what runs | metric |
 |---|---|---|
 | `decode` | 1,024 single steps | **ms per token over the last 32** (steady state, tiers warm) |
-| `prefill64` | 16 windows of 64 tokens | **ms per token over the last 32** (the last window, at position 960-1023) |
-| `long16k` | 16,384 tokens in windows of 64, then 64 single steps | **ms per token over the last 32 single steps** (steady decode at 16k; the tail's first step pays the width-1 capture, 0.85-1.5 s, so the 64-step mean is recorded as `tail_ms_per_token` but not scored) |
+| `prefill128` | 8 windows of 128 tokens (the server's prompt chunk) | **ms per token over the last 32** (the last window, at position 896-1023) |
+| `prefill64` | 16 windows of 64 tokens | the previous chunk; optional since set C |
+| `long16k` | 16,384 tokens in windows of 128, then 64 single steps | **ms per token over the last 32 single steps** (steady decode at 16k; the tail's first step pays the width-1 capture, 0.85-1.5 s, so the 64-step mean is recorded as `tail_ms_per_token` but not scored) |
 | `long16k-prefill` | the same run | the windows' ms per token without the tail (prefill averaged over 0-16k); recorded, not scored |
 | `serve3` | `quixiinfer serve --slots 3 --ctx 8192 --window 64`, 6 unmeasured requests, then `loadgen.py` at concurrency 1 and 3, 2 rounds of 256 greedy tokens | **ms per token of per-request decode at concurrency 3** (1000 / per-request tok/s) |
 | `serve1` | the same session | the concurrency-1 number; recorded, not scored |
 | `prefill2`, `prefill4`, `prefill8`, `prefill32`, `prefill128` | windows of other widths | optional, for width experiments; the narrow ones are the verify-window costs of backlog family 6 |
 
-The **standard set** is `decode`, `prefill64`, `long16k` and `serve3` (`STANDARD_CASES` in `perf_diff.py`). A
+The **standard set** is `decode`, `prefill128`, `long16k` and `serve3` (`STANDARD_CASES` in `perf_diff.py`; set
+C since 2026-11-06, when the 128-token chunk became the server's default: `prefill64` is optional now). A
 scoreboard row or a promoted baseline must cover all four; `perf_diff.py` refuses otherwise. `bench.sh --quick`
 runs `decode` and `prefill64` only (about 5 minutes) for screening: `gate` compares it case by case and reports
 the score over the common cases, but it cannot be recorded or promoted. Up to 2026-11-05 the standard set was the

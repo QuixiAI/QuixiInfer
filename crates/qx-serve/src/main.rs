@@ -53,7 +53,12 @@ fn load(args: &[String]) -> Result<(mpsc::Sender<Job>, &'static qx_tok::Tok, cha
         let gib = |k: &str, flag: &str, d: f64| -> Result<f64> { Ok(match arg(args, flag) { Some(v) => v.parse()?, None => std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }) };
         let pack = arg(args, "--pack").or_else(|| std::env::var("QX_DS_PACK").ok()).ok_or_else(|| anyhow!("DeepSeek needs the pack: --pack FILE.qxp or QX_DS_PACK"))?;
         let profile = arg(args, "--profile").or_else(|| std::env::var("QX_DS_PROFILE").ok()).or_else(|| std::path::Path::new("golden/profile-dsv41.txt").exists().then(|| "golden/profile-dsv41.txt".to_string()));
-        let window: usize = arg(args, "--window").map(|s| s.parse()).transpose()?.unwrap_or(64);
+        // 128 since 2026-11-06 (was 64): with the full staged share and a 256-record staging area a 128-token chunk
+        // prefills 10.8 ms per token against 12.3 at 64, a 16k prompt 18.2 against 21.8; the staging area costs the
+        // VRAM expert tier about 1.5 GiB, about 10% of per-request decode at three concurrent requests
+        // (perf/optimization_status.md, "128-chunk bundle"). `--window 64` with QX_DS_STAGE_SHARE=6 QX_DS_STAGE_CAP=96
+        // is the previous configuration.
+        let window: usize = arg(args, "--window").map(|s| s.parse()).transpose()?.unwrap_or(128);
         let profile_out = arg(args, "--profile-out").or_else(|| std::env::var("QX_DS_PROFILE_OUT").ok());
         // a ranking saved by an earlier run is what the tiers should start from
         let profile = match &profile_out {

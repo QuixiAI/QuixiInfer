@@ -14,6 +14,10 @@ Case sets so far:
   in windows of 64) and `serve3` (per-request decode under `loadgen.py` at concurrency 3, 3 slots). See `perf.md`,
   "The Metrics". The serve tier was 90 GiB in the first set B row and is 95 GiB from the second (a measured
   -5.4% on serve3; the tier is in the recorded settings).
+- **Set C (from 2026-11-06, the user's decision):** the 128-token prompt chunk with the full staged share (8/8)
+  and a 256-record staging area is the default, so the standard prefill case is `prefill128`, `long16k` runs in
+  windows of 128, and the server serves at `--window 128`. Set C scores are not comparable with set B's: prefill
+  is faster (10.8 against 12.3) and serve3 slower (about +10%) by construction.
   Set B scores are larger than set A's, since the two new cases are the slow regimes; a set B score is not
   comparable with a set A one. `perf_diff.py` refuses to record a run that does not cover set B.
 

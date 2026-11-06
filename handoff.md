@@ -43,7 +43,13 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   stopped with `sudo systemctl stop`; it stays enabled, as before.
 - Ideation from `~/git/{colibri,Strata,basalt,DeepInfer}` is in `perf/backlog.md` families 6 and 7 and in
   `perf/findings.md` "Rejected elsewhere".
-- **Where the loop stopped (end of the 2026-11-06 session):** the standard-setting levers are measured to their
+- **Decision taken by the user (2026-11-06, late morning):** the server's default prompt chunk is 128 with the full
+  staged share (`--window 128`, `QX_DS_STAGE_SHARE=8`, `QX_DS_STAGE_CAP=256` as defaults). The harness standard set
+  is now set C (`decode`, `prefill128`, `long16k` in windows of 128, `serve3` at `--window 128`); its baseline
+  (`baseline-setc`) was queued after the fused output projection's measurement (`wo_a-fused`, pinned to the old
+  settings). If `perf/baselines/.../run.json` lacks `serve:window=128`, that baseline did not land: run
+  `perf/harness/bench.sh --check` and promote it.
+- **Where the loop stood before that decision:** the standard-setting levers are measured to their
   ceilings. Decode is pool-bound at the box's DRAM read ceiling (52-59 GB/s measured; the pool runs 44-54); the
   dense GEMVs are 6.7 ms of a 33 ms step at 54% of GPU memory peak with a 2-4% fusion available (family 8,
   deferred); prefill at the 64-chunk is copies and GPU expert kernels, and the 128-chunk bundle (share 8/8, cap

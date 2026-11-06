@@ -40,25 +40,29 @@ After appending, run `python3 perf/harness/perf_diff.py index perf/optimization_
 
 | date | entry | verdict | line |
 |---|---|---|--:|
-| 2026-11-05 | DeepSeek history before the harness | RECORDED | 64 |
-| 2026-11-05 | Performance scaffolding | LANDED | 83 |
-| 2026-11-05 | First harness baseline | RECORDED | 106 |
-| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 126 |
-| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 139 |
-| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 154 |
-| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 173 |
-| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 196 |
-| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 226 |
-| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 253 |
-| 2026-11-06 | First set B baseline | RECORDED | 285 |
-| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 314 |
-| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 334 |
-| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 356 |
-| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 392 |
-| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 416 |
-| 2026-11-06 | nsys kernel tables of a decode run and a 64-token window run | RECORDED | 439 |
-| 2026-11-06 | Full staged share with a 256-record area at windows of 128: prefill 10.8 ms per token | CANDIDATE | 471 |
-| 2026-11-06 | The 128-chunk bundle on long16k and on the serve case — MIXED, kept as an opt-in | UNLABELED | 498 |
+| 2026-11-05 | DeepSeek history before the harness | RECORDED | 68 |
+| 2026-11-05 | Performance scaffolding | LANDED | 87 |
+| 2026-11-05 | First harness baseline | RECORDED | 110 |
+| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 130 |
+| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 143 |
+| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 158 |
+| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 177 |
+| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 200 |
+| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 230 |
+| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 257 |
+| 2026-11-06 | First set B baseline | RECORDED | 289 |
+| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 318 |
+| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 338 |
+| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 360 |
+| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 396 |
+| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 420 |
+| 2026-11-06 | nsys kernel tables of a decode run and a 64-token window run | RECORDED | 443 |
+| 2026-11-06 | Full staged share with a 256-record area at windows of 128: prefill 10.8 ms per token | CANDIDATE | 475 |
+| 2026-11-06 | The 128-chunk bundle on long16k and on the serve case — MIXED, kept as an opt-in | UNLABELED | 502 |
+| 2026-11-06 | The 128-token prompt chunk with the full staged share becomes the default — LANDED (by decision) | UNLABELED | 526 |
+| 2026-11-06 | Adaptive-tier knobs on decode: half-life and eviction margin — REJECTED (defaults confirmed) | UNLABELED | 544 |
+| 2026-11-06 | Adaptive-tier half-life on long16k: the decay was per step, not per token — RECORDED, fix CANDIDATE | UNLABELED | 563 |
+| 2026-11-06 | The fused output projection stalled in the driver's PTX JIT — REVERTED, family 8 blocked | UNLABELED | 584 |
 <!-- qx:index:end -->
 
 ## 2026-11-05: DeepSeek history before the harness — RECORDED
@@ -518,3 +522,77 @@ VRAM would have to come from the tier dynamically, which the tier does not do to
 Rejected alternatives: making the bundle the serving default (serve3 +10%).
 Open questions: time to first token for long prompts under the bundle in serving (needs a long-prompt serve
 case, `tools/longprompt.py`); cap 384 at width 128.
+
+## 2026-11-06: The 128-token prompt chunk with the full staged share becomes the default — LANDED (by decision)
+
+Status: landed by the user's decision ("the server's default prompt chunk should move to 128 with the full staged
+share"), on the measurements of the "128-chunk bundle" entries above.
+Change: `quixiinfer serve --window` defaults to 128 (was 64); the engine's `QX_DS_STAGE_SHARE` defaults to 8 (was
+6) and `QX_DS_STAGE_CAP` to 256 (was 96). The previous configuration stays reachable: `--window 64` with
+`QX_DS_STAGE_SHARE=6 QX_DS_STAGE_CAP=96`.
+Measured effect (same day, 3 repeats each): prefill 10.8 ms per token at the 128-chunk against 12.3 at 64
+(-12.6%); a 16k prompt 18.2 against 21.8 (-16.6%); the 16k decode tail within noise; per-request decode at three
+concurrent requests 100.0 against 90.9 ms per token (+10%) from the 1.5 GiB the staging area takes from the
+serving tier; one request alone unchanged.
+Harness: the standard set becomes **set C**: `decode`, `prefill128` (the chunk the server uses), `long16k` in
+windows of 128, `serve3` with the server at `--window 128`. `prefill64` stays an optional case. The set C
+baseline is taken right after the fused output projection's one-factor measurement (which pins the old
+settings), and the scoreboard notes the change; set B and set C scores are not comparable.
+Open questions: a staging area that borrows tier VRAM only while a wide window runs would return the serve3 10%
+(backlog family 7); the long-prompt time to first token in serving is still unmeasured as a case.
+
+## 2026-11-06: Adaptive-tier knobs on decode: half-life and eviction margin — REJECTED (defaults confirmed)
+
+Status: one-factor knob sweep on the forced decode case, 5 repeats per arm, same binary, back to back, with a
+same-session control.
+
+| arm | decode median ms/token | spread | against control |
+|---|--:|--:|--:|
+| control (half-life 256, margin 0.2) | 32.6 | 5.2% | |
+| `QX_DS_HALF_LIFE=64` | 34.5 | 1.2% | +5.8%, outside both spreads: worse |
+| `QX_DS_HALF_LIFE=1024` | 32.4 | 1.5% | within noise |
+| `QX_DS_MARGIN=0.05` | 32.5 | 1.5% | within noise |
+| `QX_DS_MARGIN=0.5` | 32.2 | 0.6% | -1.2%, within noise |
+
+Counters: pool 15.2-15.6 ms per token in every arm, so the VRAM hit share barely moved; the short half-life
+churned promotions (its pool share was the highest).
+Decision: REJECTED; the defaults stay. The tier's ranking is not what limits decode residency on a single
+text at 20 GiB of VRAM; what it holds is bounded by the VRAM, and the scoring already tracks the text. The
+long16k arms (half-life 64 and 1024) follow, since the 16k corpus drifts through topics; recorded when done.
+
+## 2026-11-06: Adaptive-tier half-life on long16k: the decay was per step, not per token — RECORDED, fix CANDIDATE
+
+Status: the long16k half of the knob sweep (3 repeats per arm, windows of 64, old settings) and what it revealed.
+
+| arm | 16k decode tail | spread | prefill over 0-16k (companion) | pool ms/token |
+|---|--:|--:|--:|--:|
+| baseline (half-life 256) | 37.3 | 4.6% | 21.8 | 16.7 |
+| `QX_DS_HALF_LIFE=64` | 38.4 | 7.0% | **18.7 (-14%)** | 13.4 |
+| `QX_DS_HALF_LIFE=1024` | 37.9 | 3.2% | 21.2 | 16.0 |
+
+On decode a half-life of 64 was 5.8% worse; on the 16k prefill it is 14% better. The code explains the
+asymmetry: `adapt` multiplies every score by `decay` once per call, and a call covers a whole window, so in
+64-token windows the half-life of 256 is 16,384 tokens, in 128-token windows 32,768: the tier barely follows a
+long text's topic drift during prefill, which is the long-context cost family 4 was chasing. The short half-life
+helped prefill by accident (64 calls = 4,096 tokens at width 64) and hurt decode where a call is a token.
+Change (staged in the 256k patch, `QX_DS_DECAY_PER_STEP=1` restores the old behaviour): decay `dt` tokens' worth
+per call, so the half-life means tokens in every mode. Decode is unchanged by construction (dt = 1).
+Decision: CANDIDATE; the A/B on `long16k` and `prefill128` at set C is queued behind the 256k runs. Expected:
+prefill over 16k well under 21, decode and the tail unchanged. Family 4's hypothesis ("the long-context cost is
+the pool's residency drift through the corpus") now has a mechanism and a fix.
+
+## 2026-11-06: The fused output projection stalled in the driver's PTX JIT — REVERTED, family 8 blocked
+
+Status: the one-launch `attn_output_a` (eight head-group segments with per-segment input offsets in `mgemv.cu`)
+built and its measurement started, but the first repeat never finished a step: a thread dump showed CubeCL's
+server thread at 100% CPU inside `libnvidia-ptxjitcompiler` for more than 12 minutes, JIT-compiling the changed
+`mgemv.cu` PTX at module load (the 20-minute timeout killed the repeat; the second stalled the same way). The
+previous kernel text had been in the driver's compute cache for days, which is also why an unexplained stall
+this morning (after another rebuild) looked like a hang.
+Decision: REVERTED today (the tree keeps only the user's default changes). Family 8 is blocked on a compile-time
+pathology, not on the idea: before any `mgemv.cu` change lands, time `ptxas` offline on the file's PTX
+(`nvcc -arch=sm_120a -cubin`) and keep it under a minute. The kernel's structure (24 entry points x every
+quantization type x four-way unrolled rows) is near some ptxas cliff.
+Open questions: whether the stall is the segment-search reorder or the offset arithmetic (bisect offline);
+whether `-lineinfo` matters; a per-kernel source split (one translation unit per entry) would also cut every
+compile's cost and the 63 MiB NVRTC footprint.

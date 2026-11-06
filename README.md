@@ -196,16 +196,17 @@ systemd-run --user --scope -p MemoryMax=118G -p MemorySwapMax=0 -- \
 
 `--profile` ranks the experts the tiers are filled with at start (`golden/profile-dsv41.txt` comes from a routing
 trace of a mixed corpus); `--profile-out` writes the live ranking after requests, and a start finding that file loads from it
-instead. `--window` sets the prompt chunk (64 tokens by default, up to 128). The chat template and
+instead. `--window` sets the prompt chunk (128 tokens by default, the maximum). The chat template and
 tokenizer come from the GGUF (tokenization checked against llama.cpp). `--slots` (2) sets how many requests run at
-once; `QX_DS_STAGE_SHARE` (6, eighths) and `QX_DS_STAGE_SHARE_DECODE` (3) set how many of the RAM-resident missing
+once; `QX_DS_STAGE_SHARE` (8, eighths) and `QX_DS_STAGE_SHARE_DECODE` (3) set how many of the RAM-resident missing
 experts the GPU takes by DMA staging in windows and in single decode steps; `QX_DS_STAGE_WIDE_MIN` (2) is the
 window width from which the window share applies. The expert tier leaves `QX_DS_VRAM_RESERVE_MIB` (2560) of
 device memory for the kernel modules and the window graphs; the warm-up line reports what is left, and a kernel
-that would need compiling after the warm-up aborts the server (it means a module failed to load). For long-prompt
-workloads, `--window 128` with `QX_DS_STAGE_SHARE=8 QX_DS_STAGE_CAP=256` prefills 13-17% faster (10.8 ms per token
-on a 1k prompt, 18.2 on a 16k one, against 12.3 and 21.8); the 2.4 GiB staging area it needs comes out of the
-VRAM expert tier, which costs about 10% of per-request decode at three concurrent requests, so it is not the default.
+that would need compiling after the warm-up aborts the server (it means a module failed to load). Since 2026-11-06 the defaults are the 128-token
+chunk with the full staged share and a 256-record staging area (`QX_DS_STAGE_CAP`): prefill 10.8 ms per token on a
+1k prompt and 18.2 on a 16k one, against 12.3 and 21.8 at the old 64-chunk. The 2.4 GiB staging area comes out of
+the VRAM expert tier, which costs about 10% of per-request decode at three concurrent requests; `--window 64` with
+`QX_DS_STAGE_SHARE=6 QX_DS_STAGE_CAP=96` is the previous configuration for decode-heavy serving.
 
 ### Settings
 

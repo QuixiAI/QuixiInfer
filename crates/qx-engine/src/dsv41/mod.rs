@@ -603,14 +603,17 @@ impl<'a> DsEngine<'a> {
                 // the staging area for DMA-staged experts comes first (its slots are of the largest record)
                 // the share for prompt windows (8 tokens and more) and for decode steps; both in eighths
                 let knob = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d).min(8);
-                let stage_share = knob("QX_DS_STAGE_SHARE", 6);
+                // 8/8 and 256 records since 2026-11-06 (were 6/8 and 96): at windows of 128 the GPU takes every RAM
+                // miss by DMA and the pool idles, 10.8 ms per token against 12.3 at the old 64-chunk; 6/8 at 96 made
+                // no difference at 64 and overflowed at 128 (perf/optimization_status.md, "128-chunk bundle")
+                let stage_share = knob("QX_DS_STAGE_SHARE", 8);
                 let stage_share_decode = knob("QX_DS_STAGE_SHARE_DECODE", 3);
                 // The window share applies from width 2 (QX_DS_STAGE_WIDE_MIN; it was 8 until 2026-11-06): at widths
                 // 2 and 4 the 6/8 share measured 4.7% and 8.2% faster per position than 3/8, outside the noise
                 // (perf/optimization_status.md). Width 1 keeps the decode share: a staged expert's DMA costs about 0.7
                 // ms against the pool's 0.22 when it serves one token, and 4/8 measured flat there.
                 let stage_wide_min: usize = std::env::var("QX_DS_STAGE_WIDE_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2).max(1);
-                let stage_cap: usize = if stage_share > 0 || stage_share_decode > 0 { std::env::var("QX_DS_STAGE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(96) } else { 1 };
+                let stage_cap: usize = if stage_share > 0 || stage_share_decode > 0 { std::env::var("QX_DS_STAGE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(256) } else { 1 };
                 let max_rec = (0..cfg.n_layer).map(|l| pack.experts.record[l] as usize).max().unwrap_or(0);
                 let stage = DeviceBuf::new(stage_cap * max_rec.max(256));
                 let want = (vram_gib * 1073741824.0) as usize;
