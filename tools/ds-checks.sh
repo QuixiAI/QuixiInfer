@@ -4,6 +4,7 @@
 #   2. production numerics against the reference (p1, 59 positions): expect about 57/59, KLD about 0.13
 #   3. windows of 8 and 64 against one-token steps (route1k, 128 positions): expect 128/128 bit-identical rows
 #   4. tokenization against llama.cpp's llama-tokenize (when QX_LLAMA_TOKENIZE points at it): expect identical
+#   5. rewind to 64 and park + unpark to 64 of route1k 128 against the straight pass: expect 64 / 64 twice
 # Heavy (the pack's RAM tier): run alone, under a memory cap: `tools/capped.sh 112 tools/ds-checks.sh`.
 set -u
 cd "$(dirname "$0")/.."
@@ -34,3 +35,7 @@ if [ -n "${QX_LLAMA_TOKENIZE:-}" ]; then
   python3 -I -c "import sys,struct,ast; ids=ast.literal_eval(open(sys.argv[1]).read().strip()); open(sys.argv[2],'wb').write(struct.pack('<%dI'%len(ids),*ids))" "$T/tok.ids" "$T/tok.bin"
   echo "4. tokenizer vs llama.cpp:      $(QX_MODEL="$M" target/release/qx-tok check "$T/tok.txt" "$T/tok.bin" 2>/dev/null | tr '\n' ' ')"
 fi
+# 5. a rewind (the ring still holds the window) and a park + unpark (the window rebuilt by replay) against the
+# straight pass: every later row bit-identical (the replay-based rewind, 2026-11-06)
+gpu_free
+echo "5. rewind and park vs straight: $(env $B0 QX_DS_REWIND=64 QX_DS_PARK=64 $B "$M" golden/data/route1k.tokens 128 2>/dev/null | grep -E '^(rewind|park)' | sed -E 's/ \(restore.*//; s/ then positions 64..128//' | tr '\n' ' ')"

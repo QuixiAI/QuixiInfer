@@ -123,6 +123,7 @@ if [ $CHECK = 1 ]; then
     grep -q "top-1 agreement 6/6, KLD mean 0.000000" "$RUN/logs/ds-checks.log" || check=fail
     [ "$(grep -c 'bit-identical rows: 128 / 128' "$RUN/logs/ds-checks.log")" = 2 ] || check=fail
     grep -q "^4\. .*identical" "$RUN/logs/ds-checks.log" || check=incomplete   # tokenizer line missing: no llama-tokenize
+    [ "$(grep -o '64 / 64' "$RUN/logs/ds-checks.log" | wc -l)" -ge 2 ] || check=fail   # rewind and park (line 5)
   fi
   echo "correctness: $check"
 fi

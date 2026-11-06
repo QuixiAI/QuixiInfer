@@ -208,14 +208,12 @@ pub struct Parked {
     pub tokens: Vec<u32>,
     /// Per layer: the used rows of its compressed store (empty for layers without one).
     stores: Vec<Vec<f32>>,
-    /// Per layer: the latents of every position.
-    history: Vec<Vec<f32>>,
 }
 
 impl Parked {
     /// Host bytes held.
     pub fn bytes(&self) -> usize {
-        4 * (self.tokens.len() + self.stores.iter().map(Vec::len).sum::<usize>() + self.history.iter().map(Vec::len).sum::<usize>())
+        4 * (self.tokens.len() + self.stores.iter().map(Vec::len).sum::<usize>())
     }
 }
 
@@ -265,7 +263,7 @@ pub struct DsEngine<'a> {
     /// Key chunks of 12 per token in the split attention: window plus selected rows.
     attn_chunks: usize,
     ring_w: usize,
-    /// Positions each slot's compressed stores hold (rows of a store: `max_ctx`, of which `pos / ratio` are used).
+    /// Positions each slot holds; a layer's compressed store has `store_rows(max_ctx, ratio)` rows per slot.
     max_ctx: usize,
     pub exact_experts: bool,
     /// The tiers when loaded from a pack; else the experts are read from the GGUF by the pool.
@@ -279,9 +277,6 @@ pub struct DsEngine<'a> {
     /// serial preads cost 4 ms per token).
     engram_ring: Option<std::cell::RefCell<io_uring::IoUring>>,
     /// The latents of every position so far, per layer (the ring only keeps the last n_swa + DS_TMAX), so a
-    /// sequence can be rewound to a prefix: positions [0, hist_flushed) are copied out of the rings.
-    history: Vec<Vec<Vec<f32>>>,
-    hist_flushed: Vec<usize>,
     /// Sequence slots: each has its own ring, compressed stores, position and tokens.
     pub slots: usize,
     /// The captured token (asynchronous mode), and whether the warm-up run before its capture happened.
@@ -292,7 +287,7 @@ pub struct DsEngine<'a> {
     /// Seconds in the last forward: all, experts (pool + GPU experts), the host's Engram row gather.
     pub t_forward: f64,
     pub t_engram: f64,
-    /// Phases of the last forward, seconds: uploads, launch or replay, device wait, history flush, download.
+    /// Phases of the last forward, seconds: uploads, launch or replay, device wait, (unused), download.
     pub t_phase: [f64; 5],
     pub t_experts: f64,
 }
@@ -575,9 +570,13 @@ impl<'a> DsEngine<'a> {
             ring_tables.push(DeviceBuf::from_slice(&(0..slots).map(|sl| ring.ptr + (sl * ring_w * cfg.head_dim * 4) as u64).collect::<Vec<u64>>()));
             rings.push(ring);
             stores.push(if has_comp {
-                let store = buf(slots * max_ctx * row);
+                // rows per slot: the positions compress `ratio` to one row (row (pos + 1) / ratio - 1 is written), so
+                // max_ctx / ratio rows are ever used; one spare row keeps every index in range. At 256k with the
+                // 2:1 layers this is half the 2.7 GB a max_ctx-row store would take per slot (2026-11-06).
+                let rows_l = Self::store_rows(max_ctx, cfg.ratio[l] as usize);
+                let store = buf(slots * rows_l * row);
                 let pending = buf(slots * cfg.ratio[l] * 2 * cfg.head_dim);
-                let st = DeviceBuf::from_slice(&(0..slots).map(|sl| store.ptr + (sl * max_ctx * row * 4) as u64).collect::<Vec<u64>>());
+                let st = DeviceBuf::from_slice(&(0..slots).map(|sl| store.ptr + (sl * rows_l * row * 4) as u64).collect::<Vec<u64>>());
                 let pt = DeviceBuf::from_slice(&(0..slots).map(|sl| pending.ptr + (sl * cfg.ratio[l] * 2 * cfg.head_dim * 4) as u64).collect::<Vec<u64>>());
                 Some((store, st, pending, pt))
             } else {
@@ -788,8 +787,6 @@ impl<'a> DsEngine<'a> {
             abufs,
             engram_ring: engram_pack.as_ref().map(|_| std::cell::RefCell::new(io_uring::IoUring::new(128).expect("engram io_uring"))),
             engram_pack,
-            history: vec![vec![Vec::new(); cfg.n_layer]; slots],
-            hist_flushed: vec![0; slots],
             graphs: (0..=DS_TMAX).map(|_| None).collect(),
             warmed: vec![false; DS_TMAX + 1],
             warm: false,
@@ -1106,7 +1103,11 @@ impl<'a> DsEngine<'a> {
         self.gpu.sync();
         self.st.pos[slot] = 0;
         self.st.tokens[slot].clear();
-        self.hist_flushed[slot] = 0;
+    }
+
+    /// Rows a compressed store holds per slot for `max_ctx` positions at compression `ratio`.
+    fn store_rows(max_ctx: usize, ratio: usize) -> usize {
+        max_ctx.div_ceil(ratio.max(1)) + 1
     }
 
     /// The tokens of slot `slot` so far.
@@ -1119,66 +1120,54 @@ impl<'a> DsEngine<'a> {
         self.st.pos[slot]
     }
 
-    /// Copies slot `slot`'s latents of positions [hist_flushed, pos) out of its rings into the host history (at
-    /// most the ring's width behind, so it runs at least every DS_TMAX tokens of the slot).
-    pub fn flush_history(&mut self, slot: usize) {
-        let (hd, w) = (self.cfg.head_dim, self.ring_w);
-        let (a, b) = (self.hist_flushed[slot], self.st.pos[slot]);
-        if a >= b {
-            return;
-        }
-        assert!(b - a <= w, "latent history fell behind the ring");
-        self.gpu.sync();
-        for l in 0..self.cfg.n_layer {
-            let h = &mut self.history[slot][l];
-            if h.len() < b * hd {
-                h.resize(b * hd, 0.0);
-            }
-            let base = slot * w * hd * 4;
-            let mut q = a;
-            while q < b {
-                let cell = q % w;
-                let n = (b - q).min(w - cell);
-                let v: Vec<f32> = self.st.rings[l].download_at(base + cell * hd * 4, n * hd);
-                h[q * hd..(q + n) * hd].copy_from_slice(&v);
-                q += n;
-            }
-        }
-        self.hist_flushed[slot] = b;
-    }
-
-    /// Rewinds slot `slot` to position `p` (a group boundary for every compressor ratio, so an even position),
-    /// restoring the ring cells of the attention window from the history; the compressed stores and indexer
-    /// keys are positional and the positions from `p` on are simply recomputed.
+    /// Rewinds slot `slot` to position `p` (a group boundary for every compressor ratio, so an even position).
+    /// The compressed stores and indexer keys are positional, so positions from `p` on are simply recomputed; the
+    /// attention ring must hold the window [p - n_swa, p). If the ring still does (the rewind is within the last
+    /// DS_TMAX positions), nothing is copied; otherwise the window is rebuilt by replaying the slot's own tokens
+    /// from the group boundary at or below p - n_swa: identical inputs through the same deterministic kernels give
+    /// the ring, the compressed rows and the keys bit for bit (about 130 tokens, one or two windows). This
+    /// replaced a per-position host copy of every latent, 21.5 GB per slot at 256k (2026-11-06).
     pub fn rewind(&mut self, slot: usize, p: usize) {
         assert!(p <= self.st.pos[slot], "rewind past the end");
         let max_ratio = self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
         assert!(p % max_ratio == 0, "rewind to a group boundary");
-        self.flush_history(slot);
-        let (hd, w) = (self.cfg.head_dim, self.ring_w);
-        let a = p.saturating_sub(self.cfg.n_swa);
-        for l in 0..self.cfg.n_layer {
-            let base = slot * w * hd * 4;
-            let mut q = a;
-            while q < p {
-                let cell = q % w;
-                let n = (p - q).min(w - cell);
-                self.st.rings[l].upload_at(base + cell * hd * 4, &self.history[slot][l][q * hd..(q + n) * hd]);
-                q += n;
-            }
+        let pos = self.st.pos[slot];
+        if pos - p <= self.ring_w - self.cfg.n_swa {
+            // the ring holds [p - n_swa, p) still: positions beyond p are overwritten as the slot advances
+            self.st.pos[slot] = p;
+            self.st.tokens[slot].truncate(p);
+            return;
         }
-        self.st.pos[slot] = p;
-        self.st.tokens[slot].truncate(p);
-        self.hist_flushed[slot] = p;
+        self.replay_to(slot, p);
     }
 
-    /// Moves slot `slot`'s sequence out to host memory and leaves the slot empty (as after `reset`): its tokens,
-    /// its latent history (moved, not copied) and the used rows of its compressed stores (`pos / ratio` per
-    /// store). `unpark` puts it back into any slot. The ring and the pending pairs are not kept: a restore goes
-    /// through `rewind`, which rebuilds the attention window from the history at a group boundary, where no group
-    /// is pending.
+    /// Rebuilds slot `slot`'s attention window for position `p` by replaying its tokens from the group boundary
+    /// at or below p - n_swa, and leaves the slot at `p` (tokens truncated). The slot's tokens must hold [0, p).
+    fn replay_to(&mut self, slot: usize, p: usize) {
+        let max_ratio = self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
+        let mut a = p.saturating_sub(self.cfg.n_swa);
+        a -= a % max_ratio;
+        let replay: Vec<u32> = self.st.tokens[slot][a..p].to_vec();
+        self.st.tokens[slot].truncate(a);
+        self.st.pos[slot] = a;
+        let mut off = 0;
+        while off < replay.len() {
+            // widths whose kernels every server warms (the scheduler's set): never 5 or 7, whose kernels may not be
+            // loaded and whose multi-GEMV is not bit-identical at width 5
+            let left = replay.len() - off;
+            let w = [128usize, 96, 64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1].into_iter().find(|&w| w <= left.min(DS_TMAX)).unwrap();
+            let segs: Vec<(usize, u32)> = replay[off..off + w].iter().map(|&t| (slot, t)).collect();
+            let _ = self.forward_segments(&segs, None);
+            off += w;
+        }
+        debug_assert_eq!(self.st.pos[slot], p);
+    }
+
+    /// Moves slot `slot`'s sequence out to host memory and leaves the slot empty (as after `reset`): its tokens
+    /// and the used rows of its compressed stores (`pos / ratio` per store). `unpark` puts it back into any slot.
+    /// The ring and the pending pairs are not kept: a restore goes through `rewind`, which rebuilds the attention
+    /// window by replay at a group boundary, where no group is pending.
     pub fn park(&mut self, slot: usize) -> Parked {
-        self.flush_history(slot);
         self.gpu.sync();
         let pos = self.st.pos[slot];
         let row = self.cfg.head_dim + self.cfg.idx_dim;
@@ -1186,21 +1175,16 @@ impl<'a> DsEngine<'a> {
         for l in 0..self.cfg.n_layer {
             stores.push(match &self.st.stores[l] {
                 Some((store, _, _, _)) => {
-                    let rows = pos / self.cfg.ratio[l].max(1) as usize;
-                    store.download_at::<f32>(slot * self.max_ctx * row * 4, rows * row)
+                    let ratio = self.cfg.ratio[l].max(1) as usize;
+                    let rows = pos / ratio;
+                    store.download_at::<f32>(slot * Self::store_rows(self.max_ctx, ratio) * row * 4, rows * row)
                 }
                 None => Vec::new(),
             });
         }
-        let mut history = std::mem::take(&mut self.history[slot]);
-        for h in history.iter_mut() {
-            h.truncate(pos * self.cfg.head_dim);
-        }
-        self.history[slot] = vec![Vec::new(); self.cfg.n_layer];
         let tokens = std::mem::take(&mut self.st.tokens[slot]);
         self.st.pos[slot] = 0;
-        self.hist_flushed[slot] = 0;
-        Parked { tokens, stores, history }
+        Parked { tokens, stores }
     }
 
     /// Puts a parked sequence into slot `slot` (whatever the slot held is dropped) and rewinds it to `upto`, a
@@ -1213,15 +1197,16 @@ impl<'a> DsEngine<'a> {
         let row = self.cfg.head_dim + self.cfg.idx_dim;
         for l in 0..self.cfg.n_layer {
             if let Some((store, _, _, _)) = &self.st.stores[l] {
-                let rows = (upto.div_ceil(self.cfg.ratio[l].max(1) as usize)).min(p.stores[l].len() / row);
-                store.upload_at(slot * self.max_ctx * row * 4, &p.stores[l][..rows * row]);
+                let ratio = self.cfg.ratio[l].max(1) as usize;
+                let rows = (upto.div_ceil(ratio)).min(p.stores[l].len() / row);
+                store.upload_at(slot * Self::store_rows(self.max_ctx, ratio) * row * 4, &p.stores[l][..rows * row]);
             }
         }
-        self.history[slot] = p.history;
         self.st.tokens[slot] = p.tokens;
         self.st.pos[slot] = pos;
-        self.hist_flushed[slot] = pos;
-        self.rewind(slot, upto);
+        // the ring is empty whatever the distance: always replay the window before `upto`
+        assert!(upto % self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize == 0, "unpark to a group boundary");
+        self.replay_to(slot, upto);
     }
 
     /// One token of slot 0 at its position; returns its logits. `act` receives named activations (each one syncs).
@@ -1372,9 +1357,6 @@ impl<'a> DsEngine<'a> {
         for sl in 0..self.slots {
             if counted[sl] > 0 {
                 self.st.pos[sl] += counted[sl];
-                if self.st.pos[sl] - self.hist_flushed[sl] + DS_TMAX > self.ring_w {
-                    self.flush_history(sl);
-                }
             }
         }
         self.t_phase[3] = tp.elapsed().as_secs_f64();

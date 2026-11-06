@@ -130,6 +130,11 @@ fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        // QX_DS_REWIND=P / QX_DS_PARK=P: keep every row of the straight pass, then rewind (or park and unpark) slot 0
+        // to P and re-run positions P..: every row must come back bit for bit (the replay-based rewind, 2026-11-06)
+        let rewind_to = std::env::var("QX_DS_REWIND").ok().and_then(|v| v.parse::<usize>().ok());
+        let park_to = std::env::var("QX_DS_PARK").ok().and_then(|v| v.parse::<usize>().ok());
+        let mut kept: Vec<Vec<f32>> = Vec::new();
         for p in 0..total {
             // QX_DS_NANCHECK=1: run every forward with activation dumps and name the first NaN activation
             let nancheck = std::env::var("QX_DS_NANCHECK").is_ok_and(|v| v == "1");
@@ -142,6 +147,9 @@ fn main() -> anyhow::Result<()> {
             };
             let logits = eng.forward(tok, if nancheck { Some(&mut cb) } else { None });
             dump_row(&mut dump_file, &logits);
+            if (rewind_to.is_some() || park_to.is_some()) && p < toks.len() {
+                kept.push(logits.clone());
+            }
             if let Some(n) = first_nan {
                 eprintln!("position {p}: first non-finite activation {n}");
             }
@@ -163,6 +171,30 @@ fn main() -> anyhow::Result<()> {
                 let tiers = eng.tier_stats().unwrap_or_default();
                 eprintln!("pos {p}: {:.0} ms ({:.0} ms experts){tiers}", eng.t_forward * 1e3, eng.t_experts * 1e3);
             }
+        }
+        for (what, target) in [("rewind", rewind_to), ("park/unpark", park_to)] {
+            let Some(pp) = target else { continue };
+            assert!(pp < toks.len(), "{what} target inside the prompt");
+            let t0 = std::time::Instant::now();
+            if what == "rewind" {
+                eng.rewind(0, pp);
+            } else {
+                let parked = eng.park(0);
+                eng.unpark(0, parked, pp);
+            }
+            let t_restore = t0.elapsed().as_secs_f64();
+            let mut same = 0usize;
+            let mut first_bad: Option<usize> = None;
+            for p in pp..toks.len() {
+                let logits = eng.forward(toks[p], None);
+                if logits == kept[p] {
+                    same += 1;
+                } else if first_bad.is_none() {
+                    first_bad = Some(p);
+                }
+            }
+            println!("{what} to {pp} then positions {pp}..{}: bit-identical rows: {same} / {} (restore {:.2}s{})", toks.len(), toks.len() - pp, t_restore,
+                first_bad.map(|b| format!(", first differing row {b}")).unwrap_or_default());
         }
         let last = &per_tok[per_tok.len().saturating_sub(32)..];
         let last_ms = last.iter().sum::<f64>() * 1e3 / last.len().max(1) as f64;

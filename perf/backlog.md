@@ -97,6 +97,11 @@ invented one. The aggregate score lives in `scoreboard.md`.
   split the pool rise with the counters.
 - **Kill criteria:** the rise turns out to be text-dependent routing rather than position, because route16k's
   later text is harder to keep resident. Then this family merges into family 3.
+- **Closed 2026-11-06, solved:** the kill criterion fired in the best way. The rise was the tier's residency lag,
+  caused by a per-step score decay (a 32,768-token memory in 128-token windows); decay per token landed:
+  long16k 38.5 to 33.8 (decode at 16k now equals decode at 1k), 16k prefill 18.4 to 14.4 (notebook, "score
+  decay per token"). What remains for long contexts is the host latent history (replaced by replay in the same
+  patch) and the 256k runs in progress.
 
 ### 5. Prefill beyond 11.8 ms per token
 

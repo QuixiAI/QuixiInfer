@@ -262,7 +262,9 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 let shared = |slot: usize| -> usize {
                     let mut l = eng.tokens(slot).iter().zip(&job.prompt).take_while(|(a, b)| a == b).count().min(job.prompt.len() - 1);
                     l -= l % group;
-                    if l >= 64 { l } else { 0 }
+                    // a rewind replays about 130 tokens to rebuild the attention window, so a shared prefix pays
+                    // only when it is a good deal longer than that
+                    if l >= 256 { l } else { 0 }
                 };
                 let (i, reuse) = if prefix_on { free.iter().enumerate().map(|(i, &sl)| (i, shared(sl))).max_by_key(|&(_, l)| l).unwrap() } else { (free.len() - 1, 0) };
                 let slot = free.remove(i);

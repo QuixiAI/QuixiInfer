@@ -217,8 +217,11 @@ token.
 QX_LLAMA_TOKENIZE=$HOME/git/llama.cpp-dsv41/build-tok/bin/llama-tokenize tools/ds-checks.sh
 ```
 
-The gate takes about 5 minutes. Run it in a capped unit, alone on the box. `bench.sh --check` runs it first and
-records `pass` or `fail` in `run.json`. A run without a pass can be measured, but it cannot be landed, promoted
+The gate takes about 6 minutes and prints six lines: the exact-f32 agreement (6/6, KLD 0.000000), the production
+agreement (57/59, KLD 0.128643), windows of 8 and of 64 against single steps (128 / 128 each), the tokenizer
+(identical), and since 2026-11-06 a rewind and a park + unpark against the straight pass (64 / 64 each: the
+replay-based rewind). Run it in a capped unit, alone on the box. `bench.sh --check` runs it first and records
+`pass` or `fail` in `run.json`. A run without a pass can be measured, but it cannot be landed, promoted
 or put on the scoreboard. For changes to slots, serving, prefix reuse or parking, also run the server smoke test:
 three concurrent requests, a repeat for prefix reuse, and a `json_object` request. An example is in
 `handoff.md` and the 2026-11-04 entries of `docs/progress.md`.

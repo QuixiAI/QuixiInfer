@@ -319,7 +319,11 @@ impl Loop {
         let t0 = std::time::Instant::now();
         self.ticks += 1;
         let h = &mut self.host;
-        let decay = h.decay;
+        // the half-life is in tokens: a window's call decays `dt` tokens' worth (before 2026-11-06 it decayed once
+        // per call, so a 128-token window kept a 128x longer memory than decode; QX_DS_DECAY_PER_STEP=1 restores that)
+        static PER_STEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let per_step = *PER_STEP.get_or_init(|| std::env::var("QX_DS_DECAY_PER_STEP").is_ok_and(|v| v == "1"));
+        let decay = if per_step { h.decay } else { h.decay.powi(dt.max(1) as i32) };
         for s in h.score.iter_mut() {
             *s *= decay;
         }
