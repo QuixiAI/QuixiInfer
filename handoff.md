@@ -54,6 +54,12 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   promoted, with `serve:window=128` in its `run.json`. If the tree has uncommitted engine changes, they are the 256k
   patch: verify them (`QX_DS_REWIND=64 QX_DS_PARK=64` on route1k 128 must print 64 / 64 twice; ds-checks exact)
   before committing.
+- **Landed as `39c3bc0` (2026-11-06 afternoon):** the tier's score decay per token (long16k 38.5 to 33.8, the
+  16k prefill 18.4 to 14.4; the long-context cost was this), the replay-based rewind (no host latent history; park
+  and unpark keep tokens and store rows), stores sized by ratio, `qx-ds-check` `QX_DS_REWIND`/`QX_DS_PARK`, and
+  regression line 5 (rewind and park, 64 / 64 twice) which the harness gate now requires. A full set C re-take
+  (`baseline-setc-decay`) is queued after the forced 256k pass; promote it and record the row (expected about
+  33.4) when it finishes clean.
 - **256k context, facts so far (2026-11-06):** the model allows 1M with YaRN and the engine applies it; a
   `--ctx 262144` server starts and serves on the committed tree with 1 slot (14.5 GiB tier left) and with 3 slots
   (9.4 GiB); the compressed stores are 2.7 GB per slot at 256k (1.7 after the ratio sizing in the staged patch).
