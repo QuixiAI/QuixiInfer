@@ -153,6 +153,18 @@ invented one. The aggregate score lives in `scoreboard.md`.
   acceptance for this quant, and the drafter weights are not on the box. Re-open with: a measured per-position
   acceptance of 80% or more, or w_4 under 15 ms per position from window-side work (the staged share at widths
   2-4 is measured next).
+- **Re-opened 2026-11-06 (the user's direction: bridge the gap to Strata's 40 tok/s).** Facts from the code
+  (`findings.md`, "The neighbours' mechanics"): DSpark is a real 3-block draft model in Unsloth's
+  `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` (8 GB; architecture `dflash`; 3 blocks of 128 experts, 3 used, in
+  **MXFP4**, dense parts Q8_0, a Markov bias head of 2 × 66 MB and a confidence head), now on the box at
+  `~/models/DeepSeek-V4.1-Flash-1017-GGUF/dspark/` (sha256 matches Strata's pin). It drafts 5 tokens in one
+  non-causal pass fed by the trunk's layer 37-39 attention inputs; verification is one (k+1)-row window;
+  Strata measures 31-32% per-draft acceptance (1.6 per round), DeepInfer 3.2 of 5. Our break-even is 41-46%.
+  **Next action, measurement first:** pack the drafter (an MXFP4 expert kernel is needed; `pack_gguf.py:725-773`
+  in Strata has the tensor map), run it beside normal greedy decode on code, agent and chat prompts and log the
+  acceptance of its 5 drafts against the real next tokens; with the w_T table that gives the speedup before any
+  verify path exists. Build the verify path only past +8%: the fast rewind covers k ≤ 16 but the compressor's
+  pending pair must be saved per position (odd rewinds), plus DeepInfer-style confidence truncation.
 
 ### 8. Dense GEMV efficiency at decode (new 2026-11-06, from the nsys table)
 
@@ -201,6 +213,13 @@ invented one. The aggregate score lives in `scoreboard.md`.
   skips most rows, keeping the reference's tie rule (lowest index) so line 3 of ds-checks stays exact.
 - **Kill criteria:** the profile shows the time outside the indexer (then re-aim), or a change that breaks the
   bit-identity of the selection.
+- **2026-11-06:** the nsys table named `qx_ds_idx_score` (8.8 ms per call, 8 per step, 33% of GPU time; the
+  top-k is 0.3 ms). `qx_ds_idx_score2` (queries in shared memory, float4 key reads, same FMA order) is bit-identical
+  at 262,144 and in ds-checks.
+- **Concluded 2026-11-06: LANDED.** decode256k 56.6 → 43.6 ms per token (-23%), prefill256k 34.5 → 23.2 (-33%),
+  3 repeats each way on one binary, spreads 2.8-9.1%, ranges disjoint. What remains of the position cost (43.6 at
+  262k against 34 at 1k, part of it the cold resumed tier) re-opens as a smaller family once the states carry
+  the tier ranking: the per-token `qx_ds_topk` (8 x 0.3 ms) and the candidate path are next.
 
 ### 10. The per-step uploads synchronize the whole context (new 2026-11-06)
 
@@ -213,6 +232,41 @@ invented one. The aggregate score lives in `scoreboard.md`.
   256k, and the same mechanism in serving after every prompt.
 - **Next action:** a mapped-buffer path for `tok`, `pos` and `slot`; measure `decode256k` and `serve256k3`.
 - **Kill criteria:** under 3% on both.
+
+### 11. The long-prompt layer skip: KV-only windows (new 2026-11-06, from Strata's `prompt skip`)
+
+- **Parent result:** `kv_source_layers` = 2, 8, 14, 20 and `compress_ratios` 0,0,2×18,1×20: layers 21-39 have no
+  store of their own and see earlier positions only through layer 20's compressed rows and index keys plus their
+  own 128-wide sliding windows. A prompt position's output above layer 20 feeds only its own logits and the next
+  127 positions' windows, layer by layer up the stack. Strata runs layers 20-39 for the last 2,668 rows only
+  (`ds4_model.cu:12915`, test `test_prompt_skip.py`).
+- **Hypothesis:** windows with at least `prompt_keep()` = 2,796 prompt positions after them can stop after layer
+  20's ring, store and key writes: about half the routed-expert bytes and GPU time of such a window, with every
+  kept position bit for bit the full pass's. `prefill256k` 22 → ~12 ms per token, the 16k prompt 14.4 → ~8.
+- **Next action:** in the tree (`forward_segments_opt`, `QX_DS_SKIP`); the route16k identity and timing checks
+  and ds-checks are queued; then `prefill256k` and `long16k` with and without; then the serving policy (today
+  only prompt-only windows qualify; a long prompt beside decoders gets no skip until windows alternate).
+- **Kill criteria:** any kept-tail logit differing from the full pass, or under 25% on the 16k prompt.
+
+### 12. Chunked expert-major prefill (new 2026-11-06, the Strata-class prefill win)
+
+- **Parent result:** our GPU expert kernel is a GEMV per (token, expert) selection (`moe.cu:394-497`: grid
+  `(2ff/8, k·t)`, an expert's weights re-read once per selection, ~2.3 GB of HBM reads per token at any width),
+  the staging cap counts selections, `qx_moe_post` needs all T blocks co-resident (T < ~1000), the mailbox and the
+  NVMe landing places (64) bound a window at 128. Strata streams each expert once per 8-32K-row chunk into
+  tensor-core GEMMs and measures 200 → 431 tok/s from chunk 1024 → 8192 on one card.
+- **Hypothesis:** a chunk of 4K+ rows processed layer-major: dense and attention in 128-row slabs with today's
+  kernels (unchanged bits), the MoE of the whole chunk per layer expert-major (each touched expert streamed once
+  through a VRAM staging ring, GPU only; a grouped kernel that keeps each (row, selection)'s integer block sums and
+  float chain, so single steps and chunks stay bit-identical), the residual streams (80 KB per row) the only
+  per-row state across layers. Bytes per 4K chunk ≈ 76 GB of RAM experts over PCIe + 56 GB from NVMe ≈ 6.5 s,
+  so ~1.6 ms per token at 4K, ~0.9 with family 11; the 1k prompt ~6 ms per token (1.8x), long prompts 7-12x.
+- **Next action:** after family 11 lands: the grouped expert kernel first (measurable alone at T = 128: it also
+  cuts the per-window HBM traffic), then the per-layer slab graphs and the chunk-wide MoE phase, then the whole-
+  layer NVMe streaming (the 64 landing places and QUEUE=64 are per window today).
+- **Kill criteria:** the grouped kernel not bit-identical to the per-selection one, or under 1.5x on a 4K prompt.
+
+### 13. DSpark: see family 6 (re-opened 2026-11-06); measurement first, then the verify path.
 
 ### 7. Ideas from the neighbours, not yet ranked
 

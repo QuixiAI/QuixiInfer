@@ -45,6 +45,10 @@ were 20-21 GiB VRAM and 88-100 GiB RAM. The settings before 2026-11-04 differ fr
 | The window staged share (6/8) from width 2 instead of 8 (`QX_DS_STAGE_WIDE_MIN`) | -4.7% per position at width 2, -8.2% at width 4 (forced, outside noise); serve3 -2.9%, within noise: KEPT, not a scoreboard win | 2026-11-06 |
 | **The prefill ceiling of this design:** windows of 128 with the full staged share (8/8) and a 256-record area: 10.8 ms per token against 12.3 at the standard 64-chunk (-12.6%), a 16k prompt at 18.2 against 21.8 (-16.6%); the pool idles and the copies plus the GPU expert kernels set the time. Opt-in only: the 2.4 GiB area costs serve3 +10% at concurrency 3 | notebook, "128-chunk bundle" | 2026-11-06 |
 
+- **The 256k indexer scorer (2026-11-06):** `qx_ds_idx_score2` keeps the 32 index queries in shared memory
+  instead of re-reading 32 cache lines per key row: decode256k 56.6 → 43.6 ms per token (-23%), prefill256k
+  34.5 → 23.2 (-33%), bit-identical. The position cost of 256k was one kernel's memory pattern, not the top-k.
+
 ## Correctness rules learned the hard way
 
 - **Never upload with `DeviceBuf::upload` into memory a queued kernel reads.** It runs on the legacy stream,
@@ -63,6 +67,11 @@ were 20-21 GiB VRAM and 88-100 GiB RAM. The settings before 2026-11-04 differ fr
   it (2026-11-06, `qx_mgemv_t6` at width 6, out of device memory after the graphs). `qx_gpu::kernel::seal()`
   makes a later compile fatal; `QX_DS_VERBOSE` logs every compile; the VRAM headroom is `QX_DS_VRAM_RESERVE_MIB`
   (2.5 GiB) and the warm-up prints what is left.
+- **A replay of n_swa tokens does not rebuild the rings (2026-11-06).** A layer's keys at a position come from the
+  layer below's output there, which needs that layer's own 128-wide window: each layer adds 127 positions of
+  warm-up, and the replayed positions rewrite correct store rows with wrong ones. `replay_to` now covers
+  `replay_span()` = 128 + 40 × 127 = 5,208 tokens with the stores' rows saved and put back, and `Parked` carries
+  the rings so an unpark at the parked position replays nothing. Every earlier replay check had replayed from 0.
 - **No `cuEventSynchronize` or `cuEventQuery` from the driver thread while the engine thread records a graph.**
   CubeCL captures in global mode, under which those calls from any thread fail with
   `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` and invalidate the capture. The forced bench captures one width per run
@@ -99,6 +108,34 @@ and a 2.5 GiB headroom (notebook, "a kernel that could not load"). The rules tha
   offender; `OOMPolicy=continue` keeps the surrounding script alive to record it.
 - Never let the session's background-task memory guard see a pinned tier: launch heavy runs detached (`nohup
   setsid`), as `bench.sh` is meant to be run.
+
+## The neighbours' mechanics, from their code (2026-11-06)
+
+Read for the "bridge the gap" plan (families 11-13). Numbers are theirs, on their boxes.
+
+- **Strata prefill** (`~/git/Strata/src/dsv41/ds4_model.cu`): chunks of 8192 rows by default, raised to 16-32K on
+  one GPU when the activations fit (`chunk_default` 3993); layer-major across chunks with the per-chunk state
+  parked in pinned RAM; every expert a chunk touches is streamed **once per (chunk, layer)** through a 0.4-1.2 GB
+  VRAM ring (`flow_pump` 4756) into `set_tc_kernel` (FP16 WMMA tiles, F32 accumulate, `ds4_iq.cu:821`), no CPU
+  expert compute in prefill; dense GEMMs through cuBLAS FP16; the head only for the last 16 rows; and the
+  **prompt skip**: layers 20-39 only for the last 2,668 rows (12915). Their chunk table on one R9700: 1024: 200,
+  2048: 277, 4096: 353, 8192: 431 tok/s. Prefill is **not** bit-identical to their decode ("the two paths round
+  differently", 12445; KL 0.1685 vs 0.1686).
+- **DSpark** (DeepInfer `mtp/dflash.py`, Strata `ds4_model.cu:10748+`, colibri `deepseek_v4_dspark.inc`): a
+  3-block draft model shipped separately (Unsloth `dspark-*-Q8_0.gguf`, `dflash`: experts 128 × 3 used in MXFP4,
+  dense Q8_0, `fc` 5120 → 3×5120 from the trunk's layer 37-39 attention inputs, Markov bias head 2 × [129280, 256]
+  bf16, confidence head). One non-causal pass drafts 5 tokens; the trunk verifies them as one (k+1)-row window;
+  greedy acceptance = longest matching prefix plus the bonus token. Rollback must cover the trunk's SWA rings, the
+  compressor's pending pair and the published index-key slot (colibri 4216-4268); the drafter's own 3 rings need
+  none. Acceptance: Strata 31-32% per draft (1.6 per round; 4×R9700 31 → 55-69 tok/s, 3060 +2-13%, the 4090-48 GB
+  user 16-22 → 40), DeepInfer 3.2 of 5 in production; `--dspark auto` is a *load* decision (off when the routed
+  experts exceed 1.5× free VRAM). colibri's 60% guard over 10 proposals pauses drafting for 64 tokens.
+- **Our own shape** (`crates/qx-engine/src/dsv41/mod.rs`, `kernels/moe.cu`): 384 experts, 6 used; the GPU expert
+  kernels are a GEMV per (token, expert) selection with the token's activations in registers (gate/up one warp per
+  weight row, grid `(2ff/8, k·t)`; down re-quantizes h per block), so an expert's bytes are read once per selection
+  and the per-token HBM traffic (~2.3 GB) does not shrink with width; the CPU pool is per expert over tokens;
+  bit-identity between windows and single steps rests on the per-(row, selection) integer block sums and the
+  in-order float chain `acc += d·dq·isum` (`moe.cu:383-389`), which a grouped kernel can keep.
 
 ## Rejected: with the reason, so they are not retried
 

@@ -1,4 +1,4 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-05)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-06, evening)
 
 ## Goal
 
@@ -6,6 +6,57 @@ Run [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepS
 UD-IQ2_XXS in QuixiInfer on this box, as fast as possible. The results must stay exact against the CPU reference.
 The box has an RTX 5090 (32 GB), a Ryzen 9950X (16 cores), 120 GiB of RAM and a 4 TB NVMe root. The experts live in
 three tiers: VRAM, pinned RAM and the NVMe pack.
+
+## Update 2026-11-06, evening: "bridge the gap" to Strata (prefill), and what the day found
+
+Read `perf/backlog.md` families 9, 11, 12 and 6, `perf/findings.md` "The neighbours' mechanics", and the notebook's
+2026-11-06 entries from "Nsight Compute" on. In short:
+
+- **Decode at 256k:** `qx_ds_idx_score2` (queries in shared memory) is bit-identical to the old indexer scorer
+  and measured decode256k **43.6 ms per token (3/3, spread 3.7%)** against 55-57 with the old kernel; its A/B
+  twin (`QX_DS_IDX_KERNEL=1`, label `idx1`) was running when this was written. Default is the new kernel.
+- **A real exactness bug, fixed in the tree:** `replay_to` rebuilt the rings from 128 tokens; each layer needs
+  127 more positions than the one below, so every mid-stream resume/rewind (state cache, prefix reuse beyond 128
+  tokens) was inexact and overwrote correct store rows. Now `Parked` carries the rings (`QXPK0002`, 20 MB per
+  slot; an unpark at the parked position replays nothing) and a far rewind replays `replay_span()` = 5,208 tokens
+  with the stores' rows saved and restored. Check queued: `QX_DS_REWIND=8192 QX_DS_PARK=8192` on route16k
+  (`replay8k.log`). The perf states must be regenerated (queued, `chain-states2.sh`; also writes the tier ranking
+  `-P.profile` beside each state, which `bench.sh` passes as `QX_DS_PROFILE`: the resumed cases had measured a
+  cold tier, 35-44 ms per token against 22 steady). **No set D baseline is recorded yet**; take it after the
+  states (`touch $S/baseline-go` releases the queued run) and only from a committed tree.
+- **The long-prompt layer skip (family 11), in the tree, checks queued:** windows with `prompt_keep()` = 2,796
+  prompt positions after them run layers 0-19 and layer 20's ring/store/key writes only (`forward_segments_opt(..,
+  kv_only)`; ds-check `QX_DS_SKIP=1`; the server runs prompt-only windows KV-only, `QX_DS_SKIP=0` disables).
+  Exact by construction for every kept position. Check: route16k tail-64 logits with and without must be
+  identical (`skip-on-tail.bin` vs `skip-off-tail.bin`), and the prompt time both ways.
+- **Chunked expert-major prefill (family 12), prototype M1 in the tree, built to `~/qx-bins/chunk`, checks queued
+  (`chain-chunk.sh`):** `DsEngine::forward_chunk(slot, toks)` runs a prompt chunk layer-major: the window kernels
+  over slabs of 128 rows on views of chunk-wide buffers (`ChunkBufs`, allocated at load by `QX_DS_CHUNK=N`), then
+  the layer's experts over every row at once: the driver's `ChunkJob` streams each distinct expert once (VRAM
+  residents' words at once, RAM records through the staging ring over the copy streams, NVMe records in batches
+  of 48 through the landing places), the GPU's per-expert launches wait on the expert's slot word
+  (`qx_moe_wait_word`), run the window kernels indexed by selection lists (`*_sel` variants), and mark progress
+  (`qx_moe_signal`) for the ring's reuse. Eager launches, no graphs, no pool share. Expected to be bit-identical
+  to windows (same kernels, same per-row math); the check compares the tail-64 logits after a 16k prompt in
+  chunks of 1024 and 2048 against the window pass (`chunk1024-tail.bin` vs `skip-off-tail.bin`). If identical,
+  the "chunk of N rows" lines in `chunk1024.log` give the time per row; the window pass is 11-14 ms per token.
+  Not yet: the grouped kernel (reads each expert once per launch instead of per selection; needed past ~2K rows
+  where HBM re-reads dominate), graphs per slab, the pool share, the server's use of it, VRAM borrowing for the
+  chunk buffers (they come off the tier at load).
+- **DSpark (family 6), measured facts, deprioritized:** the drafter GGUF is on the box
+  (`~/models/DeepSeek-V4.1-Flash-1017-GGUF/dspark/`, 8 GB, `dflash`, experts in MXFP4). On this box decode is
+  bandwidth-bound and a 6-row verify window reads ~2.3x the expert bytes of a step; at Strata's 31-32% acceptance
+  on this quant class it does not pay. Measure acceptance before building anything.
+- **Operational lessons of the day:** `/tmp` is tmpfs (RAM): build dirs there plus a concurrent build caused ten
+  global OOM kills of bench runs; build to `~/qx-targets/<name>`, binaries to `~/qx-bins/<name>`, never build
+  during a 100 GiB-tier run (ptxas alone peaks at 10 GB; `QX_SKIP_NVCC=1` skips it when the .cu files are
+  unchanged or hand-checked with nvcc). `pkill -f` with a pattern that appears in the command text kills the
+  shell (again). `sudo -E` drops the environment; ncu was abandoned.
+- **Chains in flight (scratchpad `$S`, markers in `$S/chain-ab.out`):** `chain-ab2.sh` (idx A/B → skip checks →
+  f10 A/B → `CHAIN-AB2-DONE`), `build-chunk.sh` (after `IDX-AB-DONE`), `chain-chunk.sh` (after both; `CHUNK-DONE`,
+  then `touch states-go`), `chain-states2.sh` (states pass, `STATES2-DONE`; then waits for `baseline-go`).
+  Uncommitted: everything above (mod.rs, driver.rs, moe.cu, qx-ds-check.rs, worker_ds.rs, bench.sh, records).
+  Commit the rings/replay fix, the skip and the chunk path only with their checks passed and recorded.
 
 ## Update 2026-11-06, late afternoon: the priority is now performance at 256k context
 
