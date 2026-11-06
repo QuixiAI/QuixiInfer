@@ -5,13 +5,13 @@
 #
 # Cases (the default is the standard set, which a scoreboard row or a baseline must cover):
 #   decode      forced decode of route1k 1024 tokens, ms per token over the last 32        (standard)
-#   prefill64   the same tokens in windows of 64, last 32                                  (standard)
-#   long16k     route16k 16,384 tokens in windows of 64, then 64 single steps: the tail's ms per token (standard);
+#   prefill128  the same tokens in windows of 128 (the server's prompt chunk since 2026-11-06), last 32 (standard)
+#   long16k     route16k 16,384 tokens in windows of 128, then 64 single steps: the last 32 steps' ms per token (standard);
 #               the same run also yields long16k-prefill, the windows' ms per token without the tail
 #   serve       quixiinfer serve, 3 slots, ctx 8192, driven by tools/loadgen.py at concurrency 1 and 3: yields
 #               serve1 and serve3, ms per token of per-request decode (serve3 is standard; serve1 is kept)
 #   prefill32, prefill128   windows of 32 and 128 (not standard)
-# --quick is --cases decode,prefill64: a 5-minute screening run. It can be gated against the baseline case by
+# --quick is --cases decode,prefill128: a 5-minute screening run. It can be gated against the baseline case by
 # case, but not recorded or promoted.
 #
 # Each run writes perf/results/<date>/<label>-<HHMMSS>/ (git-ignored):
@@ -33,7 +33,7 @@ ORIG_ARGS=("$@")
 
 LABEL=run
 REPEATS=3
-CASES=decode,prefill64,long16k,serve
+CASES=decode,prefill128,long16k,serve
 CHECK=0
 BUILD=1
 EXTRA=()
@@ -42,7 +42,7 @@ while [ $# -gt 0 ]; do
     --label) LABEL=$2; shift 2 ;;
     --repeats) REPEATS=$2; shift 2 ;;
     --cases) CASES=$2; shift 2 ;;
-    --quick) CASES=decode,prefill64; shift ;;
+    --quick) CASES=decode,prefill128; shift ;;
     --check) CHECK=1; shift ;;
     --no-build) BUILD=0; shift ;;
     --) shift; EXTRA=("$@"); break ;;
@@ -74,7 +74,7 @@ PORT=${QX_PERF_PORT:-8089}
 # scoreboard (scores are comparable only at the same settings)
 BASE=(QX_DS_PACK="$PACK" QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1)
 SERVE_RAM=${QX_PERF_SERVE_RAM:-95}   # the serve case's RAM tier (GiB); see serve_case
-SERVE_WINDOW=${QX_PERF_SERVE_WINDOW:-64}   # the server's prompt chunk (--window); an experiment knob, recorded in the settings
+SERVE_WINDOW=${QX_PERF_SERVE_WINDOW:-128}   # the server's prompt chunk (--window); an experiment knob, recorded in the settings
 # the tokenizer check (ds-checks line 4) needs llama.cpp's tokenizer binary; without it the check is reported as
 # incomplete, not as passed
 : "${QX_LLAMA_TOKENIZE:=$HOME/git/llama.cpp-dsv41/build-tok/bin/llama-tokenize}"
@@ -130,7 +130,7 @@ fi
 # forced-bench cases: extra env, token file, token count, timeout (s), and the metric perf_diff.py parse extracts
 declare -A ARGS=( [decode]="" [prefill64]="QX_DS_WINDOW=64" [prefill32]="QX_DS_WINDOW=32" [prefill128]="QX_DS_WINDOW=128"
                   [prefill2]="QX_DS_WINDOW=2" [prefill4]="QX_DS_WINDOW=4" [prefill8]="QX_DS_WINDOW=8"
-                  [long16k]="QX_DS_WINDOW=64 QX_DS_TAIL=64" [serve]="" )
+                  [long16k]="QX_DS_WINDOW=128 QX_DS_TAIL=64" [serve]="" )
 declare -A TOKF=( [long16k]="$TOKENS16K" )
 declare -A COUNT=( [long16k]=16384 )
 declare -A TMO=( [long16k]=2400 )

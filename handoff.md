@@ -45,10 +45,24 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   `perf/findings.md` "Rejected elsewhere".
 - **Decision taken by the user (2026-11-06, late morning):** the server's default prompt chunk is 128 with the full
   staged share (`--window 128`, `QX_DS_STAGE_SHARE=8`, `QX_DS_STAGE_CAP=256` as defaults). The harness standard set
-  is now set C (`decode`, `prefill128`, `long16k` in windows of 128, `serve3` at `--window 128`); its baseline
-  (`baseline-setc`) was queued after the fused output projection's measurement (`wo_a-fused`, pinned to the old
-  settings). If `perf/baselines/.../run.json` lacks `serve:window=128`, that baseline did not land: run
-  `perf/harness/bench.sh --check` and promote it.
+  is now set C (`decode`, `prefill128`, `long16k` in windows of 128, `serve3` at `--window 128`); committed as
+  `b543bce`. The queue on the box at the end of the session: a forced 64k pass and two `--ctx 262144` server starts
+  on the committed tree, then the set C baseline (`baseline-setc`), then the 256k patch (staged in the scratchpad
+  as `ctx256k-patch.py` + `rewind-check-patch.py`: ratio-sized stores, replay-based rewind, decay per token)
+  built in place with its bit-identity checks, `tools/ds-checks.sh`, 256k server starts and a forced 256k pass,
+  then the decay A/B. If `perf/baselines/.../run.json` lacks `serve:window=128`, the baseline did not land: run
+  `perf/harness/bench.sh --check` and promote it. If the tree has uncommitted engine changes, they are the 256k
+  patch: verify them (`QX_DS_REWIND=64 QX_DS_PARK=64` on route1k 128 must print 64 / 64 twice; ds-checks exact)
+  before committing.
+- **256k context, facts so far (2026-11-06):** the model allows 1M with YaRN and the engine applies it; a
+  `--ctx 262144` server starts and serves on the committed tree with 1 slot (14.5 GiB tier left) and with 3 slots
+  (9.4 GiB); the compressed stores are 2.7 GB per slot at 256k (1.7 after the ratio sizing in the staged patch).
+  The blockers are the host latent history (21.5 GB per slot; 5.7 GB measured at 64k) and the tier's residency
+  lag after topic shifts (the forced 64k pass: 14 ms per token at 28k, 57 at 36k, decode tail 57 at 64k), which
+  the per-step decay explains (notebook, "Forced 64k pass"). Both fixes are in the staged patch.
+- **A kernel-file change invalidates the driver's PTX JIT cache:** the first run after rebuilding a `.cu` pays a
+  JIT per module at load; the fused `mgemv.cu` took more than 12 minutes in `libnvidia-ptxjitcompiler` and looked
+  like a hang (7 compiles printed, then nothing). Thread dumps tell the two apart. The fusion was reverted.
 - **Where the loop stood before that decision:** the standard-setting levers are measured to their
   ceilings. Decode is pool-bound at the box's DRAM read ceiling (52-59 GB/s measured; the pool runs 44-54); the
   dense GEMVs are 6.7 ms of a 33 ms step at 54% of GPU memory peak with a 2-4% fusion available (family 8,

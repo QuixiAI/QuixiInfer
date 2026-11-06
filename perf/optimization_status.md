@@ -40,29 +40,30 @@ After appending, run `python3 perf/harness/perf_diff.py index perf/optimization_
 
 | date | entry | verdict | line |
 |---|---|---|--:|
-| 2026-11-05 | DeepSeek history before the harness | RECORDED | 68 |
-| 2026-11-05 | Performance scaffolding | LANDED | 87 |
-| 2026-11-05 | First harness baseline | RECORDED | 110 |
-| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 130 |
-| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 143 |
-| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 158 |
-| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 177 |
-| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 200 |
-| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 230 |
-| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 257 |
-| 2026-11-06 | First set B baseline | RECORDED | 289 |
-| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 318 |
-| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 338 |
-| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 360 |
-| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 396 |
-| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 420 |
-| 2026-11-06 | nsys kernel tables of a decode run and a 64-token window run | RECORDED | 443 |
-| 2026-11-06 | Full staged share with a 256-record area at windows of 128: prefill 10.8 ms per token | CANDIDATE | 475 |
-| 2026-11-06 | The 128-chunk bundle on long16k and on the serve case — MIXED, kept as an opt-in | UNLABELED | 502 |
-| 2026-11-06 | The 128-token prompt chunk with the full staged share becomes the default — LANDED (by decision) | UNLABELED | 526 |
-| 2026-11-06 | Adaptive-tier knobs on decode: half-life and eviction margin — REJECTED (defaults confirmed) | UNLABELED | 544 |
-| 2026-11-06 | Adaptive-tier half-life on long16k: the decay was per step, not per token — RECORDED, fix CANDIDATE | UNLABELED | 563 |
-| 2026-11-06 | The fused output projection stalled in the driver's PTX JIT — REVERTED, family 8 blocked | UNLABELED | 584 |
+| 2026-11-05 | DeepSeek history before the harness | RECORDED | 69 |
+| 2026-11-05 | Performance scaffolding | LANDED | 88 |
+| 2026-11-05 | First harness baseline | RECORDED | 111 |
+| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 131 |
+| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 144 |
+| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 159 |
+| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 178 |
+| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 201 |
+| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 231 |
+| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 258 |
+| 2026-11-06 | First set B baseline | RECORDED | 290 |
+| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 319 |
+| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 339 |
+| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 361 |
+| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 397 |
+| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 421 |
+| 2026-11-06 | nsys kernel tables of a decode run and a 64-token window run | RECORDED | 444 |
+| 2026-11-06 | Full staged share with a 256-record area at windows of 128: prefill 10.8 ms per token | CANDIDATE | 476 |
+| 2026-11-06 | The 128-chunk bundle on long16k and on the serve case — MIXED, kept as an opt-in | UNLABELED | 503 |
+| 2026-11-06 | The 128-token prompt chunk with the full staged share becomes the default — LANDED (by decision) | UNLABELED | 527 |
+| 2026-11-06 | Adaptive-tier knobs on decode: half-life and eviction margin — REJECTED (defaults confirmed) | UNLABELED | 545 |
+| 2026-11-06 | Adaptive-tier half-life on long16k: the decay was per step, not per token — RECORDED, fix CANDIDATE | UNLABELED | 564 |
+| 2026-11-06 | The fused output projection stalled in the driver's PTX JIT — REVERTED, family 8 blocked | UNLABELED | 585 |
+| 2026-11-06 | Forced 64k pass: the long-context cost is residency lag after topic shifts | RECORDED | 601 |
 <!-- qx:index:end -->
 
 ## 2026-11-05: DeepSeek history before the harness — RECORDED
@@ -596,3 +597,41 @@ quantization type x four-way unrolled rows) is near some ptxas cliff.
 Open questions: whether the stall is the segment-search reorder or the offset arithmetic (bisect offline);
 whether `-lineinfo` matters; a per-kernel source split (one translation unit per entry) would also cut every
 compile's cost and the 63 MiB NVRTC footprint.
+
+## 2026-11-06: 256k context on the committed tree: the servers start; VRAM is not the blocker — RECORDED
+
+Status: measurement. `quixiinfer serve --ctx 262144` on the committed tree (stores at `max_ctx` rows): one slot
+starts, serves a request, and leaves a 14.5 GiB expert tier (0.86 GiB of device memory free after the 14 warm-up
+graphs); three slots start too, with a 9.4 GiB tier. So a compressed store is 2.7 GB per slot at 256k (4 source
+layers x 262,144 rows x 2,560 B), not the 10.7 GB the morning's audit said (a layer count applied twice); sizing
+by ratio makes it 1.7 GB. What blocks 256k is the host latent history, 21.5 GB per slot (measured growing: 5.7 GB
+at 64k), and the residency lag (next entry); both are in the staged patch. The model's YaRN scaling is applied.
+Decision: the 256k patch proceeds as staged; the earlier "one slot at 256k leaves the usual tier" claim is
+corrected to "three slots at 256k leave 9.4 GiB, one slot 14.5, plus 1 GiB each from the ratio sizing".
+
+## 2026-11-06: Forced 64k pass: the long-context cost is residency lag after topic shifts — RECORDED
+
+Status: measurement on the committed tree (defaults: windows of 128, share 8/8, cap 256), `route-dsv41.tokens`
+65,600 tokens, `QX_DS_TAIL=64`, one slot, 20 / 100 GiB tiers. Cost by position from the `pos N:` lines, with the
+tier shares of each bucket's selections (`poscurve.py` in the session scratchpad; a copy belongs in `perf/harness`):
+
+| position | ms per token | VRAM share | staged | RAM (pool) | NVMe | pool ms per token |
+|--:|--:|--:|--:|--:|--:|--:|
+| 8k | 17.6 | 58% | 32% | 8% | 1.8% | 10.8 |
+| 16k | 14.7 | 59% | 32% | 7% | 1.5% | 9.3 |
+| 28k | 14.3 | 61% | 32% | 6% | 1.3% | 7.6 |
+| 32k | 22.8 | 56% | 32% | 8% | 5.2% | 15.5 |
+| **36k** | **56.6** | **17%** | 33% | **40%** | **9.8%** | 51.1 |
+| 40k | 40.4 | 32% | 33% | 29% | 5.4% | 34.3 |
+| 48k | 26.4 | 51% | 33% | 13% | 3.3% | 16.4 |
+| 56k | 40.6 | 40% | 33% | 19% | 7.3% | 29.6 |
+| 64k | 35.6 | 40% | 33% | 22% | 4.9% | 27.4 |
+
+Reading: the per-token cost tracks the VRAM share, not the position. The trace changes topic around 33-36k; the
+tier's VRAM share collapses from 56% to 17% and takes about 30k tokens to recover, which is exactly the
+per-step decay's effective memory at width 128 (half-life 256 calls = 32,768 tokens). The staged share sits at
+33% throughout: the 256-record area fills every window when the VRAM share is low (the window's distinct misses
+run to three times the cap), and the rest falls to the pool, whose time per token (7.6 to 51) is the whole
+curve. Host memory: the latent history grew to 5.7 GB at 64k (the 21.5 GB per slot at 256k, as computed).
+Decision: the decay-per-token fix (staged) is the experiment for this, and it now runs before the forced 256k
+pass. If it holds, family 4 (long-context cost) is mostly this one bug.
