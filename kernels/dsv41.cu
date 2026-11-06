@@ -427,6 +427,39 @@ extern "C" __global__ void qx_ds_idx_score(const u64* info) {
     if (h == 0) F(9)[(u64)t * info[10] + r] = d;
 }
 
+/// `qx_ds_idx_score` with the same arithmetic, arranged for the memory system (2026-11-06): the token's 32 query
+/// rows go to shared memory once per block, padded to 129 floats so lane h reading q[h][i] hits a distinct bank, and
+/// the key is read as float4 broadcasts (all lanes the same address). Each (row, head) product is still the serial
+/// 128-step chain d += q[i] * key[i] in order, and the head sum the same warp tree, so the scores are bit for bit
+/// the old kernel's. Same info words and grid; 256 threads; 16.5 KB of shared memory.
+extern "C" __global__ void qx_ds_idx_score2(const u64* info) {
+    __shared__ float sq[32 * 129];
+    const u32 t = blockIdx.y, warp = threadIdx.x / 32, h = threadIdx.x % 32, kdim = U(6), ratio = U(5);
+    const u32 pos = reinterpret_cast<const u32*>(info[3])[t], slot = reinterpret_cast<const u32*>(info[4])[t];
+    const u32 nv = (pos + 1) / ratio;
+    if (blockIdx.x * 8 >= nv) return;  // whole block past the visible rows: nothing to load either
+    const float* qt = CF(0) + (u64)t * 32 * kdim;
+    for (u32 i = threadIdx.x; i < 32 * kdim; i += blockDim.x) sq[(i / kdim) * 129 + (i % kdim)] = qt[i];
+    __syncthreads();
+    const u32 r = blockIdx.x * 8 + warp;
+    if (r >= nv) return;
+    const float* key = reinterpret_cast<const float*>(reinterpret_cast<const u64*>(info[2])[slot]) + (u64)r * info[7] + U(8);
+    const float* q = sq + h * 129;
+    float d = 0.f;
+    const u32 k4 = kdim / 4;
+    for (u32 i = 0; i < k4; ++i) {
+        const float4 kv = reinterpret_cast<const float4*>(key)[i];
+        d += q[4 * i] * kv.x;
+        d += q[4 * i + 1] * kv.y;
+        d += q[4 * i + 2] * kv.z;
+        d += q[4 * i + 3] * kv.w;
+    }
+    for (u32 i = k4 * 4; i < kdim; ++i) d += q[i] * key[i];
+    d = fmaxf(d, 0.f) * (CF(1)[(u64)t * 32 + h] * __uint_as_float(U(11)));
+    d = warp_sum(d);
+    if (h == 0) F(9)[(u64)t * info[10] + r] = d;
+}
+
 /// Block maxima for the candidate selection: bmax[b] = max of scores[8b .. 8b+8) over the visible rows, plus 1e30 on
 /// the block of the newest visible row. info: [0] scores (T x max_rows), [1] bmax out (T x max_blocks), [2]
 /// positions, [3] ratio, [4] block size, [5] max_rows, [6] max_blocks. Grid (ceil(max_blocks / 256), T).

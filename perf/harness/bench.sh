@@ -68,6 +68,7 @@ PACK=${QX_DS_PACK:-$D/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp}
 TOKENS=perf/data/route1k.tokens
 TOKENS16K=perf/data/route16k.tokens
 TOKENS256K=perf/data/wiki256k.tokens
+STATES=perf/states   # the saved 256k states the set D cases resume from (perf/states/README.md)
 B=target/release/qx-ds-check
 SERVER=target/release/quixiinfer
 PORT=${QX_PERF_PORT:-8089}
@@ -134,7 +135,6 @@ fi
 # set D (2026-11-06, performance at 256k): decode256k resumes a saved 262,144-token state and runs the remaining
 # 64 tokens as single steps; prefill256k resumes the 245,760-token state and runs the last 16,384 tokens in windows
 # of 128; serve256k is the server at --ctx 262144. The states come from one full pass (perf/states/README.md).
-STATES=perf/states
 declare -A ARGS=( [decode]="" [prefill64]="QX_DS_WINDOW=64" [prefill32]="QX_DS_WINDOW=32" [prefill128]="QX_DS_WINDOW=128"
                   [prefill2]="QX_DS_WINDOW=2" [prefill4]="QX_DS_WINDOW=4" [prefill8]="QX_DS_WINDOW=8"
                   [long16k]="QX_DS_WINDOW=128 QX_DS_TAIL=64" [serve]="" [serve256k]=""

@@ -40,35 +40,36 @@ After appending, run `python3 perf/harness/perf_diff.py index perf/optimization_
 
 | date | entry | verdict | line |
 |---|---|---|--:|
-| 2026-11-05 | DeepSeek history before the harness | RECORDED | 74 |
-| 2026-11-05 | Performance scaffolding | LANDED | 93 |
-| 2026-11-05 | First harness baseline | RECORDED | 116 |
-| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 136 |
-| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 149 |
-| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 164 |
-| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 183 |
-| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 206 |
-| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 236 |
-| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 263 |
-| 2026-11-06 | First set B baseline | RECORDED | 295 |
-| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 324 |
-| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 344 |
-| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 366 |
-| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 402 |
-| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 426 |
-| 2026-11-06 | nsys kernel tables of a decode run and a 64-token window run | RECORDED | 449 |
-| 2026-11-06 | Full staged share with a 256-record area at windows of 128: prefill 10.8 ms per token | CANDIDATE | 481 |
-| 2026-11-06 | The 128-chunk bundle on long16k and on the serve case — MIXED, kept as an opt-in | UNLABELED | 508 |
-| 2026-11-06 | The 128-token prompt chunk with the full staged share becomes the default — LANDED (by decision) | UNLABELED | 532 |
-| 2026-11-06 | Adaptive-tier knobs on decode: half-life and eviction margin — REJECTED (defaults confirmed) | UNLABELED | 550 |
-| 2026-11-06 | Adaptive-tier half-life on long16k: the decay was per step, not per token — RECORDED, fix CANDIDATE | UNLABELED | 569 |
-| 2026-11-06 | The fused output projection stalled in the driver's PTX JIT — REVERTED, family 8 blocked | UNLABELED | 590 |
-| 2026-11-06 | 256k context on the committed tree: the servers start; VRAM is not the blocker | RECORDED | 606 |
-| 2026-11-06 | Forced 64k pass: the long-context cost is residency lag after topic shifts | RECORDED | 617 |
-| 2026-11-06 | Set C baseline (the 128-token chunk as default) | RECORDED | 644 |
-| 2026-11-06 | The tier's score decay per token (was per step) | LANDED | 664 |
-| 2026-11-06 | The first forced 256k pass (decay per token): decode at 256k is 56 ms per token, GPU-side growth | RECORDED | 692 |
-| 2026-11-06 | The state cache: save a slot after a pass, resume it later, bit for bit — LANDED (tooling) | UNLABELED | 721 |
+| 2026-11-05 | DeepSeek history before the harness | RECORDED | 75 |
+| 2026-11-05 | Performance scaffolding | LANDED | 94 |
+| 2026-11-05 | First harness baseline | RECORDED | 117 |
+| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 137 |
+| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 150 |
+| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 165 |
+| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 184 |
+| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 207 |
+| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 237 |
+| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 264 |
+| 2026-11-06 | First set B baseline | RECORDED | 296 |
+| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 325 |
+| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 345 |
+| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 367 |
+| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 403 |
+| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 427 |
+| 2026-11-06 | nsys kernel tables of a decode run and a 64-token window run | RECORDED | 450 |
+| 2026-11-06 | Full staged share with a 256-record area at windows of 128: prefill 10.8 ms per token | CANDIDATE | 482 |
+| 2026-11-06 | The 128-chunk bundle on long16k and on the serve case — MIXED, kept as an opt-in | UNLABELED | 509 |
+| 2026-11-06 | The 128-token prompt chunk with the full staged share becomes the default — LANDED (by decision) | UNLABELED | 533 |
+| 2026-11-06 | Adaptive-tier knobs on decode: half-life and eviction margin — REJECTED (defaults confirmed) | UNLABELED | 551 |
+| 2026-11-06 | Adaptive-tier half-life on long16k: the decay was per step, not per token — RECORDED, fix CANDIDATE | UNLABELED | 570 |
+| 2026-11-06 | The fused output projection stalled in the driver's PTX JIT — REVERTED, family 8 blocked | UNLABELED | 591 |
+| 2026-11-06 | 256k context on the committed tree: the servers start; VRAM is not the blocker | RECORDED | 607 |
+| 2026-11-06 | Forced 64k pass: the long-context cost is residency lag after topic shifts | RECORDED | 618 |
+| 2026-11-06 | Set C baseline (the 128-token chunk as default) | RECORDED | 645 |
+| 2026-11-06 | The tier's score decay per token (was per step) | LANDED | 665 |
+| 2026-11-06 | The first forced 256k pass (decay per token): decode at 256k is 56 ms per token, GPU-side growth | RECORDED | 693 |
+| 2026-11-06 | The state cache: save a slot after a pass, resume it later, bit for bit — LANDED (tooling) | UNLABELED | 722 |
+| 2026-11-06 | nsys of a resumed 256k decode step: the indexer scorer is the 256k penalty | RECORDED | 738 |
 <!-- qx:index:end -->
 
 ## 2026-11-05: DeepSeek history before the harness — RECORDED
@@ -733,3 +734,30 @@ Effect: a 256k decode or late-prefill measurement costs a 1.3 GB state read, a 1
 themselves (minutes) instead of a 94-minute pass per repeat. Set D is built on it (`decode256k`, `prefill256k`).
 Decision: landed. The states live in `perf/states/` (git-ignored), regenerated by one full pass
 (`perf/states/README.md`); the first one is running.
+
+## 2026-11-06: nsys of a resumed 256k decode step: the indexer scorer is the 256k penalty — RECORDED
+
+Status: measurement (set D tooling: `QX_DS_LOAD_STATE=perf/states/wiki256k-262144.state`, 64 single steps at
+262,144, `nsys profile -t cuda --cuda-graph-trace=node`; 89 ms per step under the profiler against 55-56 without).
+
+| kernel | share of GPU time | calls per step | mean per call |
+|---|--:|--:|--:|
+| `qx_moe_wait_staged` + `qx_moe_wait` (the GPU waiting for the pool and the staging) | 48% | 80 | 0.3-2.2 ms |
+| **`qx_ds_idx_score`** (the lightning indexer scoring every visible compressed row) | **33%** | **8** | **8.8 ms** |
+| `qx_mgemv_t8` + `qx_mgemv` (dense GEMVs) | 6.3% | | |
+| `qx_ds_attn_part` + `merge` | 2.6% | 44 | 99 + 28 us |
+| `qx_ds_topk` | 1.2% | 9 | 289 us |
+| the candidate kernels (`block_max`, `mark_blocks`, `cand_mask`, `zero_u32`) | under 0.1% | | 1-4 us |
+
+Reading: eight indexer layers each score 131k-262k keys per token; a call reads at most 134 MB of keys and does
+one GFLOP, 0.1 ms at the 5090's bandwidth, and takes 8.8 ms: two orders of magnitude off, and the entire
+position-proportional cost of decode at 256k (34 at 1k against 56). The top-k, which the arithmetic suspected,
+is 0.3 ms per call. The kernel's shape explains it: one warp per key row, lane h computing head h's 128-step dot
+product with its own 512-byte query row from global memory, so every iteration of every warp touches 32 distinct
+cache lines for the queries and one for the key.
+Decision: backlog family 9 aims at `qx_ds_idx_score`. `qx_ds_idx_score2` (staged in the tree behind
+`QX_DS_IDX_KERNEL`, default 2): the 32 query rows in shared memory padded to 129 floats (bank-conflict-free per
+lane), float4 key broadcasts, the same per-element FMA order and the same warp tree, so the scores are bit for
+bit the old kernel's (line 3 of ds-checks and the resume checks prove it at 1k; the 256k tail dump
+`straight256k-tail.bin` proves it at 256k). An Nsight Compute capture of the old kernel is queued for the
+record. Expected: decode at 256k from 56 toward about 30 ms per token, prefill at 246k from 28 toward 15.

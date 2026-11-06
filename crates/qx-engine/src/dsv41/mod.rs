@@ -128,6 +128,10 @@ struct Scratch {
     tok: DeviceBuf,
     pos: DeviceBuf,
     slot: DeviceBuf,
+    /// Host-mapped staging for the three per-step inputs above (ids, positions, slots: DS_TMAX u32 each): the host
+    /// writes them and a copy kernel moves them in stream order, so a step never synchronizes the whole context
+    /// (a synchronous upload waited for the driver's in-flight promotion copies: 1.4-7 ms a step at 256k, 2026-11-06).
+    in_host: qx_gpu::mem::HostMapped,
     r: DeviceBuf,
     rn: DeviceBuf,
     e: DeviceBuf,
@@ -457,6 +461,7 @@ impl<'a> DsEngine<'a> {
             tok: buf(tm),
             pos: buf(tm),
             slot: buf(tm),
+            in_host: qx_gpu::mem::HostMapped::new(3 * tm * 4),
             r: buf(hcd * tm),
             rn: buf(hcd * tm),
             e: buf(E * tm),
@@ -1302,9 +1307,23 @@ impl<'a> DsEngine<'a> {
         let pos_min = positions.iter().copied().min().unwrap() as usize;
         let pos_max = positions.iter().copied().max().unwrap() as usize;
         let tp = std::time::Instant::now();
-        self.s.tok.upload(&ids);
-        self.s.pos.upload(&positions);
-        self.s.slot.upload(&slots_v);
+        // QX_DS_SYNC_UPLOADS=1 restores the synchronous uploads (each ends in cuCtxSynchronize) for an A/B
+        static SYNC_UPLOADS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SYNC_UPLOADS.get_or_init(|| std::env::var("QX_DS_SYNC_UPLOADS").is_ok_and(|v| v == "1")) {
+            self.s.tok.upload(&ids);
+            self.s.pos.upload(&positions);
+            self.s.slot.upload(&slots_v);
+        } else {
+            // the previous forward synced, so nothing reads the staging or the three buffers now; the copies run on
+            // the compute stream ahead of this window's kernels (and ahead of a graph replay)
+            let tm = DS_TMAX;
+            self.s.in_host.slice::<u32>(0, t).copy_from_slice(&ids);
+            self.s.in_host.slice::<u32>(tm * 4, t).copy_from_slice(&positions);
+            self.s.in_host.slice::<u32>(2 * tm * 4, t).copy_from_slice(&slots_v);
+            for (i, dst) in [&self.s.tok, &self.s.pos, &self.s.slot].into_iter().enumerate() {
+                self.k("qx_ds_copy_f32", 256, ((t as u32).div_ceil(256), 1, 1), &[self.s.in_host.dptr + (i * tm * 4) as u64, dst.ptr, t as u64]);
+            }
+        }
         self.t_phase[0] = tp.elapsed().as_secs_f64();
         // the Engram rows of every Engram layer and token, gathered on the host into the mapped regions
         // (region ei holds token n's rows at n * cols * dim) before any launch
@@ -1505,7 +1524,10 @@ impl<'a> DsEngine<'a> {
                 if w.has_idx_q {
                     self.rope(self.s.iq.ptr, c.idx_heads, c.idx_dim, c.idx_dim - c.n_rot, comp, 0, false, t);
                     let max_rows = self.max_rows as u64;
-                    self.k("qx_ds_idx_score", 256, ((self.max_rows as u32).div_ceil(8), tt, 1), &[self.s.iq.ptr, self.s.iw.ptr, store_table, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, c.idx_dim as u64, row as u64, c.head_dim as u64, self.s.scores.ptr, max_rows, bits(1.0 / ((c.idx_heads * c.idx_dim) as f32).sqrt())]);
+                    // QX_DS_IDX_KERNEL=1 keeps the original scorer; 2 (default) the shared-memory one, bit-identical
+                    static IDX_KERNEL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+                    let idx_entry = *IDX_KERNEL.get_or_init(|| if std::env::var("QX_DS_IDX_KERNEL").is_ok_and(|v| v == "1") { "qx_ds_idx_score" } else { "qx_ds_idx_score2" });
+                    self.k(idx_entry, 256, ((self.max_rows as u32).div_ceil(8), tt, 1), &[self.s.iq.ptr, self.s.iw.ptr, store_table, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, c.idx_dim as u64, row as u64, c.head_dim as u64, self.s.scores.ptr, max_rows, bits(1.0 / ((c.idx_heads * c.idx_dim) as f32).sqrt())]);
                     dump(format!("idx_score-{l}"), &self.s.scores, n_visible, &mut act);
                     let (sb, cb) = self.st.sels[l].as_ref().unwrap();
                     let bs = c.cand_bs.max(1);

@@ -9,6 +9,12 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
 
 ## Update 2026-11-06, late afternoon: the priority is now performance at 256k context
 
+- **Uncommitted in the tree (an experiment in flight):** family 10, the per-step token/position/slot uploads
+  through a host-mapped staging buffer and `qx_ds_copy_f32` instead of synchronous uploads that end in
+  `cuCtxSynchronize` (`dsv41/mod.rs`, `in_host`; `QX_DS_SYNC_UPLOADS=1` restores the old path). Built into a
+  separate target dir; its A/B (`f10-sync` against `f10-async` on `decode256k` and `serve256k`) is queued after
+  the set D baseline. Land it only if the A/B clears 3% on either and `tools/ds-checks.sh` stays exact.
+
 - The user reset the goal: maximize performance at 256k (`goal-prompt.md`, rewritten; read it first). Short-context
   numbers (set C baseline 34.621) become guards. The queued set C re-take was cancelled; the decay fix's win is
   recorded from its A/B (long16k 38.5 to 33.8).
