@@ -50,8 +50,8 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   on the committed tree, then the set C baseline (`baseline-setc`), then the 256k patch (staged in the scratchpad
   as `ctx256k-patch.py` + `rewind-check-patch.py`: ratio-sized stores, replay-based rewind, decay per token)
   built in place with its bit-identity checks, `tools/ds-checks.sh`, 256k server starts and a forced 256k pass,
-  then the decay A/B. If `perf/baselines/.../run.json` lacks `serve:window=128`, the baseline did not land: run
-  `perf/harness/bench.sh --check` and promote it. If the tree has uncommitted engine changes, they are the 256k
+  then the decay A/B. The set C baseline landed: **34.621** (decode 34.0, prefill128 11.0, long16k 38.8, serve3 99.0),
+  promoted, with `serve:window=128` in its `run.json`. If the tree has uncommitted engine changes, they are the 256k
   patch: verify them (`QX_DS_REWIND=64 QX_DS_PARK=64` on route1k 128 must print 64 / 64 twice; ds-checks exact)
   before committing.
 - **256k context, facts so far (2026-11-06):** the model allows 1M with YaRN and the engine applies it; a
