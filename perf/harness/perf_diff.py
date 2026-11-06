@@ -63,10 +63,14 @@ RE_TAIL = re.compile(r"^decode tail of (\d+) single steps at position (\d+)\+: "
 RE_TAIL_PHASES = re.compile(r"phases per step: engram " + NUM + r" ms, uploads " + NUM + r", launch/replay " + NUM
                             + r", device wait " + NUM + r", history flush " + NUM + r", logits download " + NUM)
 # tools/loadgen.py's table: conc reqs tokens prompt wall agg per-req ttft_med ttft_p90
+RE_SCHED_PHASES = re.compile(r"sched: per step over the last (\d+): forward " + NUM + r" ms \(engram " + NUM + r", uploads " + NUM
+                             + r", launch/replay " + NUM + r", device wait " + NUM + r", history flush " + NUM + r", logits download " + NUM
+                             + r"\), (?:between forwards|outside the engine) " + NUM)
+RE_REQ_TIERS = re.compile(r"^req: .*? vram (\d+) staged (\d+) pcie (\d+) ram (\d+) nvme (\d+)", re.M)
 RE_LOADGEN = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+" + NUM + r"\s+" + NUM + r"\s+" + NUM + r"\s+" + NUM + r"\s+" + NUM + r"\s*$", re.M)
 
 
-def parse_log(text, metric="last32"):
+def parse_log(text, metric="last32", server_text=None):
     """One results row from an engine log. `metric` picks the number that becomes `value`:
     last32    ms per token over the last 32 tokens (decode and prefill windows alike)
     tail      the QX_DS_TAIL single steps' ms per token (decode at a long context)
@@ -87,6 +91,30 @@ def parse_log(text, metric="last32"):
         row["panicked"] = "panicked" in text or "Traceback" in text
         if row["value"]:
             row["tok_s"] = round(1000.0 / row["value"], 2)
+        if server_text:
+            # the server's QX_SCHED_STATS lines: the last per-step phase line and the last cumulative tier counters
+            ph = None
+            for ph in RE_SCHED_PHASES.finditer(server_text):
+                pass
+            if ph:
+                row["step_phases_ms"] = dict(zip(["forward", "engram", "uploads", "launch_replay", "device_wait", "history_flush",
+                                                  "logits_download", "outside_engine"], map(float, ph.groups()[1:])))
+                row["step_phases_ms"]["steps"] = int(ph.group(1))
+            rq = None
+            for rq in RE_REQ_TIERS.finditer(server_text):
+                pass
+            if rq:
+                g = list(map(int, rq.groups()))
+                tot = max(g[0] + g[1] + g[2] + g[3] + g[4], 1)
+                row["tiers_cumulative"] = {"vram": g[0], "staged": g[1], "pcie": g[2], "ram": g[3], "nvme": g[4],
+                                           "vram_share": round(g[0] / tot, 4), "staged_share": round(g[1] / tot, 4),
+                                           "ram_share": round(g[3] / tot, 4), "nvme_share": round(g[4] / tot, 4)}
+            w = None
+            for w in re.finditer(r"window widths (\{[^}]*\})", server_text):
+                pass
+            if w:
+                row["window_widths"] = w.group(1)
+            row["panicked"] = row["panicked"] or "panicked" in server_text or "fatal:" in server_text
         return row
     m = RE_DECODE.search(text)
     if m:
@@ -134,7 +162,10 @@ def parse_log(text, metric="last32"):
 def cmd_parse(a):
     text = Path(a.log).read_text(errors="replace")
     row = {"schema": SCHEMA, "case": a.case, "repeat": a.repeat, "exit": a.exit, "log": str(a.log)}
-    row.update(parse_log(text, a.metric))
+    # a serve case's companion server log sits next to the loadgen log as <name>.server.log
+    companion = Path(str(a.log)[: -len(".log")] + ".server.log") if str(a.log).endswith(".log") else None
+    server_text = companion.read_text(errors="replace") if companion and companion.exists() else None
+    row.update(parse_log(text, a.metric, server_text))
     print(json.dumps(row))
 
 

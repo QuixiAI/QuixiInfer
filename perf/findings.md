@@ -40,6 +40,7 @@ were 20-21 GiB VRAM and 88-100 GiB RAM. The settings before 2026-11-04 differ fr
 | Windows of up to 128 tokens, pool reads each expert once per window | prefill 34 to 21.8 ms per token at windows of 64 | 2026-11-04 |
 | DMA-staged GPU share of RAM misses (6/8 windows, 3/8 decode, 96-record area, 4 streams, deduplicated) | prefill64 21.8 to 11.8 ms per token (1.85x), decode 31.4; bit-identical | 2026-11-04 |
 | Fixed window widths (`WIDTHS`) captured at server warm-up | removes 0.9 s capture stalls from requests | 2026-11-04 |
+| The window staged share (6/8) from width 2 instead of 8 (`QX_DS_STAGE_WIDE_MIN`) | -4.7% per position at width 2, -8.2% at width 4 (forced, outside noise); serve3 -2.9%, within noise: KEPT, not a scoreboard win | 2026-11-06 |
 
 ## Correctness rules learned the hard way
 
@@ -109,7 +110,10 @@ and a 2.5 GiB headroom (notebook, "a kernel that could not load"). The rules tha
   needed for windows, but more launch-count work will not pay.
 - **Prefill windows of 128 lose to 64 with staging (2026-11-04).** They ran 14.6 against 11.8 ms per token,
   because a window's distinct experts overflow the 96-record staging area and the rest fall back to the pool.
-  64 stays the prompt chunk.
+  64 stays the prompt chunk. **Confirmed and bounded on 2026-11-06:** with a 192-record area, 128 ties 64
+  (12.1 against 12.3-12.4, within noise) at a cost of 0.9 GiB of VRAM; neither width nor capacity beats 64's
+  12.3. Prefill at 64 is bound by the copies and the GPU expert kernels, with the pool at 11 ms per token
+  overlapped. Backlog family 5 closed.
 - **A staged share above 6/8 for windows makes no difference (2026-11-04).** 7/8 measured 11.8 and 8/8 11.6,
   against 11.8 at 6/8. That is inside the noise, and the limit moves to the copies and the GPU expert kernels.
 - **A decode staged share of 4/8 makes no difference (2026-11-04).** It measured 31.2 against 31.4 ms at 3/8,

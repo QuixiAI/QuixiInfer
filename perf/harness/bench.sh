@@ -148,7 +148,7 @@ serve_case() {
   # QX_DS_RAM=90 for the server, not the forced bench's 100: at 100 the server's RSS is 111 GB on a 120 GiB box
   # (102.5 GB pinned tier, 1.9 GB anonymous, 6.7 GB file-backed), and under memory pressure its anonymous memory
   # grows to 9-15 GB until an OOM kill (2026-11-06, perf/findings.md "Operating envelope"). The later env entry wins.
-  local srv=(env "${BASE[@]}" QX_DS_RAM="${QX_PERF_SERVE_RAM:-90}" "${EXTRA[@]}" $SERVER serve --model "$M" --pack "$PACK"
+  local srv=(env "${BASE[@]}" QX_DS_RAM="${QX_PERF_SERVE_RAM:-90}" QX_SCHED_STATS=1 "${EXTRA[@]}" $SERVER serve --model "$M" --pack "$PACK"
              --ctx 8192 --slots 3 --window 64 --host 127.0.0.1 --port "$PORT")
   cmds+=("${srv[*]} ; python3 tools/loadgen.py --url http://127.0.0.1:$PORT/v1 --levels 1,3 --rounds 2 --max-tokens 256 --temperature 0 --warmup 6")
   "${srv[@]}" > "$slog" 2>&1 &

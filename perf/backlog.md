@@ -44,6 +44,11 @@ invented one. The aggregate score lives in `scoreboard.md`.
 - **Next action:** after family 1, measure the `serve` case's per-request decode against the forced bench at the
   same tier settings. Split the difference with the counters into NVMe, pool and GPU, and the windows' distinct
   experts per token.
+- **Measured 2026-11-06** (notebook, "Where a serve3 step goes"): a serve3 step is 104 ms, device wait 97-103,
+  pool 96 of which NVMe wait 31 and staging wait 13.6; host overhead under 1 ms. Shares VRAM 61 / staged 24 / RAM
+  11 / NVMe 3.9%. Residency it is. Running: `QX_DS_PROMOS=64`, `QX_DS_STAGE_SHARE=4` on the serve case. Next
+  code lever: family 3's store sizing (VRAM back to the tier), then per-layer NVMe prefetch if the wait is
+  latency-bound. Also open: prefix reuse reports 0 on repeated prompts.
 - **Kill criteria:** the gap is still unexplained by counters after two measurement passes. A residency change
   that does not lift the `serve` per-request decode by 8% also fires the kill.
 
@@ -95,6 +100,10 @@ invented one. The aggregate score lives in `scoreboard.md`.
   `bench.sh --cases prefill64,prefill128 -- QX_DS_STAGE_CAP=N`, within the VRAM family 3 frees.
 - **Kill criteria:** no width and capacity setting beats 11.8 by 8%. Prefill is then copy-bound at about 14-25 GB/s,
   and further gains need the NVMe tier changed.
+- **Killed 2026-11-06** (notebook, "Staging area 192 records"): cap 192 makes windows of 128 tie 64 (12.1 against
+  12.3) and does nothing at 64; nothing beats 64 by the bar. The remaining prefill lever is the GPU side of a
+  window (the grouped expert kernels and the staging copies), which belongs to family 7's EXPDEC-style idea with
+  an nsys table first.
 
 ### 6. Long shot: the economics of a verify window (DSpark-style drafting), measurement first
 

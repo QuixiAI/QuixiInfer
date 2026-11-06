@@ -220,6 +220,14 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         let mut waiting: std::collections::VecDeque<Job> = Default::default();
         let mut running: Vec<Req> = Vec::new();
         let mut steps = 0usize;
+        // per-step timing for the `sched:` line (QX_SCHED_STATS): the engine's forward time and its phases, the
+        // Engram gather, and the wall time between forwards (sampling, detokenizing, the HTTP side)
+        let mut acc_fwd = 0f64;
+        let mut acc_phase = [0f64; 5];
+        let mut acc_engram = 0f64;
+        let mut acc_wall = 0f64;
+        let mut acc_steps = 0usize;
+        let mut last_step_end: Option<std::time::Instant> = None;
         loop {
             if running.is_empty() && waiting.is_empty() {
                 match rx.recv() {
@@ -300,6 +308,20 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             *width_hist.entry(segs.len()).or_default() += 1;
             let out = eng.forward_segments(&segs, None);
             steps += 1;
+            if stats {
+                let now = std::time::Instant::now();
+                if let Some(t) = last_step_end {
+                    // the step period less the engine's own time: what the host spent outside the forward
+                    acc_wall += (now.duration_since(t).as_secs_f64() - eng.t_forward).max(0.0);
+                }
+                acc_fwd += eng.t_forward;
+                acc_engram += eng.t_engram;
+                for (a, v) in acc_phase.iter_mut().zip(eng.t_phase.iter()) {
+                    *a += v;
+                }
+                acc_steps += 1;
+                last_step_end = Some(now);
+            }
             let mut row = 0;
             for &(ri, n, samples) in &plan {
                 let r = &mut running[ri];
@@ -359,6 +381,22 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             }
             if stats && (steps % 200 == 0 || running.is_empty()) {
                 eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}", running.len(), waiting.len(), width_hist);
+                if acc_steps > 0 {
+                    let k = acc_steps as f64 / 1e3;
+                    // the wall between forwards is everything outside the engine: host sampling, detokenizing,
+                    // event sends and the scheduler; forward = the engine's own time per step
+                    eprintln!(
+                        "sched: per step over the last {acc_steps}: forward {:.2} ms (engram {:.2}, uploads {:.2}, launch/replay {:.2}, device wait {:.2}, history flush {:.2}, logits download {:.2}), outside the engine {:.2} ms",
+                        acc_fwd / k, acc_engram / k, acc_phase[0] / k, acc_phase[1] / k, acc_phase[2] / k, acc_phase[3] / k, acc_phase[4] / k,
+                        acc_wall / (acc_steps.saturating_sub(1).max(1) as f64 / 1e3)
+                    );
+                    acc_fwd = 0.0;
+                    acc_engram = 0.0;
+                    acc_phase = [0.0; 5];
+                    acc_wall = 0.0;
+                    acc_steps = 0;
+                    last_step_end = None;
+                }
             }
             if let Some(path) = &opt.profile_out {
                 if running.is_empty() && last_save.is_none_or(|t| t.elapsed().as_secs() >= 60) {

@@ -40,17 +40,20 @@ After appending, run `python3 perf/harness/perf_diff.py index perf/optimization_
 
 | date | entry | verdict | line |
 |---|---|---|--:|
-| 2026-11-05 | DeepSeek history before the harness | RECORDED | 56 |
-| 2026-11-05 | Performance scaffolding | LANDED | 75 |
-| 2026-11-05 | First harness baseline | RECORDED | 98 |
-| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 118 |
-| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 131 |
-| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 146 |
-| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 165 |
-| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 188 |
-| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 218 |
-| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 245 |
-| 2026-11-06 | First set B baseline | RECORDED | 277 |
+| 2026-11-05 | DeepSeek history before the harness | RECORDED | 59 |
+| 2026-11-05 | Performance scaffolding | LANDED | 78 |
+| 2026-11-05 | First harness baseline | RECORDED | 101 |
+| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 121 |
+| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 134 |
+| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 149 |
+| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 168 |
+| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 191 |
+| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 221 |
+| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 248 |
+| 2026-11-06 | First set B baseline | RECORDED | 280 |
+| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 309 |
+| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 329 |
+| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 351 |
 <!-- qx:index:end -->
 
 ## 2026-11-05: DeepSeek history before the harness — RECORDED
@@ -302,3 +305,81 @@ Open questions: serve3's per-request decode is 2.9x the forced decode step (95 a
 one window should cost about a width-3 window (about 23 ms per position at width 2, 19 at width 4, so roughly 60
 ms per step, 20 per token), yet each request sees 95 ms per token. Family 2's first measurement should split a
 serve3 step with the server's counters (the `sched:` and `req:` lines) rather than guess.
+
+## 2026-11-06: Staged share 6/8 from width 2: the serve3 A/B — KEPT
+
+Status: kept behind `QX_DS_STAGE_WIDE_MIN` (default 2); concludes the CANDIDATE entry above.
+Change (one factor): `QX_DS_STAGE_WIDE_MIN=8` (the old behaviour) against the default 2, serve case only, 3 repeats
+each, same binary, back to back (`serve-widemin8`, `serve-widemin2`).
+
+| case | threshold 8 | threshold 2 | change | spreads (8 / 2) |
+|---|--:|--:|--:|--:|
+| serve3 (scored) | 98.04 | 95.24 | -2.9% | 3.0% / 0.9% |
+| serve1 | 40.49 | 39.68 | -2.0% | 3.5% / 2.8% |
+
+The set B baseline (threshold 2) measured serve3 95.24 as well, so the number is stable; the gain is in the
+measured direction but under the 3% bar and inside the noisier arm's spread.
+Decision: KEPT, not LANDED as a serve3 win. The default stays 2 because the direct measurements at widths 2 and 4
+cleared their bars outside the noise (-4.7%, -8.2% per position) and nothing regressed; the scoreboard effect
+through serve3 is under 1% and is not claimed. Why serve3 moves less than width 4 did: a serve3 step is a width-3
+window, where the share's gain was -4.7% at width 2, and the step's cost is dominated by things the share does
+not touch (the next entry, the phase decomposition, says which).
+Open questions: none for this knob; 5/8 and 7/8 at narrow widths stay in family 7's list.
+
+## 2026-11-06: Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED
+
+Status: measurement concluded; backlog family 5 closed on its kill criterion.
+Bottleneck hypothesis: windows of 128 lost to 64 (14.6 against 11.8 on 2026-11-04) because a window's distinct
+experts overflow the 96-record staging area and the rest fall to the pool; a 192-record area would let 128 win.
+Change (one factor): `QX_DS_STAGE_CAP=192` against the default 96, `--cases prefill64,prefill128`, 3 repeats each,
+same binary, back to back (`stagecap96`, `stagecap192`).
+
+| case | cap 96 | cap 192 | change | spreads (96 / 192) | pool ms/token (96 / 192) |
+|---|--:|--:|--:|--:|--:|
+| prefill64 | 12.30 | 12.40 | +0.8% | 1.6% / 1.6% | 14.3 / 11.0 |
+| prefill128 | 15.40 | 12.10 | -21.4% | 2.6% / 0.0% | 27.1 / 19.8 |
+
+Decision: the hypothesis is confirmed (128 catches up exactly when the area has room) and the family's target is
+missed: no width and capacity setting beats prefill64's 12.3 by 8%, or at all (12.1 at 128 is within the
+noise). The prompt chunk stays 64 and the cap stays 96: 192 records cost about 0.9 GiB of VRAM, about 100
+resident experts in serving, for a tie. Prefill at 64 is now bound by the staging copies and the GPU expert
+kernels, not by the pool (11 ms per token of pool against 12.3 total with the pool overlapped).
+Rejected alternatives: raising the window share above 6/8 (measured flat on 2026-11-04).
+Open questions: the GPU side of a 64-token window (the multi-GEMV over `slots`/`slots_stg`, the copies) is the
+remaining lever: an nsys table of one window, and family 7's shared-memory grouped kernel idea.
+
+## 2026-11-06: Where a serve3 step goes: pool-bound on residency, not host overhead — RECORDED
+
+Status: measurement for backlog family 2 (the serving gap). The server now prints per-step phases and the
+harness records them with the serve rows (`step_phases_ms`, `tiers_cumulative`, `window_widths`).
+Run: `serve-phases` (one repeat of the serve case, `QX_SCHED_STATS=1`), same binary as the set B baseline; its
+serve3 reproduced the baseline exactly (95.24 ms per token).
+
+Per step, three decoders in one width-3 window (the last 200 steps of the concurrency-3 phase):
+
+| part | ms per step | source |
+|---|--:|---|
+| engine forward | 104-110 | `sched:` phases |
+| of which device wait | 97-103 | the GPU waiting for the driver (pool and staging) |
+| of which uploads, launch, flush, download | about 1 | |
+| host outside the engine (sampling, detokenizing, events, scheduler) | under 1 | step period less forward |
+| pool time (the driver's counter, per step) | 96 | `req:` counters, deltas over the 200 steps |
+| of which NVMe fetch wait | 31 | |
+| of which staging-copy wait | 13.6 | |
+
+Tier shares over the run: VRAM 61%, staged 24%, RAM 11%, NVMe 3.9%; the forced bench's steady state is 76 / 0 /
+22 / 1.8 (decode) with the staged share taking RAM misses in windows. At concurrency 1 the server's single step is
+36-44 ms against the forced 33: the same residency story, smaller.
+Reading: the per-request 95 ms is the step period (104 ms) per token, and the step is pool-bound. Against a
+forced width-4 window (pool 58 ms per window), the server's width-3 step pays about 40 ms more in the pool: NVMe
+latency that the RAM compute no longer hides (31 ms, about 0.8 ms per layer, 28 NVMe experts per step at 3.9%),
+and a lower VRAM share (three conversations route wider; the serving tier is 90 GiB of RAM and the VRAM budget
+less the 2.5 GiB headroom and the slots' stores). Host overhead is not a lever.
+Also seen: prompt windows at position 0 are never graph-eligible, so they launch eagerly (launch/replay 12-34 ms
+in blocks with prompt chunks): a time-to-first-token cost, not a decode one. Every request shows `0 reused` even
+when prompts repeat: prefix reuse is not firing in this pattern (open).
+Decision: family 2's next experiments are residency knobs on the serve case, one factor each, 3 repeats: `QX_DS_PROMOS=64`
+(RAM promotions catch up faster), then `QX_DS_STAGE_SHARE=4` (less staging wait at width 3). Both queued. The code
+lever behind them is family 3 (store sizing returns about 1.8 GiB of VRAM to the tier).
+Open questions: why prefix reuse reports 0; whether NVMe wait is latency-bound per layer (then issuing layer
+l+1's reads before layer l's RAM compute finishes is the lever) or bandwidth-bound (then only residency helps).
