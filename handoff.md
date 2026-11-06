@@ -42,7 +42,15 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
 - The Qwen `quixiinfer.service` was found crash-looping every 10 s (18,742 restarts, `status=200/CHDIR`) and was
   stopped with `sudo systemctl stop`; it stays enabled, as before.
 - Ideation from `~/git/{colibri,Strata,basalt,DeepInfer}` is in `perf/backlog.md` families 6 and 7 and in
-  `perf/findings.md` "Rejected elsewhere". The first long shot is the narrow-window measurement for DSpark-style
+  `perf/findings.md` "Rejected elsewhere".
+- **Where the loop stopped (end of the 2026-11-06 session):** the standard-setting levers are measured to their
+  ceilings. Decode is pool-bound at the box's DRAM read ceiling (52-59 GB/s measured; the pool runs 44-54); the
+  dense GEMVs are 6.7 ms of a 33 ms step at 54% of GPU memory peak with a 2-4% fusion available (family 8,
+  deferred); prefill at the 64-chunk is copies and GPU expert kernels, and the 128-chunk bundle (share 8/8, cap
+  256) is -12.6% to -16.6% as an opt-in that costs serve3 +10%; serving is residency (the 95 GiB tier landed
+  -5.4%). What remains needs a decision or a project: a staging area that borrows tier VRAM only while a wide
+  window runs (would give the bundle's prefill without the serve3 loss), a change of the standard prompt chunk,
+  per-request expert hot sets for serving, or DSpark drafting (needs the drafter weights and 80% acceptance). The first long shot is the narrow-window measurement for DSpark-style
   drafting (family 6); the UD-IQ2_XXS GGUF has no MTP tensors, so a drafter would need a separate download.
 
 ## Update 2026-11-05

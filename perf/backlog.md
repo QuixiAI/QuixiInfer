@@ -167,10 +167,14 @@ invented one. The aggregate score lives in `scoreboard.md`.
   (540 MB: 1.5 TB/s, fine). The big matrices run at 1-1.4 TB/s; the eight small launches per layer are the
   cheap target: one multi-segment `MGemv` launch per group of independent projections (q_a and kv_a read the same
   normed input) would save most of their 1.66 ms, about -4% on decode.
-- **Next action:** read the layer sequence in `dsv41/mod.rs` for which of the eight small GEMVs per layer are
-  independent, fuse them into segment groups, check line 3 of `tools/ds-checks.sh` (segments do not change a
-  row's sum order), measure decode and long16k. `qx-kbench` has no DeepSeek shapes; the nsys sqlite per-grid
-  breakdown is the measurement for now.
+- **Read 2026-11-06:** the eight grid-1024 launches are `attn_output_a` applied per head group (`o_groups` = 8,
+  `wo_a_groups` in `dsv41/mod.rs`), each with its own input slice of the attention output, 1,024 rows x 4,096
+  columns of Q6_K at 0.8 TB/s. One launch for all eight needs a per-segment input offset in `mgemv.cu` and
+  `ops::Seg` (segments share one x today) and must keep the split-K one-row-per-block reduction (`lanes` 0) so
+  every row's sum order stays what the exact-reference check pins. Expected gain: 17 us per layer of bandwidth
+  plus seven launch gaps, 0.7-1.3 ms per step, 2-4% of decode: at or below the bar for a kernel change.
+- **DEFERRED 2026-11-06:** not worth the kernel change alone. Reopen if another launch fusion in the same layer
+  (the `g_x` group's small segments, the hc mixes) can ride along to clear 8%.
 - **Kill criteria:** achieved bandwidth already above 70% of peak on the shapes that carry the time, or any
   change that breaks `tools/ds-checks.sh` line 3.
 
