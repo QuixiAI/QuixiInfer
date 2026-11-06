@@ -40,21 +40,22 @@ After appending, run `python3 perf/harness/perf_diff.py index perf/optimization_
 
 | date | entry | verdict | line |
 |---|---|---|--:|
-| 2026-11-05 | DeepSeek history before the harness | RECORDED | 60 |
-| 2026-11-05 | Performance scaffolding | LANDED | 79 |
-| 2026-11-05 | First harness baseline | RECORDED | 102 |
-| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 122 |
-| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 135 |
-| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 150 |
-| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 169 |
-| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 192 |
-| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 222 |
-| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 249 |
-| 2026-11-06 | First set B baseline | RECORDED | 281 |
-| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 310 |
-| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 330 |
-| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 352 |
-| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 388 |
+| 2026-11-05 | DeepSeek history before the harness | RECORDED | 61 |
+| 2026-11-05 | Performance scaffolding | LANDED | 80 |
+| 2026-11-05 | First harness baseline | RECORDED | 103 |
+| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 123 |
+| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 136 |
+| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 151 |
+| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 170 |
+| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 193 |
+| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 223 |
+| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 250 |
+| 2026-11-06 | First set B baseline | RECORDED | 282 |
+| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 311 |
+| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 331 |
+| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 353 |
+| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 389 |
+| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 413 |
 <!-- qx:index:end -->
 
 ## 2026-11-05: DeepSeek history before the harness — RECORDED
@@ -408,3 +409,26 @@ Rejected alternatives: chunked NVMe reads (a record is one 9.4 MiB O_DIRECT read
 1.3-1.4 ms; the per-layer wait is that read minus the overlapped RAM compute); issuing the next layer's reads
 early (its routing is not known until this layer finishes).
 Open questions: none for these knobs.
+
+## 2026-11-06: Set B baseline re-taken at the 95 GiB serve tier — RECORDED
+
+Status: baseline promoted (replaces the morning's set B baseline, which was at a 90 GiB serve tier).
+Correctness: `tools/ds-checks.sh` pass, all five lines exact.
+Run: `baseline-setb-ram95` at git fa12636 (+ the validator tweak below), host rtx-5090_ryzen-9-9950x_121g, 3
+repeats, standard settings with `serve:QX_DS_RAM=95` recorded.
+
+| case | median ms/token | spread | first set B row (serve tier 90) | change |
+|---|--:|--:|--:|--:|
+| decode | 33.0 | 3.0% | 33.1 | within noise |
+| prefill64 | 12.4 | 2.4% | 12.1 | +2.5%, within noise |
+| long16k | 37.3 | 4.6% | 36.4 | +2.5%, within noise |
+| serve3 | **90.9** | 0.0% | 95.2 | **-4.5%** (the tier) |
+| long16k-prefill (companion) | 21.8 | 10.0% | 20.9 | the pool's residency drift through the 16k text (15.0-17.1 ms per token across repeats) |
+| serve1 (companion) | 39.5 | 3.1% | 40.5 | -2.4% |
+
+Score: **34.321** (34.327 before: the serve3 gain and the two within-noise rises cancel in the geomean).
+Decision: this is the baseline every later gate compares against. The validator now treats a noisy companion row
+as a warning (it blocked this run on `long16k-prefill` at exactly 10.0%); scored cases still block.
+Open questions: long16k's own spread (4.6%) and its companion's (10%) are the pool's residency drift through the
+corpus; for family 4 that drift *is* the long-context cost, and a profile-seeded tier or a per-text hot set would
+be the experiment.

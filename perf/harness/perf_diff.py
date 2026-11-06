@@ -275,8 +275,12 @@ def cmd_validate(a):
         if s.get("ok", 0) < 2:
             print(f"WARN: {c}: {s.get('ok', 0)} usable repeat(s); decisions need at least 2 (3 by default)")
         if s.get("spread", 0) > SPREAD_LIMIT:
-            print(f"NOISY: {c}: spread {100 * s['spread']:.1f}% > {100 * SPREAD_LIMIT:.0f}%: re-run on an idle box before using it")
-            bad += 1
+            if c in STANDARD_CASES or not all(k in per_case(rows) for k in STANDARD_CASES):
+                print(f"NOISY: {c}: spread {100 * s['spread']:.1f}% > {100 * SPREAD_LIMIT:.0f}%: re-run on an idle box before using it")
+                bad += 1
+            else:
+                # a companion row (long16k-prefill, serve1) is recorded, never scored: its noise is a note
+                print(f"WARN: {c}: spread {100 * s['spread']:.1f}% (a companion row, not scored; noted, not blocking)")
     if info.get("correctness") != "pass":
         print(f"NOTE: correctness {info.get('correctness', 'unknown')}: measurable, not landable (run with --check)")
     if info.get("git", {}).get("dirty"):

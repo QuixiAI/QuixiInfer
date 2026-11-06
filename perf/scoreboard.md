@@ -37,3 +37,4 @@ Harness-recorded scores:
 |---|---|---|---|---|---|---|
 | 2026-11-05 | 19.514 | decode 32.00 prefill64 11.90 | rtx-5090_ryzen-9-9950x_121g | f359604 | pass | set A. first harness baseline (f359604: staged share, kernel-load deadlock fix) |
 | 2026-11-06 | 34.327 | decode 33.10 prefill64 12.10 long16k 36.40 serve3 95.24 | rtx-5090_ryzen-9-9950x_121g | 0dc3dbd+wt | pass | set B (first row): harness long16k+serve3; capture-race fix; warm-up of every width, sealed kernel set, 2.5 GiB VRAM headroom; stage share 6/8 from width 2; allocator thresholds pinned |
+| 2026-11-06 | 34.321 | decode 33.00 prefill64 12.40 long16k 37.30 serve3 90.91 | rtx-5090_ryzen-9-9950x_121g | 4e782fb+wt | pass | set B at the serve tier 95 GiB (settings change: serve3 90.9 against 95.2 at 90; decode, prefill64 and long16k within noise of the first set B row) |

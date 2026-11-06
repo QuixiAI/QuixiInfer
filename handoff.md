@@ -23,8 +23,8 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
 - **Kept:** the window staged share (6/8) applies from width 2 (`QX_DS_STAGE_WIDE_MIN`, was 8): -4.7% at width 2,
   -8.2% at width 4 on the forced bench; serve3 -2.9%, within noise. The serve case's RAM tier is 95 GiB (serve3
   -5.4% against 90); PROMOS=64, STAGE_SHARE=4 and STAGE_CAP=192 measured flat (notebook). The set B baseline was
-  re-taken at the 95 GiB serve tier (`baseline-setb-ram95`); if `perf/baselines/.../run.json` still says
-  `serve:QX_DS_RAM=90`, that run did not finish: re-run `perf/harness/bench.sh --check` and promote it.
+  re-taken at the 95 GiB serve tier and promoted: **score 34.321** (decode 33.0, prefill64 12.4, long16k 37.3,
+  serve3 90.9), `serve:QX_DS_RAM=95` in its `run.json`. Gate every later run against it.
 - **Two bugs found by the serve case, both fixed in the working tree:**
   1. A capture race: the driver thread's `cuEventSynchronize`/`cuEventQuery` during a global-mode graph capture
      panicked the server's warm-up. Fix: `Shared::capture` mutex plus a device drain before recording

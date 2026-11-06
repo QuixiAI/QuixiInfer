@@ -74,7 +74,7 @@ Measured from `/proc/PID/status` while serving (`quixiinfer serve --slots 3 --ct
 
 | | RssShmem (pinned tier) | RssAnon | RssFile | total |
 |---|--:|--:|--:|--:|
-| idle after warm-up | 102.5 GB | 1.9 GB | 6.7 GB | 111.1 GB |
+| idle after warm-up | 102.5 GB | 1.9 GB | 6.7 GB (the pack's mmap: page cache from the tier fill, reclaimable) | 111.1 GB |
 | under load, no memory pressure (112G cap, five probes) | 102.5 GB | 1.9 GB | 6.7 GB | 111.1 GB |
 | under load at a 110G cap (1.5 GB headroom) | 102.5 GB | 1.9 → 9.3 GB | 6.7 → 0.1 GB | at the cap, then killed |
 | under load at a 118G cap (global pressure) | 105 GB | 14.7 GB | 0.06 GB | global OOM kill |

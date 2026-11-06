@@ -173,11 +173,11 @@ becomes a family.
 - **The first-touch floor** (colibri: a 16-token turn touches 3,371 distinct experts; no cache size removes the
   first read of each). For serving this is what the profile seed and parked prefixes address, nothing else.
 - **Host memory** (ours, 2026-11-06, `findings.md` "Operating envelope"): the anonymous growth was NVRTC retrying
-  a kernel whose module could not load for lack of VRAM, and is fixed. What remains: the 6.7 GB of file-backed resident pages at idle (the GGUF mmap kept
-  warm after load, or CUDA's device mappings; `pmap -x` on the idle server says). If they are the GGUF's, dropping
-  them after load (`madvise(DONTNEED)`, or reading the dense weights into VRAM without keeping the map) returns
-  6.7 GB to the RAM tier, about 700 more resident experts. Also: the pool's `vec![0f32; ff]` per expert per token
-  is allocator churn a per-thread scratch would remove.
+  a kernel whose module could not load for lack of VRAM, and is fixed. The 7-8 GB of file-backed resident pages
+  are the expert pack's mmap (`smaps` on a serving process: 7,955 MiB of `.qxp`, 97 GB of `/dev/zero` pinned
+  tier, 2.1 GB anonymous): page cache left by the tier fill reading through the map, clean and reclaimable, so
+  not a tier lever; an `madvise(MADV_DONTNEED)` on the map after the fill would make RSS honest. Low priority.
+  Also: the pool's `vec![0f32; ff]` per expert per token is allocator churn a per-thread scratch would remove.
 - **SWA bounded replay** (DeepInfer `YOCO_PREFILL_TRUNCATION_MODE=compact`, keep 140 tokens): recompute only a
   bounded suffix when a decoder's state is rebuilt. Ours rebuilds the ring from the host latent history in
   `rewind`; the equivalent is already in place, but a measurement of `rewind`'s cost at 16k belongs to family 4.
