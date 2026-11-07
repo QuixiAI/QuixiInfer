@@ -28,6 +28,12 @@ pub struct Shared {
     /// Selections staged into VRAM by DMA for the GPU, and the time the driver waited for those copies after
     /// its pool share.
     pub staged_hits: AtomicU64,
+    /// How often a layer's routed experts were routed by the previous token too (the premise of a speculative
+    /// prefetch): all selections, and the selections not served from VRAM (the ones a prefetch could have hidden).
+    pub spec_hits: AtomicU64,
+    pub spec_total: AtomicU64,
+    pub spec_miss_hits: AtomicU64,
+    pub spec_miss_total: AtomicU64,
     pub stage_ns: AtomicU64,
     /// Set by the host after each token (the sampled token is known): the driver may run its promotions.
     pub tokens_done: AtomicU64,
@@ -140,6 +146,10 @@ impl Driver {
             promo_ns: Default::default(),
             mapped_hits: Default::default(),
             staged_hits: Default::default(),
+            spec_hits: Default::default(),
+            spec_total: Default::default(),
+            spec_miss_hits: Default::default(),
+            spec_miss_total: Default::default(),
             stage_ns: Default::default(),
             tokens_done: Default::default(),
             profile_req: AtomicBool::new(false),
@@ -184,6 +194,8 @@ struct Loop {
     words: HostMapped,
     word_next: usize,
     missed: Vec<usize>,
+    /// The experts each layer routed for the previous token (or window): the speculative-prefetch guess.
+    last_sel: Vec<Vec<i32>>,
     /// (free at tick, class, address).
     quarantine: std::collections::VecDeque<(u64, usize, u64)>,
     ticks: u64,
@@ -382,6 +394,30 @@ impl Loop {
         let ne = self.host.n_expert;
         for &e in &all {
             self.host.score[l * ne + e as usize] += 1.0;
+        }
+        {
+            // the speculative-prefetch premise: would the previous token's experts of this layer have guessed these?
+            if self.last_sel.len() < self.host.layers.len() {
+                self.last_sel.resize(self.host.layers.len(), Vec::new());
+            }
+            let prev = &self.last_sel[l];
+            let mut cur: Vec<i32> = all.clone();
+            cur.sort_unstable();
+            cur.dedup();
+            let hits = cur.iter().filter(|e| prev.binary_search(e).is_ok()).count();
+            sh.spec_hits.fetch_add(hits as u64, Ordering::Relaxed);
+            sh.spec_total.fetch_add(cur.len() as u64, Ordering::Relaxed);
+            // the selections the host serves (pool + staged): the ones a prefetch could hide
+            let mut miss: Vec<i32> = ids.clone();
+            if nstage > 0 {
+                miss.extend_from_slice(mb.slice::<i32>(mailbox::MB_SIDS, nstage));
+            }
+            miss.sort_unstable();
+            miss.dedup();
+            let mh = miss.iter().filter(|e| prev.binary_search(e).is_ok()).count();
+            sh.spec_miss_hits.fetch_add(mh as u64, Ordering::Relaxed);
+            sh.spec_miss_total.fetch_add(miss.len() as u64, Ordering::Relaxed);
+            self.last_sel[l] = cur;
         }
         sh.vram_hits.fetch_add((all.len() - nm - nmap - nstage) as u64, Ordering::Relaxed);
         sh.mapped_hits.fetch_add(nmap as u64, Ordering::Relaxed);
@@ -664,7 +700,7 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     let n_stage_streams: usize = std::env::var("QX_DS_STAGE_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 8);
     let stage_streams: Vec<cudarc::driver::sys::CUstream> = (0..n_stage_streams).map(|_| unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("stage stream")).collect();
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
-    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events };
+    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events };
     // exercise every copy path once before a window can wait on this thread: whatever the CUDA driver
     // loads or allocates on a stream's first copy then happens while the device is idle
     let scratch = qx_gpu::mem::DeviceBuf::new(64);
