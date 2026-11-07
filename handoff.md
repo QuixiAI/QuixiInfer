@@ -7,6 +7,19 @@ UD-IQ2_XXS in QuixiInfer on this box, as fast as possible. The results must stay
 The box has an RTX 5090 (32 GB), a Ryzen 9950X (16 cores), 120 GiB of RAM and a 4 TB NVMe root. The experts live in
 three tiers: VRAM, pinned RAM and the NVMe pack.
 
+## Update 2026-11-07, evening: the priority is prefill (Strata's 935 tok/s at 16k against our 190-250)
+
+- The user: "double our efforts to match Strata's prefill". The chunk profile (notebook, backlog family 14) says
+  the dense one-launch GEMV is 42% of the chunk and latency-bound, attention 22%, the exact expert tiles 31%.
+  Row-blocking with per-group barriers was 12% slower (rejected); the one-barrier form (`QX_MGEMV_ZB=1`, d88f99c)
+  and the one-barrier + 4-rows form (`QX_MGEMV_ZT=1`, in the tree) are measuring (chains zb, zt in the scratchpad;
+  `~/qx-bins/chunk21`, `chunk22`). Land whichever clears the bar bit-identically, then attention.
+- The price of a non-exact prefill is measured (notebook, findings): Strata's FP16 tiles add nothing over its own
+  decode path; its engine sits at KL ~0.03 from our exact path, ours at 0.01-0.02 from f32. A bf16 tile path is a
+  lossy opt-in option by the goal's rules, not taken; exact forms first.
+- Landed since noon: `qx_ds_topk2` (decode256k 45.4 -> 43.5-44.2, 8fae0e7), the server's 4096 chunk default
+  (42c23e7), README on today's facts (53a86c8). Set D row 31.470 (d6cfb45).
+
 ## Update 2026-11-07, noon: set D promoted at 34.447; the GEMV's register story; the 256k cases re-based
 
 - **Scoreboard:** the chunk-path tree (6d8ce02) is the baseline, score 49.601 → **34.447** (prefill256k 21.5 →

@@ -205,6 +205,24 @@ invented one. The aggregate score lives in `scoreboard.md`.
 - **Kill criteria:** achieved bandwidth already above 70% of peak on the shapes that carry the time, or any
   change that breaks `tools/ds-checks.sh` line 3.
 
+### 14. Prefill to Strata's number (new 2026-11-07 evening: the user's priority is matching Strata's 935 tok/s on a 16k prompt; ours 190-250)
+
+- **Where the chunk's GPU time goes** (profile on chunk19, two 4096-row chunks, per slab-layer): the dense one-launch
+  GEMV 42% (13.4 launches, 413 us each; latency-bound: 16 token groups per block in series, two barriers and a shared
+  round trip each, about 3 us a group; 50x off the bandwidth and compute floors), attention 22% (`attn_part` 560 us
+  + `merge` 157 us per slab-layer call), the exact int8 expert tiles 31%, the rest 5%.
+- **Measured dead end:** 4 or 8 rows per block with per-group barriers (`mgemv_zr`): 12% slower, bit-identical.
+- **In flight:** one barrier per block (`mgemv_zb`, QX_MGEMV_ZB=1: every warp's partial for every group to shared
+  memory, one summing pass at the end in the same order); then the same with 4 rows per block sharing the activation
+  fragments (`mgemv_zt`, QX_MGEMV_ZT=1, its own table). Target: the 817 us launch under 150 us, the dense passes
+  under 10% of the chunk, prefill256k 6.2 -> about 4.5 ms per token.
+- **Next:** the attention over the slab (one block per (head, token) over the window plus 512 selected latents; the
+  same per-call latency pattern); the expert tiles' dequant per 16 elements. A bf16 tensor-core tile path for the
+  dense passes behind an opt-in knob is the lossy option (measured: Strata's whole engine is at KL 0.03 from our exact
+  path); the exact forms first.
+- **Kill criteria:** a form that is not bit-identical on ds-checks line 3 and the 16k tails; a form inside the
+  chunk timing's 1% spread.
+
 ### 9. 256k decode: the position-proportional GPU time (new 2026-11-06, the set D target)
 
 - **Parent result:** the first forced 256k pass (decay per token): prefill 14 ms per token at 24k rising to 28 at
