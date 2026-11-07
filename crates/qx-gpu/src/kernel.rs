@@ -48,7 +48,10 @@ impl Module {
         if marker.as_ref().is_some_and(|m| m.exists()) {
             return;
         }
-        let opts = cudarc::nvrtc::CompileOptions { options: vec!["--gpu-architecture=sm_120a".into(), "-lineinfo".into()], ..Default::default() };
+        // PTX only (a virtual architecture): the check is that NVRTC accepts the source, and a real target would make
+        // NVRTC run ptxas over the whole module (10-20 minutes for mgemv.cu or moe.cu on 2026-11-07) before CubeCL's
+        // own compile and the driver's JIT pay for the same SASS again
+        let opts = cudarc::nvrtc::CompileOptions { options: vec!["--gpu-architecture=compute_120a".into(), "-lineinfo".into()], ..Default::default() };
         if let Err(e) = cudarc::nvrtc::compile_ptx_with_opts(self.source, opts) {
             panic!("kernels/{}.cu does not compile with NVRTC:\n{e}", self.name);
         }
