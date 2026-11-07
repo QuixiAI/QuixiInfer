@@ -523,6 +523,302 @@ template <int XM, int NT, int RB> QX_DEV void mgemv_zt2(const u64* info) {
 
 extern "C" __global__ void __launch_bounds__(256) b_t8zt2(const u64* info) { mgemv_zt2<0, 8, 4>(info); }
 extern "C" __global__ void __launch_bounds__(256, 2) b_t8zt2o(const u64* info) { mgemv_zt2<0, 8, 4>(info); }
+
+/// `mgemv_zt` with the lane's weights held across the 16 token groups: on the Q8 path the 2 steps' int8 fragments
+/// and scales of RB rows (loaded once per block, where `zt` reloaded them per group); on the f32 path the 2 steps'
+/// decoded weights of RBF rows (decoded once per block, where `zt` decoded them per group), both steps' inputs
+/// loaded before the arithmetic. Only lanes with at most 2 steps (cols <= 4096 at 256 per step): others fall back.
+template <int XM, int NT, int RB> QX_DEV void mgemv_zh(const u64* info) {
+    const u64* segs = reinterpret_cast<const u64*>(info[1]);
+    const u32 nseg = (u32)info[2];
+    u32 s = 0;
+    while (s + 1 < nseg && blockIdx.x >= (u32)segs[(s + 1) * 8 + 6]) ++s;
+    const u64* d = segs + s * 8;
+    const u32 rows = (u32)d[2], cols = (u32)d[3], ty = (u32)d[4], lanes = (u32)d[5];
+    const u64 stride = d[7] ? d[7] : type_row_bytes(ty, cols);
+    const u32 blk = blockIdx.x - (u32)d[6];
+    const u32 warp = threadIdx.x / 32, wl = threadIdx.x % 32;
+    float* y = reinterpret_cast<float*>(d[1]);
+    const u32 nz = (u32)(info[5] >> 32) ? (u32)(info[5] >> 32) : 1;
+    __shared__ float part[8][RB * 128];
+    if (lanes == 0 && ty == QX_Q8_0_P && info[7] != 0 && cols <= 4096) {
+        const u32 r0 = blk * RB;
+        const u32 nr = min((u32)RB, rows - r0);
+        const u32 nb = cols / 32;
+        const u8* w = reinterpret_cast<const u8*>(d[0]) + (u64)r0 * stride;
+        // this lane's two steps: b0 = warp's step, b1 = warp + 8 (present when cols == 4096)
+        const u32 b0 = warp * 256 + 8 * wl, b1 = b0 + 8 * 256;
+        const bool two = b1 < cols;
+        int2 w0[RB], w1[RB];
+        float d0[RB], d1[RB];
+#pragma unroll
+        for (int r = 0; r < RB; ++r) {
+            const u8* row = w + (u64)(r < nr ? r : 0) * stride;
+            const u16* dw = reinterpret_cast<const u16*>(row + (u64)nb * 32);
+            w0[r] = *reinterpret_cast<const int2*>(row + b0);
+            d0[r] = f16_to_f32(dw[b0 / 32]);
+            w1[r] = two ? *reinterpret_cast<const int2*>(row + b1) : make_int2(0, 0);
+            d1[r] = two ? f16_to_f32(dw[b1 / 32]) : 0.f;
+        }
+        const u32 xs = (u32)info[9], ds = xs / 32;
+        for (u32 z = 0; z < nz; ++z) {
+            const u64 z0 = (u64)z * NT;
+            const i8* xq0 = reinterpret_cast<const i8*>(info[7]) + z0 * xs;
+            const float* xd0 = reinterpret_cast<const float*>(info[8]) + z0 * ds;
+            int2 q0[NT], q1[NT];
+            float s0[NT], s1[NT];
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                q0[n] = *reinterpret_cast<const int2*>(xq0 + n * xs + b0);
+                s0[n] = xd0[n * ds + b0 / 32];
+                q1[n] = two ? *reinterpret_cast<const int2*>(xq0 + n * xs + b1) : make_int2(0, 0);
+                s1[n] = two ? xd0[n * ds + b1 / 32] : 0.f;
+            }
+            float a0[RB][NT], a1[RB][NT];
+#pragma unroll
+            for (int r = 0; r < RB; ++r)
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    a0[r][n] = 0.f;
+                    a1[r][n] = 0.f;
+                    // the reference: the pair loop (both steps) when b1 < cols, else the single tail step into a0
+                    if (two) {
+                        a0[r][n] += d0[r] * s0[n] * (float)__dp4a(w0[r].y, q0[n].y, __dp4a(w0[r].x, q0[n].x, 0));
+                        a1[r][n] += d1[r] * s1[n] * (float)__dp4a(w1[r].y, q1[n].y, __dp4a(w1[r].x, q1[n].x, 0));
+                    } else {
+                        a0[r][n] += d0[r] * s0[n] * (float)__dp4a(w0[r].y, q0[n].y, __dp4a(w0[r].x, q0[n].x, 0));
+                    }
+                }
+#pragma unroll
+            for (int r = 0; r < RB; ++r)
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    const float v = warp_sum(a0[r][n] + a1[r][n]);
+                    if (wl == 0) part[warp][r * 128 + z0 + n] = v;
+                }
+        }
+        __syncthreads();
+        const u32 nt = nz * NT;
+        for (u32 i = threadIdx.x; i < RB * nt; i += blockDim.x) {
+            const u32 r = i / nt, n = i % nt;
+            if (r < nr) {
+                float t = 0.f;
+                for (int k = 0; k < 8; ++k) t += part[k][r * 128 + n];
+                y[(info[6] + n) * rows + r0 + r] = t;
+            }
+        }
+        return;
+    }
+    if (lanes == 0 && ty != QX_Q8_0_P && cols <= 4096) {
+        constexpr int RBF = 2;
+        const u32 r0 = blk * RBF;
+        const u32 nr = min((u32)RBF, rows - r0);
+        const u8* w = reinterpret_cast<const u8*>(d[0]) + (u64)r0 * stride;
+        const u32 b0 = warp * 256 + 8 * wl, b1 = b0 + 8 * 256;
+        const bool two = b1 < cols;
+        float w0[RBF][8], w1[RBF][8];
+#pragma unroll
+        for (int r = 0; r < RBF; ++r) {
+            const u8* row = w + (u64)(r < nr ? r : 0) * stride;
+            switch (ty) {
+#define DQ(t) case t: dec<t>(row, cols, b0, w0[r]); if (two) dec<t>(row, cols, b1, w1[r]); break;
+                DQ(QX_F32) DQ(QX_BF16) DQ(QX_Q8_0) DQ(QX_Q6_K) DQ(QX_IQ4_NL) DQ(QX_IQ3_S) DQ(QX_IQ2_S) DQ(QX_Q6_K_P) DQ(QX_NVFP4)
+                DQ(QX_IQ2_XXS) DQ(QX_IQ2_XS) DQ(QX_IQ3_XXS) DQ(QX_IQ1_S) DQ(QX_Q2_K) DQ(QX_Q5_K)
+#undef DQ
+                default: break;
+            }
+        }
+        for (u32 z = 0; z < nz; ++z) {
+            const u64 z0 = (u64)z * NT;
+            float a0[RBF][NT];
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                XIn<XM> xi;
+                xi.x = reinterpret_cast<const float*>(info[0]) + (z0 + n) * info[3];
+                xi.arg = XM == 2 ? info[4] + 4ull * (z0 + n) * info[3] : info[4];
+                xi.xq = nullptr;
+                xi.xd = nullptr;
+                float4 xa, xb, xc, xd;
+                ldx8<XM>(xi, b0, xa, xb);
+                if (two) ldx8<XM>(xi, b1, xc, xd);
+#pragma unroll
+                for (int r = 0; r < RBF; ++r) {
+                    // the reference (row_partial, lanes 32, step0 warp, dstep 8, cols <= 4096): single steps into a0
+                    float a = 0.f;
+                    a += dot8x(w0[r], xa, xb);
+                    if (two) a += dot8x(w1[r], xc, xd);
+                    a0[r][n] = a;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < RBF; ++r)
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    const float v = warp_sum((a0[r][n] + 0.f) + (0.f + 0.f));
+                    if (wl == 0) part[warp][r * 128 + z0 + n] = v;
+                }
+        }
+        __syncthreads();
+        const u32 nt = nz * NT;
+        for (u32 i = threadIdx.x; i < RBF * nt; i += blockDim.x) {
+            const u32 r = i / nt, n = i % nt;
+            if (r < nr) {
+                float t = 0.f;
+                for (int k = 0; k < 8; ++k) t += part[k][r * 128 + n];
+                y[(info[6] + n) * rows + r0 + r] = t;
+            }
+        }
+        return;
+    }
+    mgemv_zt<XM, NT, RB>(info);
+}
+
+extern "C" __global__ void __launch_bounds__(256) b_t8zh(const u64* info) { mgemv_zh<0, 8, 4>(info); }
+
+/// Many rows per block on the planar Q8_0 split-K segments with cols <= 4096 (each lane: step `warp` and, when
+/// cols == 4096, step warp + 8): the lane's input fragments of a group are held once (8 tokens x 2 steps) and the
+/// rows walked against them with transient accumulators (a0 = 0 + s0, a1 = 0 + s1, v = a0 + a1: the reference's
+/// chain for a lane with at most two steps, spelled out so the bits are the same). The x traffic per launch falls
+/// by RB; the warp_sum trees stay one per (row, token). One barrier per block.
+template <int NT, int RB> QX_DEV void mgemv_zw(const u64* info) {
+    const u64* segs = reinterpret_cast<const u64*>(info[1]);
+    const u32 nseg = (u32)info[2];
+    u32 s = 0;
+    while (s + 1 < nseg && blockIdx.x >= (u32)segs[(s + 1) * 8 + 6]) ++s;
+    const u64* d = segs + s * 8;
+    const u32 rows = (u32)d[2], cols = (u32)d[3], ty = (u32)d[4];
+    const u64 stride = d[7] ? d[7] : type_row_bytes(ty, cols);
+    const u32 blk = blockIdx.x - (u32)d[6];
+    const u32 warp = threadIdx.x / 32, wl = threadIdx.x % 32;
+    float* y = reinterpret_cast<float*>(d[1]);
+    const u32 nz = (u32)(info[5] >> 32) ? (u32)(info[5] >> 32) : 1;
+    __shared__ float part[8][RB * NT];  // per group: (warp, row, token)
+    const u32 r0 = blk * RB;
+    const u32 nr = min((u32)RB, rows - r0);
+    const u32 nb = cols / 32;
+    const u8* w = reinterpret_cast<const u8*>(d[0]) + (u64)r0 * stride;
+    const u32 b0 = warp * 256 + 8 * wl, b1 = b0 + 8 * 256;
+    const bool two = b1 < cols;
+    const u32 xs = (u32)info[9], ds = xs / 32;
+    for (u32 z = 0; z < nz; ++z) {
+        const u64 z0 = (u64)z * NT;
+        const i8* xq0 = reinterpret_cast<const i8*>(info[7]) + z0 * xs;
+        const float* xd0 = reinterpret_cast<const float*>(info[8]) + z0 * ds;
+        int2 q0[NT], q1[NT];
+        float s0[NT], s1[NT];
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+            q0[n] = *reinterpret_cast<const int2*>(xq0 + n * xs + b0);
+            s0[n] = xd0[n * ds + b0 / 32];
+            q1[n] = two ? *reinterpret_cast<const int2*>(xq0 + n * xs + b1) : make_int2(0, 0);
+            s1[n] = two ? xd0[n * ds + b1 / 32] : 0.f;
+        }
+        for (u32 r = 0; r < nr; ++r) {
+            const u8* row = w + (u64)r * stride;
+            const u16* dw = reinterpret_cast<const u16*>(row + (u64)nb * 32);
+            const int2 w0 = *reinterpret_cast<const int2*>(row + b0);
+            const float d0 = f16_to_f32(dw[b0 / 32]);
+            const int2 w1 = two ? *reinterpret_cast<const int2*>(row + b1) : make_int2(0, 0);
+            const float d1 = two ? f16_to_f32(dw[b1 / 32]) : 0.f;
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                float a0 = 0.f, a1 = 0.f;
+                a0 += d0 * s0[n] * (float)__dp4a(w0.y, q0[n].y, __dp4a(w0.x, q0[n].x, 0));
+                if (two) a1 += d1 * s1[n] * (float)__dp4a(w1.y, q1[n].y, __dp4a(w1.x, q1[n].x, 0));
+                const float v = warp_sum(a0 + a1);
+                if (wl == 0) part[warp][r * NT + n] = v;
+            }
+        }
+        __syncthreads();
+        for (u32 i = threadIdx.x; i < nr * NT; i += blockDim.x) {
+            const u32 r = i / NT, n = i % NT;
+            float t = 0.f;
+            for (int k = 0; k < 8; ++k) t += part[k][r * NT + n];
+            y[(info[6] + z0 + n) * rows + r0 + r] = t;
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) b_t8zw8(const u64* info) { mgemv_zw<8, 8>(info); }
+extern "C" __global__ void __launch_bounds__(256) b_t8zw16(const u64* info) { mgemv_zw<8, 16>(info); }
+extern "C" __global__ void __launch_bounds__(256) b_t8zw32(const u64* info) { mgemv_zw<8, 32>(info); }
+
+/// `mgemv_zt`'s batching (RB rows x 8 tokens computed together, then their 32 trees together) without persistent
+/// accumulators: for cols <= 4096 each lane has at most two steps, so a pair's chain is v = (0 + s0) + (0 + s1),
+/// spelled out as the reference's adds. Half the registers per pair, so more rows per block at the same occupancy.
+/// Per group reduction (barriers measured free). Planar Q8_0 split-K segments only (the bench).
+template <int NT, int RB> QX_DEV void mgemv_zv(const u64* info) {
+    const u64* segs = reinterpret_cast<const u64*>(info[1]);
+    const u32 nseg = (u32)info[2];
+    u32 s = 0;
+    while (s + 1 < nseg && blockIdx.x >= (u32)segs[(s + 1) * 8 + 6]) ++s;
+    const u64* d = segs + s * 8;
+    const u32 rows = (u32)d[2], cols = (u32)d[3], ty = (u32)d[4];
+    const u64 stride = d[7] ? d[7] : type_row_bytes(ty, cols);
+    const u32 blk = blockIdx.x - (u32)d[6];
+    const u32 warp = threadIdx.x / 32, wl = threadIdx.x % 32;
+    float* y = reinterpret_cast<float*>(d[1]);
+    const u32 nz = (u32)(info[5] >> 32) ? (u32)(info[5] >> 32) : 1;
+    __shared__ float part[8][RB * NT];
+    const u32 r0 = blk * RB;
+    const u32 nr = min((u32)RB, rows - r0);
+    const u32 nb = cols / 32;
+    const u8* w = reinterpret_cast<const u8*>(d[0]) + (u64)r0 * stride;
+    const u32 b0 = warp * 256 + 8 * wl, b1 = b0 + 8 * 256;
+    const bool two = b1 < cols;
+    const u32 xs = (u32)info[9], ds = xs / 32;
+    for (u32 z = 0; z < nz; ++z) {
+        const u64 z0 = (u64)z * NT;
+        const i8* xq0 = reinterpret_cast<const i8*>(info[7]) + z0 * xs;
+        const float* xd0 = reinterpret_cast<const float*>(info[8]) + z0 * ds;
+        int2 q0[NT], q1[NT];
+        float s0[NT], s1[NT];
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+            q0[n] = *reinterpret_cast<const int2*>(xq0 + n * xs + b0);
+            s0[n] = xd0[n * ds + b0 / 32];
+            q1[n] = two ? *reinterpret_cast<const int2*>(xq0 + n * xs + b1) : make_int2(0, 0);
+            s1[n] = two ? xd0[n * ds + b1 / 32] : 0.f;
+        }
+        float v[RB][NT];
+#pragma unroll
+        for (int r = 0; r < RB; ++r) {
+            const u8* row = w + (u64)(r < nr ? r : 0) * stride;
+            const u16* dw = reinterpret_cast<const u16*>(row + (u64)nb * 32);
+            const int2 w0 = *reinterpret_cast<const int2*>(row + b0);
+            const float d0 = f16_to_f32(dw[b0 / 32]);
+            const int2 w1 = two ? *reinterpret_cast<const int2*>(row + b1) : make_int2(0, 0);
+            const float d1 = two ? f16_to_f32(dw[b1 / 32]) : 0.f;
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                float a0 = 0.f, a1 = 0.f;
+                a0 += d0 * s0[n] * (float)__dp4a(w0.y, q0[n].y, __dp4a(w0.x, q0[n].x, 0));
+                if (two) a1 += d1 * s1[n] * (float)__dp4a(w1.y, q1[n].y, __dp4a(w1.x, q1[n].x, 0));
+                v[r][n] = a0 + a1;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < RB; ++r)
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                const float t = warp_sum(v[r][n]);
+                if (wl == 0) part[warp][r * NT + n] = t;
+            }
+        __syncthreads();
+        for (u32 i = threadIdx.x; i < nr * NT; i += blockDim.x) {
+            const u32 r = i / NT, n = i % NT;
+            float t = 0.f;
+            for (int k = 0; k < 8; ++k) t += part[k][r * NT + n];
+            y[(info[6] + z0 + n) * rows + r0 + r] = t;
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) b_t8zv4(const u64* info) { mgemv_zv<8, 4>(info); }
+extern "C" __global__ void __launch_bounds__(256) b_t8zv6(const u64* info) { mgemv_zv<8, 6>(info); }
+extern "C" __global__ void __launch_bounds__(256) b_t8zv8(const u64* info) { mgemv_zv<8, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) b_t8z(const u64* info) { mgemv_z<0, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) b_t8zb(const u64* info) { mgemv_zb<0, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) b_t8zt(const u64* info) { mgemv_zt<0, 8, 4>(info); }
@@ -539,18 +835,27 @@ static u16 f32_to_f16_bits(float f) {
 
 int main(int argc, char** argv) {
     const u32 rows = argc > 1 ? atoi(argv[1]) : 5120, cols = argc > 2 ? atoi(argv[2]) : 4096, T = argc > 3 ? atoi(argv[3]) : 128;
+    const bool q6k = argc > 4 && std::strcmp(argv[4], "q6k") == 0;  // planar Q6_K rows against f32 inputs (the f32 path)
     const u32 nb = cols / 32;
-    const u64 stride = ((u64)nb * 32 + nb * 2 + 15) / 16 * 16;
+    const u32 nb6 = cols / 256;
+    const u64 stride = q6k ? ((u64)nb6 * 210 + 15) / 16 * 16 : ((u64)nb * 32 + nb * 2 + 15) / 16 * 16;
     std::vector<u8> w((u64)rows * stride);
     srand(7);
     for (u32 r = 0; r < rows; ++r) {
         u8* row = w.data() + (u64)r * stride;
-        for (u32 i = 0; i < nb * 32; ++i) row[i] = (u8)(i8)((rand() % 255) - 127);
-        u16* d = reinterpret_cast<u16*>(row + (u64)nb * 32);
-        for (u32 b = 0; b < nb; ++b) d[b] = f32_to_f16_bits(0.005f + (rand() % 1000) * 1e-5f);
+        if (q6k) {
+            for (u32 i = 0; i < nb6 * 208; ++i) row[i] = (u8)(rand() % 256);  // ql, qh, scales: any bits decode
+            u16* d = reinterpret_cast<u16*>(row + (u64)nb6 * 208);
+            for (u32 b = 0; b < nb6; ++b) d[b] = f32_to_f16_bits(0.0005f + (rand() % 1000) * 1e-6f);
+        } else {
+            for (u32 i = 0; i < nb * 32; ++i) row[i] = (u8)(i8)((rand() % 255) - 127);
+            u16* d = reinterpret_cast<u16*>(row + (u64)nb * 32);
+            for (u32 b = 0; b < nb; ++b) d[b] = f32_to_f16_bits(0.005f + (rand() % 1000) * 1e-5f);
+        }
     }
     std::vector<i8> xq((u64)T * cols);
     std::vector<float> xd((u64)T * nb), xf((u64)T * cols, 0.f);
+    for (auto& v : xf) v = (rand() % 2001 - 1000) * 1e-3f;
     for (auto& v : xq) v = (i8)((rand() % 255) - 127);
     for (auto& v : xd) v = 0.01f + (rand() % 1000) * 1e-5f;
     u8* dw; i8* dxq; float* dxd; float* dxf; float* dy; u64* dtab; u64* dinfo;
@@ -559,15 +864,15 @@ int main(int argc, char** argv) {
     CK(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice)); CK(cudaMemcpy(dxq, xq.data(), xq.size(), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dxd, xd.data(), xd.size() * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dxf, xf.data(), xf.size() * 4, cudaMemcpyHostToDevice));
     // the engine's segment words: w, y, rows, cols, type, lanes (0: split-K), first block, stride
-    auto table = [&](u64 blocks_of_seg) { u64 t[8] = {(u64)dw, (u64)dy, rows, cols, QX_Q8_0_P, 0, 0, stride}; (void)blocks_of_seg; CK(cudaMemcpy(dtab, t, 64, cudaMemcpyHostToDevice)); };
+    auto table = [&](u64 blocks_of_seg) { u64 t[8] = {(u64)dw, (u64)dy, rows, cols, q6k ? (u64)QX_Q6_K_P : (u64)QX_Q8_0_P, 0, 0, stride}; (void)blocks_of_seg; CK(cudaMemcpy(dtab, t, 64, cudaMemcpyHostToDevice)); };
     table(rows);
-    u64 info[16] = {(u64)dxf, (u64)dtab, 1, cols, 0, 8ull | ((u64)(T / 8) << 32), 0, (u64)dxq, (u64)dxd, cols, 0, 0, 0, 0, 0, 0};
+    u64 info[16] = {(u64)dxf, (u64)dtab, 1, cols, 0, 8ull | ((u64)(T / 8) << 32), 0, q6k ? 0 : (u64)dxq, q6k ? 0 : (u64)dxd, cols, 0, 0, 0, 0, 0, 0};
     CK(cudaMemcpy(dinfo, info, 128, cudaMemcpyHostToDevice));
     std::vector<float> ref((u64)T * rows), out((u64)T * rows);
     cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
     struct V { const char* name; void (*k)(const u64*); u32 blocks; };
-    const V vs[] = {{"t8z (current)", b_t8z, rows}, {"t8zb (one barrier)", b_t8zb, rows}, {"t8zt (one barrier, 4 rows)", b_t8zt, (rows + 3) / 4}, {"t8zs (row per lane, stack)", b_t8zs, 0}, {"t8zx (4 rows, transpose fold)", b_t8zx, (rows + 3) / 4}, {"t8zt2 (4 rows, base+stride)", b_t8zt2, (rows + 3) / 4}, {"t8zt2o (same, 2 blocks/SM)", b_t8zt2o, (rows + 3) / 4}, {"t8zt8 (8 rows)", b_t8zt8, (rows + 7) / 8}, {"zt DIAG no tree (inexact)", b_zt_notree, (rows + 3) / 4}, {"zt DIAG no dots (inexact)", b_zt_nodots, (rows + 3) / 4}};
-    std::printf("rows %u cols %u tokens %u: weights %.1f MB, x int8 %.1f MB\n", rows, cols, T, w.size() / 1e6, xq.size() / 1e6);
+    const V vs[] = {{"t8z (current)", b_t8z, rows}, {"t8zb (one barrier)", b_t8zb, rows}, {"t8zt (one barrier, rows shared)", b_t8zt, q6k ? (rows + 1) / 2 : (rows + 3) / 4}, {"t8zh (weights held across groups)", b_t8zh, q6k ? (rows + 1) / 2 : (rows + 3) / 4}, {"t8zv4 (transient v, 4 rows)", b_t8zv4, (rows + 3) / 4}, {"t8zv6 (6 rows)", b_t8zv6, (rows + 5) / 6}, {"t8zv8 (8 rows)", b_t8zv8, (rows + 7) / 8}, {"t8zs (row per lane, stack)", b_t8zs, 0}, {"t8zx (4 rows, transpose fold)", b_t8zx, (rows + 3) / 4}, {"t8zt2 (4 rows, base+stride)", b_t8zt2, (rows + 3) / 4}, {"t8zt2o (same, 2 blocks/SM)", b_t8zt2o, (rows + 3) / 4}, {"t8zt8 (8 rows)", b_t8zt8, (rows + 7) / 8}, {"zt DIAG no tree (inexact)", b_zt_notree, (rows + 3) / 4}, {"zt DIAG no dots (inexact)", b_zt_nodots, (rows + 3) / 4}};
+    std::printf("rows %u cols %u tokens %u (%s): weights %.1f MB\n", rows, cols, T, q6k ? "planar Q6_K, f32 inputs" : "planar Q8_0, int8 inputs", w.size() / 1e6);
     for (size_t vi = 0; vi < sizeof(vs) / sizeof(vs[0]); ++vi) {
         const V& v = vs[vi];
         CK(cudaMemset(dy, 0, (u64)T * rows * 4));

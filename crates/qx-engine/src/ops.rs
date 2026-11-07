@@ -224,7 +224,8 @@ impl MGemv {
             let nb = if lanes == 0 { s.rows as u32 } else { (s.rows as u32).div_ceil(8 * (32 / lanes as u32)) };
             words.extend_from_slice(&[s.w, s.y, s.rows as u64, s.cols as u64, s.qx, lanes, blocks as u64, s.stride as u64]);
             blocks += nb;
-            let znb = if lanes == 0 && s.qx == QX_Q8_0_P { (s.rows as u32).div_ceil(4) } else { nb };
+            // 4 rows per block on the planar Q8_0 split-K segments, 2 on the other split-K ones (the f32 path)
+            let znb = if lanes == 0 && (s.qx == QX_Q8_0_P || s.cols <= 4096) { (s.rows as u32).div_ceil(if s.qx == QX_Q8_0_P { 4 } else { 2 }) } else { nb };
             zwords.extend_from_slice(&[s.w, s.y, s.rows as u64, s.cols as u64, s.qx, lanes, zblocks as u64, s.stride as u64]);
             zblocks += znb;
             if s.qx != QX_Q8_0_P {

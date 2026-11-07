@@ -43,6 +43,25 @@ template <int XM> QX_DEV float dot8(const float* w, const XIn<XM>& xi, u32 base)
     return w[0] * x0.x + w[1] * x0.y + w[2] * x0.z + w[3] * x0.w + w[4] * x1.x + w[5] * x1.y + w[6] * x1.z + w[7] * x1.w;
 }
 
+/// `dot8` split: the token's 8 inputs loaded and transformed once (shared across rows), then the same expression.
+template <int XM> QX_DEV void ldx8(const XIn<XM>& xi, u32 base, float4& x0, float4& x1) {
+    x0 = *reinterpret_cast<const float4*>(xi.x + base);
+    x1 = *reinterpret_cast<const float4*>(xi.x + base + 4);
+    if constexpr (XM == 1) {
+        const float s = __uint_as_float((u32)xi.arg);
+        x0 = make_float4(siluf_(x0.x * s), siluf_(x0.y * s), siluf_(x0.z * s), siluf_(x0.w * s));
+        x1 = make_float4(siluf_(x1.x * s), siluf_(x1.y * s), siluf_(x1.z * s), siluf_(x1.w * s));
+    } else if constexpr (XM == 2) {
+        const float* x2 = reinterpret_cast<const float*>(xi.arg) + base;
+        const float4 u0 = *reinterpret_cast<const float4*>(x2), u1 = *reinterpret_cast<const float4*>(x2 + 4);
+        x0 = make_float4(siluf_(x0.x) * u0.x, siluf_(x0.y) * u0.y, siluf_(x0.z) * u0.z, siluf_(x0.w) * u0.w);
+        x1 = make_float4(siluf_(x1.x) * u1.x, siluf_(x1.y) * u1.y, siluf_(x1.z) * u1.z, siluf_(x1.w) * u1.w);
+    }
+}
+QX_DEV float dot8x(const float* w, const float4& x0, const float4& x1) {
+    return w[0] * x0.x + w[1] * x0.y + w[2] * x0.z + w[3] * x0.w + w[4] * x1.x + w[5] * x1.y + w[6] * x1.z + w[7] * x1.w;
+}
+
 /// The lane's share of one row for NT tokens at once: steps st = step0, step0 + dstep, ... of 8*lanes elements
 /// each. Full steps run four at a time with all their loads issued before any use, so each warp keeps several
 /// chunks in flight. Every token's arithmetic is exactly the single-token sequence, whatever NT: a window of
@@ -456,6 +475,73 @@ template <int XM, int NT, int RB> QX_DEV void mgemv_zt(const u64* info) {
         __syncthreads();
         const u32 nt = nz * NT;
         for (u32 i = threadIdx.x; i < RB * nt; i += blockDim.x) {
+            const u32 r = i / nt, n = i % nt;
+            if (r < nr) {
+                float t = 0.f;
+                for (int k = 0; k < 8; ++k) t += part[k][r * 128 + n];
+                y[(info[6] + n) * rows + r0 + r] = t;
+            }
+        }
+        return;
+    }
+    if (lanes == 0 && ty != QX_Q8_0_P && cols <= 4096) {
+        // the f32 path (dequantized rows against f32 inputs), RBF rows per block, the lane's two steps (warp, and
+        // warp + 8 when cols == 4096) decoded once per block instead of once per token group (bench: 240 -> 176 us
+        // on 1,024 planar-Q6_K rows), both steps' inputs loaded before the arithmetic. The chain per (row, token)
+        // is `row_partial`'s for (lane, 32, warp, 8) at cols <= 4096: single steps into a0, out = (a0 + a1) + (a2 + a3)
+        // with a1..a3 zero, spelled out below so the bits are the same.
+        constexpr int RBF = 2;
+        const u32 r0 = blk * RBF;
+        const u32 nr = min((u32)RBF, rows - r0);
+        const u8* w = reinterpret_cast<const u8*>(d[0]) + (u64)r0 * stride;
+        const u32 b0 = warp * 256 + 8 * wl, b1 = b0 + 8 * 256;
+        const bool two = b1 < cols;
+        float w0[RBF][8], w1[RBF][8];
+#pragma unroll
+        for (int r = 0; r < RBF; ++r) {
+            const u8* row = w + (u64)(r < nr ? r : 0) * stride;
+            switch (ty) {
+#define DQ(t) case t: dec<t>(row, cols, b0, w0[r]); if (two) dec<t>(row, cols, b1, w1[r]); break;
+                DQ(QX_F32) DQ(QX_BF16) DQ(QX_Q8_0) DQ(QX_Q6_K) DQ(QX_IQ4_NL) DQ(QX_IQ3_S) DQ(QX_IQ2_S) DQ(QX_Q6_K_P) DQ(QX_NVFP4)
+                DQ(QX_IQ2_XXS) DQ(QX_IQ2_XS) DQ(QX_IQ3_XXS) DQ(QX_IQ1_S) DQ(QX_Q2_K) DQ(QX_Q5_K)
+#undef DQ
+                default:
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) w0[r][i] = w1[r][i] = 0.f;
+            }
+        }
+        for (u32 z = 0; z < nz; ++z) {
+            const u64 z0 = (u64)z * NT;
+            float a0[RBF][NT];
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                XIn<XM> xi;
+                xi.x = reinterpret_cast<const float*>(info[0]) + (z0 + n) * info[3];
+                xi.arg = XM == 2 ? info[4] + 4ull * (z0 + n) * info[3] : info[4];
+                xi.xq = nullptr;
+                xi.xd = nullptr;
+                float4 xa, xb, xc, xd;
+                ldx8<XM>(xi, b0, xa, xb);
+                if (two) ldx8<XM>(xi, b1, xc, xd);
+#pragma unroll
+                for (int r = 0; r < RBF; ++r) {
+                    float a = 0.f;
+                    a += dot8x(w0[r], xa, xb);
+                    if (two) a += dot8x(w1[r], xc, xd);
+                    a0[r][n] = a;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < RBF; ++r)
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    const float v = warp_sum((a0[r][n] + 0.f) + (0.f + 0.f));
+                    if (wl == 0) part[warp][r * 128 + z0 + n] = v;
+                }
+        }
+        __syncthreads();
+        const u32 nt = nz * NT;
+        for (u32 i = threadIdx.x; i < RBF * nt; i += blockDim.x) {
             const u32 r = i / nt, n = i % nt;
             if (r < nr) {
                 float t = 0.f;
