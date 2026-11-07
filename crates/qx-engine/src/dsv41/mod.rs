@@ -2188,6 +2188,11 @@ impl<'a> DsEngine<'a> {
             let (sps, cps) = if sp != 0 { (sp + (s0 * c.idx_top_k * 4) as u64, cp + (s0 * 4) as u64) } else { (0, 0) };
             if std::env::var("QX_DS_ATTN").is_ok_and(|v| v == "old") {
                 self.k("qx_ds_attn", 256, (c.n_head as u32, ts as u32, 1), &[q, self.st.ring_tables[l].ptr, self.ring_w as u64, ps, sl, sps, cps, stp, row as u64, w.sinks.ptr, o, bits(1.0 / (hd as f32).sqrt()), c.n_swa as u64, c.idx_top_k as u64, hd as u64]);
+            } else if attn_tile() && self.attn_chunks <= 64 {
+                // the slab form: one block per (8 heads, token) over all the chunks, the merge in-block (the same bits;
+                // the partials buffer holds the chunks' scores). QX_DS_ATTN=tile
+                let chunks = self.attn_chunks as u64;
+                self.k("qx_ds_attn_tile", 256, ((c.n_head / 8) as u32, ts as u32, 1), &[q, self.st.ring_tables[l].ptr, self.ring_w as u64, ps, sl, sps, cps, stp, row as u64, w.sinks.ptr, o, bits(1.0 / (hd as f32).sqrt()), c.n_swa as u64, c.idx_top_k as u64, hd as u64, self.s.attn_part.ptr, chunks]);
             } else {
                 let chunks = self.attn_chunks as u64;
                 self.k("qx_ds_attn_part", 256, ((c.n_head / 8) as u32, chunks as u32, ts as u32), &[q, self.st.ring_tables[l].ptr, self.ring_w as u64, ps, sl, sps, cps, stp, row as u64, w.sinks.ptr, o, bits(1.0 / (hd as f32).sqrt()), c.n_swa as u64, c.idx_top_k as u64, hd as u64, self.s.attn_part.ptr, chunks]);
@@ -2309,4 +2314,11 @@ impl<'a> DsEngine<'a> {
         self.dump(format!("l_out-{l}"), &self.s.r, hcd, act);
         self.dsync("layer");
     }
+}
+
+/// Whether the attention over a window runs the slab kernel (`QX_DS_ATTN=tile`: one block per 8 heads and token over
+/// all the key chunks, the merge in-block), the same bits as the chunked kernels.
+fn attn_tile() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| std::env::var("QX_DS_ATTN").is_ok_and(|v| v == "tile"))
 }

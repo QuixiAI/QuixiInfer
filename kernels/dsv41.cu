@@ -843,6 +843,133 @@ extern "C" __global__ void qx_ds_attn_part(const u64* info) {
     }
 }
 
+/// The slab form of `qx_ds_attn_part` + `qx_ds_attn_merge`, the same bits: one block per (8 heads, token) walks the
+/// token's key chunks of 12 in order with the 8 queries resident, so a chunk's keys and the queries are staged once
+/// per block instead of the queries once per chunk (the per-chunk blocks moved ~550 MB through shared memory per
+/// slab-layer call, 2026-11-07). Pass 1 scores every chunk (the scores to `scratch`, the partials buffer) and keeps
+/// each chunk's (m_c, l_c) exactly as `attn_part` computes them (the same lane mapping and shuffle trees); the
+/// merge's M, L and w_c follow in the merge's order; pass 2 reloads each chunk's keys, recomputes p_j = e^(s_j - m_c)
+/// from the stored scores, forms the chunk's o_c in key order and accumulates w_c * o_c in chunk order; o = acc / L.
+/// info as qx_ds_attn_part ([15] scratch: the partials buffer, [16] C). Grid (H / 8, T), 256 threads.
+extern "C" __global__ void __launch_bounds__(256) qx_ds_attn_tile(const u64* info) {
+    constexpr u32 KC = 12, KS = 513, CMAX = 64;
+    __shared__ float ks[KC * KS];
+    __shared__ float qs[8 * 512];
+    __shared__ float sc[8][KC];
+    __shared__ float mc[8][CMAX], lc[8][CMAX], wc[8][CMAX];
+    __shared__ float s_L[8];
+    const u32 hg = blockIdx.x, t = blockIdx.y, dim = U(14), W = U(2), n_swa = U(12), ksel = U(13);
+    const u32 H = gridDim.x * 8, C = U(16), tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const u32 pos = reinterpret_cast<const u32*>(info[3])[t], slot = reinterpret_cast<const u32*>(info[4])[t];
+    const float* ring = reinterpret_cast<const float*>(reinterpret_cast<const u64*>(info[1])[slot]);
+    const u32 first = pos + 1 > n_swa ? pos + 1 - n_swa : 0;
+    const u32 nw = pos + 1 - first;
+    const u32 ns = info[6] ? reinterpret_cast<const u32*>(info[6])[t] : 0;
+    const i32* sel = info[5] ? reinterpret_cast<const i32*>(info[5]) + (u64)t * ksel : nullptr;
+    const float* store = ns ? reinterpret_cast<const float*>(reinterpret_cast<const u64*>(info[7])[slot]) : nullptr;
+    const float scale = __uint_as_float(U(11));
+    const u32 nk = nw + ns;
+    // the chunks' scores: (t, h, c, j), 12 floats per (t, h, c), inside the partials buffer
+    float* scratch = F(15) + ((u64)t * H + hg * 8) * C * KC;
+    const float* q = CF(0) + ((u64)t * H + hg * 8) * dim;
+    for (u32 i = tid; i < 8 * dim; i += blockDim.x) qs[i] = q[i];
+    auto load_keys = [&](u32 j0) {
+        for (u32 j = 0; j < KC; ++j) {
+            const u32 jj = j0 + j;
+            if (jj < nk) {
+                const float* kr = jj < nw ? ring + (u64)((first + jj) % W) * dim : store + (u64)sel[jj - nw] * info[8];
+                for (u32 i = tid; i < dim; i += blockDim.x) ks[j * KS + i] = kr[i];
+            } else {
+                for (u32 i = tid; i < dim; i += blockDim.x) ks[j * KS + i] = 0.f;
+            }
+        }
+    };
+    const u32 nc = min(C, (nk + KC - 1) / KC);  // the non-empty chunks (the empty ones contribute nothing to the merge)
+    // pass 1: scores and each chunk's (m_c, l_c), as attn_part
+    for (u32 c = 0; c < nc; ++c) {
+        const u32 j0 = c * KC;
+        __syncthreads();  // the previous chunk's keys and scores are consumed
+        load_keys(j0);
+        __syncthreads();
+        {
+            const u32 p = tid / 2, half = tid & 1, h = p / KC, j = p % KC;
+            float d = 0.f;
+            if (p < 8 * KC && j0 + j < nk) {
+                const float* qq = qs + h * dim + half * (dim / 2);
+                const float* kk = ks + j * KS + half * (dim / 2);
+                for (u32 i = 0; i < dim / 2; ++i) d += qq[i] * kk[i];
+            }
+            d += __shfl_xor_sync(0xffffffffu, d, 1);
+            if (half == 0 && p < 8 * KC) {
+                const float s = j0 + j < nk ? d * scale : QX_NINF;
+                sc[h][j] = s;
+                scratch[((u64)h * C + c) * KC + j] = s;
+            }
+        }
+        __syncthreads();
+        {
+            const u32 h = warp;
+            float s = lane < KC ? sc[h][lane] : QX_NINF;
+            float m = s;
+            for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            float p = lane < KC && s != QX_NINF ? expf(s - m) : 0.f;
+            float l = p;
+            for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+            if (lane == 0) { mc[h][c] = m; lc[h][c] = l; }
+        }
+    }
+    __syncthreads();
+    // the merge's statistics per head, in its order (the empty chunks: m = -inf, l = 0, w = 0)
+    if (lane == 0) {
+        const u32 h = warp;
+        const float sink = CF(9)[hg * 8 + h];
+        float M = sink;
+        for (u32 c = 0; c < C; ++c) M = fmaxf(M, c < nc ? mc[h][c] : QX_NINF);
+        float L = expf(sink - M);
+        for (u32 c = 0; c < C; ++c) {
+            const float m = c < nc ? mc[h][c] : QX_NINF;
+            const float w = m == QX_NINF ? 0.f : expf(m - M);
+            if (c < nc) wc[h][c] = w;
+            L += (c < nc ? lc[h][c] : 0.f) * w;
+        }
+        s_L[h] = L;
+    }
+    __syncthreads();
+    // pass 2: per chunk the probabilities from the stored scores, o_c in key order, w_c * o_c in chunk order
+    float acc[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) acc[r] = 0.f;
+    for (u32 c = 0; c < nc; ++c) {
+        const u32 j0 = c * KC;
+        __syncthreads();
+        load_keys(j0);
+        {
+            const u32 h = warp;
+            if (lane < KC) {
+                const float s = scratch[((u64)h * C + c) * KC + lane];
+                sc[h][lane] = s != QX_NINF ? expf(s - mc[h][c]) : 0.f;
+            }
+        }
+        __syncthreads();
+        {
+            const u32 h = warp;
+            const float w = wc[h][c];
+            for (u32 r = 0; r < dim / 32; ++r) {
+                const u32 i = lane + 32 * r;
+                float o = 0.f;
+                for (u32 j = 0; j < KC; ++j) o += sc[h][j] * ks[j * KS + i];
+                acc[r] += w * o;
+            }
+        }
+    }
+    {
+        const u32 h = warp;
+        float* o = F(10) + ((u64)t * H + hg * 8 + h) * dim;
+        const float L = s_L[h];
+        for (u32 r = 0; r < dim / 32; ++r) o[lane + 32 * r] = acc[r] / L;
+    }
+}
+
 /// Merges the chunk partials of qx_ds_attn_part with the head's sink: M = max(m_c, sink), L = sum l_c e^(m_c - M)
 /// + e^(sink - M), o = sum o_c e^(m_c - M) / L. info: [0] partials, [1] sinks (H), [2] out (T x H x dim), [3] C,
 /// [4] dim. Grid (H, T), 256 threads.
