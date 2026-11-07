@@ -10,6 +10,7 @@
 #define F(i) reinterpret_cast<float*>(info[i])
 #define CF(i) reinterpret_cast<const float*>(info[i])
 #define U(i) ((u32)info[i])
+#define QX_SLOT_MASK 0x0000ffffffffffffull
 
 /// Softmax over n (<= 1024) logits, top k by probability (ties to the lower index), weights renormalised over
 /// the k (sum clamped at 6.103515625e-5). One warp: each lane holds n/32 logits.
@@ -391,9 +392,12 @@ template <int T> QX_DEV float iq_block_value(float d, float dmin, float dq, int 
 
 /// Gate and up rows of the resident selected experts against Q8_K activations, for an input of up to NB * 256
 /// elements. Grid and info as gateup_q8k.
-template <int T, int NB> QX_DEV void gateup_q8k_t(const u64* info) {
-    const u32 kk = blockIdx.y;
-    const u64 slot = reinterpret_cast<const u64*>(info[0])[kk];
+template <int T, int NB, bool SEL = false> QX_DEV void gateup_q8k_t(const u64* info) {
+    // SEL (the chunk path's per-expert launches): blockIdx.y indexes a selection list [9] and [0] is the address
+    // of one slot word the driver writes behind the record's copy (the launch waited on it)
+    const u32 kk = SEL ? reinterpret_cast<const u32*>(info[9])[blockIdx.y] : blockIdx.y;
+    // a chunk slot word carries the job's generation in its top 16 bits (no zeroing between jobs)
+    const u64 slot = SEL ? (*reinterpret_cast<const volatile u64*>(info[0]) & QX_SLOT_MASK) : reinterpret_cast<const u64*>(info[0])[kk];
     if (slot == 0) return;
     const u32 warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
     const u32 ff = U(5), nb = U(6) / 256;
@@ -431,6 +435,12 @@ extern "C" __global__ void qx_moe_gateup_q8k_iq2_xs_w20(const u64* info) { gateu
 extern "C" __global__ void qx_moe_gateup_q8k_iq3_xxs_w20(const u64* info) { gateup_q8k_t<QX_IQ3_XXS, 20>(info); }
 extern "C" __global__ void qx_moe_gateup_q8k_iq1_s_w20(const u64* info) { gateup_q8k_t<QX_IQ1_S, 20>(info); }
 extern "C" __global__ void qx_moe_gateup_q8k_q2_k_w20(const u64* info) { gateup_q8k_t<QX_Q2_K, 20>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_iq2_s_w20_sel(const u64* info) { gateup_q8k_t<QX_IQ2_S, 20, true>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_iq2_xxs_w20_sel(const u64* info) { gateup_q8k_t<QX_IQ2_XXS, 20, true>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_iq2_xs_w20_sel(const u64* info) { gateup_q8k_t<QX_IQ2_XS, 20, true>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_iq3_xxs_w20_sel(const u64* info) { gateup_q8k_t<QX_IQ3_XXS, 20, true>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_iq1_s_w20_sel(const u64* info) { gateup_q8k_t<QX_IQ1_S, 20, true>(info); }
+extern "C" __global__ void qx_moe_gateup_q8k_q2_k_w20_sel(const u64* info) { gateup_q8k_t<QX_Q2_K, 20, true>(info); }
 
 /// Down rows of the resident selected experts for formats with 256-element blocks: the expert's hidden
 /// activations `h = silu(min(g, c)) * clamp(u, -c, c)` (c = 0: plain silu(g) * u) are quantized to Q8_K in shared
@@ -438,13 +448,13 @@ extern "C" __global__ void qx_moe_gateup_q8k_q2_k_w20(const u64* info) { gateup_
 /// integer dots, blocks summed in order. ff <= 2560. Grid: (ceil(E / (8 * DRPW)), k), 256 threads.
 /// info: [0] slots, [1] gu, [2] clamp (f32 bits), [3] unused, [4] v out (k x E), [5] ff, [6] E, [7] offset of the
 /// down rows in the slot, [8] down row bytes.
-template <int T> QX_DEV void down_q8k_t(const u64* info) {
+template <int T, bool SEL = false> QX_DEV void down_q8k_t(const u64* info) {
     __shared__ __align__(16) i8 hq[2560];
     __shared__ float hd[10];
     __shared__ float av[256];
     __shared__ u32 ai[256];
-    const u32 kk = blockIdx.y, ff = U(5), n = U(6), nb = ff / 256;
-    const u64 slot = reinterpret_cast<const u64*>(info[0])[kk];
+    const u32 kk = SEL ? reinterpret_cast<const u32*>(info[9])[blockIdx.y] : blockIdx.y, ff = U(5), n = U(6), nb = ff / 256;
+    const u64 slot = SEL ? (*reinterpret_cast<const volatile u64*>(info[0]) & QX_SLOT_MASK) : reinterpret_cast<const u64*>(info[0])[kk];
     if (slot == 0) return;
     const float* gu = CF(1) + (u64)kk * 2 * ff;
     const float c = __uint_as_float((u32)info[2]);
@@ -502,6 +512,13 @@ extern "C" __global__ void qx_moe_down_q8k_iq2_xs(const u64* info) { down_q8k_t<
 extern "C" __global__ void qx_moe_down_q8k_iq3_xxs(const u64* info) { down_q8k_t<QX_IQ3_XXS>(info); }
 extern "C" __global__ void qx_moe_down_q8k_iq1_s(const u64* info) { down_q8k_t<QX_IQ1_S>(info); }
 extern "C" __global__ void qx_moe_down_q8k_q2_k(const u64* info) { down_q8k_t<QX_Q2_K>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq2_s_sel(const u64* info) { down_q8k_t<QX_IQ2_S, true>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq3_s_sel(const u64* info) { down_q8k_t<QX_IQ3_S, true>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq2_xxs_sel(const u64* info) { down_q8k_t<QX_IQ2_XXS, true>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq2_xs_sel(const u64* info) { down_q8k_t<QX_IQ2_XS, true>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq3_xxs_sel(const u64* info) { down_q8k_t<QX_IQ3_XXS, true>(info); }
+extern "C" __global__ void qx_moe_down_q8k_iq1_s_sel(const u64* info) { down_q8k_t<QX_IQ1_S, true>(info); }
+extern "C" __global__ void qx_moe_down_q8k_q2_k_sel(const u64* info) { down_q8k_t<QX_Q2_K, true>(info); }
 
 /// NVFP4 gate and up rows . Q8_K x, bit-equal to the CPU pool (qx_cpu::dot::nvfp4_q8k): per 256-chunk, lane l
 /// holds 8 codes of sub-block l / 2 (even lanes the low nibbles, odd the high); the integer sub-block sums pair
@@ -889,4 +906,58 @@ extern "C" __global__ void qx_moe_down_nvfp4(const u64* info) { moe_down<QX_NVFP
 extern "C" __global__ void qx_moe_slots_all(const u64* info) {
     const u32 a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a < U(4)) reinterpret_cast<u64*>(info[1])[a] = info[2] + (u64)reinterpret_cast<const i32*>(info[0])[a] * info[3];
+}
+
+// ---- the chunk path (prefill in chunks of many rows, experts streamed once per layer) ----
+
+/// Spins until the slot word at [0] carries generation [1] in its top 16 bits (the driver writes `address |
+/// gen << 48` behind the record's copy, or at once for a VRAM-resident record; no zeroing between jobs, so no
+/// race between a reset and the copy streams' writes). One thread.
+extern "C" __global__ void qx_moe_wait_word(const u64* info) {
+    const u64* w = reinterpret_cast<const u64*>(info[0]);
+    const u64 gen = info[1];
+    while ((ld_acquire_sys(w) >> 48) != gen) {
+    }
+}
+
+/// Stores [1] at the host-mapped word [0] with release semantics (the GPU's progress mark for the driver's slot
+/// reuse). One thread.
+extern "C" __global__ void qx_moe_signal(const u64* info) {
+    st_release_sys(reinterpret_cast<u64*>(info[0]), info[1]);
+}
+
+/// Q8_K of one row of x per block, the post kernel's rule (per 256: the first index of the largest magnitude sets
+/// the scale). info: [0] x (rows x E f32), [1] xq out (rows x E i8), [2] xd out (rows x E/256 f32), [3] E.
+/// Grid (rows), 256 threads.
+extern "C" __global__ void qx_moe_q8k_rows(const u64* info) {
+    const u32 E = U(3), tk = blockIdx.x;
+    const float* x = CF(0) + (u64)tk * E;
+    const u32 w = threadIdx.x / 32, l = threadIdx.x % 32;
+    for (u32 b = w; b < E / 256; b += blockDim.x / 32) {
+        float v[8], am = 0.f;
+        u32 ai = 0xffffffffu;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            v[i] = x[b * 256 + 8 * l + i];
+            const float a = fabsf(v[i]);
+            if (a > am) { am = a; ai = 8 * l + i; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float oa = __shfl_xor_sync(0xffffffffu, am, o);
+            const u32 oi = __shfl_xor_sync(0xffffffffu, ai, o);
+            if (oa > am || (oa == am && oi < ai)) { am = oa; ai = oi; }
+        }
+        i8* qs = reinterpret_cast<i8*>(info[1]) + (u64)tk * E + b * 256 + 8 * l;
+        float* dd = reinterpret_cast<float*>(info[2]) + (u64)tk * (E / 256);
+        if (am == 0.f) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) qs[i] = 0;
+            if (l == 0) dd[b] = 0.f;
+        } else {
+            const float iscale = __fdiv_rn(-127.f, x[b * 256 + ai]);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) qs[i] = (i8)min(127, __float2int_rn(__fmul_rn(iscale, v[i])));
+            if (l == 0) dd[b] = __fdiv_rn(1.f, iscale);
+        }
+    }
 }

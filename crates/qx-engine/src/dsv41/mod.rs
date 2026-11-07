@@ -212,12 +212,15 @@ pub struct Parked {
     pub tokens: Vec<u32>,
     /// Per layer: the used rows of its compressed store (empty for layers without one).
     stores: Vec<Vec<f32>>,
+    /// Per layer: the slot's whole attention ring (`ring_w` latents), so `unpark` at the parked position needs no
+    /// replay. Empty in files written before the format carried it (`QXPK0001`): those are restored by replay.
+    rings: Vec<Vec<f32>>,
 }
 
 impl Parked {
     /// Host bytes held.
     pub fn bytes(&self) -> usize {
-        4 * (self.tokens.len() + self.stores.iter().map(Vec::len).sum::<usize>())
+        4 * (self.tokens.len() + self.stores.iter().map(Vec::len).sum::<usize>() + self.rings.iter().map(Vec::len).sum::<usize>())
     }
 
     /// Positions held.
@@ -225,17 +228,20 @@ impl Parked {
         self.tokens.len()
     }
 
-    /// Writes the state to `path`: a magic, the tokens, then every layer's store rows (little-endian).
+    /// Writes the state to `path`: a magic, the tokens, every layer's store rows, then every layer's ring
+    /// (little-endian; `QXPK0002`).
     pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-        f.write_all(b"QXPK0001")?;
+        f.write_all(b"QXPK0002")?;
         f.write_all(&(self.tokens.len() as u64).to_le_bytes())?;
         f.write_all(bytemuck::cast_slice(&self.tokens))?;
-        f.write_all(&(self.stores.len() as u64).to_le_bytes())?;
-        for s in &self.stores {
-            f.write_all(&(s.len() as u64).to_le_bytes())?;
-            f.write_all(bytemuck::cast_slice(s))?;
+        for part in [&self.stores, &self.rings] {
+            f.write_all(&(part.len() as u64).to_le_bytes())?;
+            for s in part {
+                f.write_all(&(s.len() as u64).to_le_bytes())?;
+                f.write_all(bytemuck::cast_slice(s))?;
+            }
         }
         f.flush()
     }
@@ -246,9 +252,11 @@ impl Parked {
         let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
-        if &magic != b"QXPK0001" {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a QuixiInfer state file"));
-        }
+        let has_rings = match &magic {
+            b"QXPK0001" => false,
+            b"QXPK0002" => true,
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a QuixiInfer state file")),
+        };
         let mut n = [0u8; 8];
         let rd_len = |f: &mut std::io::BufReader<std::fs::File>, n: &mut [u8; 8]| -> std::io::Result<usize> {
             f.read_exact(n)?;
@@ -257,16 +265,53 @@ impl Parked {
         let nt = rd_len(&mut f, &mut n)?;
         let mut tokens = vec![0u32; nt];
         f.read_exact(bytemuck::cast_slice_mut(&mut tokens))?;
-        let nl = rd_len(&mut f, &mut n)?;
-        let mut stores = Vec::with_capacity(nl);
-        for _ in 0..nl {
-            let len = rd_len(&mut f, &mut n)?;
-            let mut v = vec![0f32; len];
-            f.read_exact(bytemuck::cast_slice_mut(&mut v))?;
-            stores.push(v);
+        let mut parts: Vec<Vec<Vec<f32>>> = Vec::new();
+        for _ in 0..(if has_rings { 2 } else { 1 }) {
+            let nl = rd_len(&mut f, &mut n)?;
+            let mut part = Vec::with_capacity(nl);
+            for _ in 0..nl {
+                let len = rd_len(&mut f, &mut n)?;
+                let mut v = vec![0f32; len];
+                f.read_exact(bytemuck::cast_slice_mut(&mut v))?;
+                part.push(v);
+            }
+            parts.push(part);
         }
-        Ok(Parked { tokens, stores })
+        let rings = if has_rings { parts.pop().unwrap() } else { Vec::new() };
+        let stores = parts.pop().unwrap();
+        Ok(Parked { tokens, stores, rings })
     }
+}
+
+/// The chunk path's per-row state (`forward_chunk`): what crosses the layer boundary (the hc streams `r`, the
+/// FFN hc pre-mix of the previous layer `pre`), what the MoE phase needs for every row of the chunk at once (`x`,
+/// `xq`/`xd`, `ids`/`wts`, the per-selection `gu` and `out`, the shared expert's `shy`, the FFN hc terms `post`/`comb`),
+/// the token arrays, the per-expert selection lists and slot words, and the Engram rows of every row.
+pub struct ChunkBufs {
+    pub rows: usize,
+    r: DeviceBuf,
+    pre: DeviceBuf,
+    post: DeviceBuf,
+    comb: DeviceBuf,
+    x: DeviceBuf,
+    shy: DeviceBuf,
+    ids: DeviceBuf,
+    wts: DeviceBuf,
+    xq: DeviceBuf,
+    xd: DeviceBuf,
+    gu: DeviceBuf,
+    out: DeviceBuf,
+    tok: DeviceBuf,
+    pos: DeviceBuf,
+    slot: DeviceBuf,
+    sel: DeviceBuf,
+    slots_tbl: DeviceBuf,
+    erows_host: qx_gpu::mem::HostMapped,
+    /// Per indexer layer: the selected rows and their count per row of the chunk (read by the layers above it,
+    /// so they must outlive the slab pass), and the candidate blocks of the candidate source layer likewise.
+    sels: Vec<Option<(DeviceBuf, DeviceBuf)>>,
+    cand_sel: DeviceBuf,
+    cand_count: DeviceBuf,
 }
 
 /// The device side of the tiers in the asynchronous mode (the host side lives in the driver thread).
@@ -308,6 +353,18 @@ pub struct DsEngine<'a> {
     layers: Vec<Layer<'a>>,
     s: Scratch,
     st: State,
+    /// The chunk path's buffers (`forward_chunk`), allocated at load when `QX_DS_CHUNK` is set.
+    chunk: Option<ChunkBufs>,
+    /// The Engram host rows' layout for the next launches: rows per Engram-layer region and the first row the
+    /// window reads (DS_TMAX and 0 for windows; the chunk's rows and the slab's first row in chunk mode).
+    erows_stride: usize,
+    erows_row0: usize,
+    /// The chunk jobs' generation counter (see `ChunkJob::gen`).
+    chunk_gen: u64,
+    /// Set while `replay_to` rebuilds the rings: the windows skip the compressed-store and index-key writes (the
+    /// stores already hold the exact rows; the replay's early positions are not exact and must not overwrite or
+    /// be read back from them) and launch eagerly (no graph has that kernel set).
+    replaying: bool,
     /// The pool for the experts the host dispatches (None in the asynchronous mode: the driver has its own).
     pool: Option<Pool>,
     /// Rows the compressed stores hold (the context in compressed positions).
@@ -333,6 +390,8 @@ pub struct DsEngine<'a> {
     pub slots: usize,
     /// The captured token (asynchronous mode), and whether the warm-up run before its capture happened.
     graphs: Vec<Option<cubecl_runtime::client::Graph>>,
+    /// Per width: the graph of the KV-only variant (layers up to the last KV source, see `prompt_keep`).
+    graphs_kv: Vec<Option<cubecl_runtime::client::Graph>>,
     /// Per width: whether its compile pass ran (see `forward_segments`); `warm` marks that pass while it runs.
     warmed: Vec<bool>,
     warm: bool,
@@ -638,6 +697,34 @@ impl<'a> DsEngine<'a> {
             // the selected rows and their count per token of a window
             sels.push(if has_idx_q { Some((buf(cfg.idx_top_k * DS_TMAX), buf(DS_TMAX))) } else { None });
         }
+        // QX_DS_CHUNK=N: the chunk path's buffers for N rows (before the tiers take the rest of the VRAM)
+        let chunk = std::env::var("QX_DS_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).map(|rows| {
+            let k = cfg.n_expert_used;
+            ChunkBufs {
+                rows,
+                r: buf(rows * hcd),
+                pre: buf(rows * hc),
+                post: buf(rows * hc),
+                comb: buf(rows * hc * hc),
+                x: buf(rows * E),
+                shy: buf(rows * E),
+                ids: buf(rows * k),
+                wts: buf(rows * k),
+                xq: DeviceBuf::new(rows * E),
+                xd: buf(rows * (E / 256)),
+                gu: buf(rows * k * 2 * cfg.ff_exp),
+                out: buf(rows * k * E),
+                tok: buf(rows),
+                pos: buf(rows),
+                slot: buf(rows),
+                sel: buf(rows * k),
+                slots_tbl: buf(2 * cfg.n_expert),
+                erows_host: qx_gpu::mem::HostMapped::new(cfg.engram_layers.len() * rows * cfg.engram_cols() * cfg.engram_dim * 4),
+                sels: (0..cfg.n_layer).map(|l| (cfg.topk_src[l] == l as i32).then(|| (buf(cfg.idx_top_k * rows), buf(rows)))).collect(),
+                cand_sel: buf(cfg.cand_blocks.max(1) * rows),
+                cand_count: buf(rows),
+            }
+        });
         let output = mat("output.weight")?;
         let g_out = MGemv::new(&[output.seg(&s.logits)]);
         let cpus = pool_cpus();
@@ -828,6 +915,11 @@ impl<'a> DsEngine<'a> {
             layers,
             s,
             st: State { rings, ring_tables, stores, sels, tokens: vec![Vec::new(); slots], pos: vec![0; slots] },
+            chunk,
+            erows_stride: DS_TMAX,
+            erows_row0: 0,
+            chunk_gen: 0,
+            replaying: false,
             slots,
             pool: if driver.is_some() { None } else { Some(Pool::new(&cpus)) },
             max_rows: max_ctx,
@@ -841,6 +933,7 @@ impl<'a> DsEngine<'a> {
             engram_ring: engram_pack.as_ref().map(|_| std::cell::RefCell::new(io_uring::IoUring::new(128).expect("engram io_uring"))),
             engram_pack,
             graphs: (0..=DS_TMAX).map(|_| None).collect(),
+            graphs_kv: (0..=DS_TMAX).map(|_| None).collect(),
             warmed: vec![false; DS_TMAX + 1],
             warm: false,
             t_engram: 0.0,
@@ -1175,11 +1268,10 @@ impl<'a> DsEngine<'a> {
 
     /// Rewinds slot `slot` to position `p` (a group boundary for every compressor ratio, so an even position).
     /// The compressed stores and indexer keys are positional, so positions from `p` on are simply recomputed; the
-    /// attention ring must hold the window [p - n_swa, p). If the ring still does (the rewind is within the last
-    /// DS_TMAX positions), nothing is copied; otherwise the window is rebuilt by replaying the slot's own tokens
-    /// from the group boundary at or below p - n_swa: identical inputs through the same deterministic kernels give
-    /// the ring, the compressed rows and the keys bit for bit (about 130 tokens, one or two windows). This
-    /// replaced a per-position host copy of every latent, 21.5 GB per slot at 256k (2026-11-06).
+    /// attention ring must hold the window [p - n_swa, p) at every layer. If the ring still does (the rewind is
+    /// within the last DS_TMAX positions), nothing is copied; otherwise the rings are rebuilt by replaying the
+    /// slot's own tokens (`replay_to`). This replaced a per-position host copy of every latent, 21.5 GB per slot
+    /// at 256k (2026-11-06).
     pub fn rewind(&mut self, slot: usize, p: usize) {
         assert!(p <= self.st.pos[slot], "rewind past the end");
         let max_ratio = self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
@@ -1194,15 +1286,30 @@ impl<'a> DsEngine<'a> {
         self.replay_to(slot, p);
     }
 
-    /// Rebuilds slot `slot`'s attention window for position `p` by replaying its tokens from the group boundary
-    /// at or below p - n_swa, and leaves the slot at `p` (tokens truncated). The slot's tokens must hold [0, p).
+    /// Tokens a replay must cover so that every layer's ring is exact at its end: a layer's keys at a position
+    /// come from the layer below's output there, which needs that layer's own window of n_swa positions, so each
+    /// layer adds n_swa - 1 positions of warm-up; n_layer layers deep, n_swa + n_layer * (n_swa - 1) (5,208 here).
+    pub fn replay_span(&self) -> usize {
+        self.cfg.n_swa + self.cfg.n_layer * (self.cfg.n_swa - 1)
+    }
+
+    /// Rebuilds slot `slot`'s attention rings for position `p` by replaying its tokens from the group boundary at
+    /// or below p - replay_span(), and leaves the slot at `p` (tokens truncated). The slot's tokens must hold
+    /// [0, p). The replay runs in `replaying` mode: the compressed stores and index keys are neither written nor
+    /// disturbed (they hold the exact rows of every position below `p` already; the replay's early positions are
+    /// not exact, and a later replayed position reads the rows of the earlier ones), only the rings are rebuilt,
+    /// and the chain of n_swa - 1 positions per layer makes the last n_swa positions exact at every layer by the
+    /// end. (Before 2026-11-06 the replay covered n_swa tokens, which left every layer above the first inexact;
+    /// a first fix saved and restored the rows but let the replay read its own wrong ones.)
     fn replay_to(&mut self, slot: usize, p: usize) {
         let max_ratio = self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
-        let mut a = p.saturating_sub(self.cfg.n_swa);
+        let mut a = p.saturating_sub(self.replay_span());
         a -= a % max_ratio;
         let replay: Vec<u32> = self.st.tokens[slot][a..p].to_vec();
         self.st.tokens[slot].truncate(a);
         self.st.pos[slot] = a;
+        self.gpu.sync();
+        self.replaying = true;
         let mut off = 0;
         while off < replay.len() {
             // widths whose kernels every server warms (the scheduler's set): never 5 or 7, whose kernels may not be
@@ -1213,13 +1320,15 @@ impl<'a> DsEngine<'a> {
             let _ = self.forward_segments(&segs, None);
             off += w;
         }
+        self.replaying = false;
         debug_assert_eq!(self.st.pos[slot], p);
+        self.gpu.sync();
     }
 
-    /// Moves slot `slot`'s sequence out to host memory and leaves the slot empty (as after `reset`): its tokens
-    /// and the used rows of its compressed stores (`pos / ratio` per store). `unpark` puts it back into any slot.
-    /// The ring and the pending pairs are not kept: a restore goes through `rewind`, which rebuilds the attention
-    /// window by replay at a group boundary, where no group is pending.
+    /// Moves slot `slot`'s sequence out to host memory and leaves the slot empty (as after `reset`): its tokens,
+    /// the used rows of its compressed stores (`pos / ratio` per store) and its attention rings. `unpark` puts it
+    /// back into any slot. The pending pairs are not kept: a park happens at a group boundary, where no group is
+    /// pending.
     pub fn park(&mut self, slot: usize) -> Parked {
         let p = self.snapshot(slot);
         self.st.tokens[slot].clear();
@@ -1227,7 +1336,8 @@ impl<'a> DsEngine<'a> {
         p
     }
 
-    /// Slot `slot`'s state as `park` would take it, without emptying the slot: the tokens and the used store rows.
+    /// Slot `slot`'s state as `park` would take it, without emptying the slot: the tokens, the used store rows
+    /// and the rings.
     pub fn snapshot(&mut self, slot: usize) -> Parked {
         self.gpu.sync();
         let pos = self.st.pos[slot];
@@ -1244,7 +1354,9 @@ impl<'a> DsEngine<'a> {
             });
         }
         let tokens = self.st.tokens[slot].clone();
-        Parked { tokens, stores }
+        let n_ring = self.ring_w * self.cfg.head_dim;
+        let rings = (0..self.cfg.n_layer).map(|l| self.st.rings[l].download_at::<f32>(slot * n_ring * 4, n_ring)).collect();
+        Parked { tokens, stores, rings }
     }
 
     /// Puts a parked sequence into slot `slot` (whatever the slot held is dropped) and rewinds it to `upto`, a
@@ -1264,9 +1376,304 @@ impl<'a> DsEngine<'a> {
         }
         self.st.tokens[slot] = p.tokens;
         self.st.pos[slot] = pos;
-        // the ring is empty whatever the distance: always replay the window before `upto`
         assert!(upto % self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize == 0, "unpark to a group boundary");
-        self.replay_to(slot, upto);
+        if p.rings.len() == self.cfg.n_layer {
+            // the rings as parked: exact at `pos`, and `rewind` keeps its fast path within the last DS_TMAX
+            let n_ring = self.ring_w * self.cfg.head_dim;
+            for l in 0..self.cfg.n_layer {
+                self.st.rings[l].upload_at(slot * n_ring * 4, &p.rings[l][..n_ring]);
+            }
+            self.rewind(slot, upto);
+        } else {
+            // a state without rings (QXPK0001): rebuild them by replay
+            self.replay_to(slot, upto);
+        }
+    }
+
+    /// The Engram rows of every Engram layer and token of `toks` (at `positions`), gathered on the host into the
+    /// mapped regions of `dst` (region ei holds token n's rows at (ei * stride + n) * cols * dim). Sets `t_engram`.
+    fn gather_engram(&self, toks: &[(usize, u32)], positions: &[u32], dst: &qx_gpu::mem::HostMapped, stride: usize) -> f64 {
+        let t = toks.len();
+        let c = &self.cfg;
+        let ed = c.engram_dim;
+        let n_e = c.engram_cols() * ed;
+        let te = std::time::Instant::now();
+        let all_rows: Vec<Vec<u64>> = (0..c.engram_layers.len()).flat_map(|ei| (0..t).map(move |n| (ei, n))).map(|(ei, n)| c.engram_rows(ei, &self.st.tokens[toks[n].0], positions[n] as usize)).collect();
+        if let (Some((f, pack)), Some(ring)) = (&self.engram_pack, &self.engram_ring) {
+            use io_uring::{opcode, types};
+            use std::os::fd::AsRawFd;
+            let rb = pack.ple.row_bytes as usize;
+            let flat: Vec<u64> = all_rows.iter().flatten().copied().collect();
+            let mut raw = vec![0u8; flat.len() * rb];
+            let mut ring = ring.borrow_mut();
+            let mut next = 0;
+            let mut done = 0;
+            while done < flat.len() {
+                while next < flat.len() && next - done < 120 {
+                    let e = opcode::Read::new(types::Fd(f.as_raw_fd()), unsafe { raw.as_mut_ptr().add(next * rb) }, rb as u32).offset(pack.ple_row(flat[next])).build().user_data(next as u64);
+                    unsafe { ring.submission().push(&e).expect("engram io_uring queue") };
+                    next += 1;
+                }
+                ring.submit_and_wait(1).expect("engram io_uring submit");
+                for cqe in ring.completion() {
+                    assert!(cqe.result() == rb as i32, "engram row read returned {}", cqe.result());
+                    done += 1;
+                }
+            }
+            let ty = qx_pack::ggml::GgmlType::from_id(13).unwrap(); // Q5_K
+            let mut i = 0;
+            for (ri, rows) in all_rows.iter().enumerate() {
+                let (ei, n) = (ri / t, ri % t);
+                let dst = dst.slice::<f32>((ei * stride + n) * n_e * 4, n_e);
+                for j in 0..rows.len() {
+                    qx_pack::dequant(ty, &raw[i * rb..(i + 1) * rb], &mut dst[j * ed..(j + 1) * ed]);
+                    i += 1;
+                }
+            }
+        } else {
+            for (ri, rows) in all_rows.iter().enumerate() {
+                let (ei, n) = (ri / t, ri % t);
+                let dst = dst.slice::<f32>((ei * stride + n) * n_e * 4, n_e);
+                for (j, &r) in rows.iter().enumerate() {
+                    self.engram_row(r, &mut dst[j * ed..(j + 1) * ed]);
+                }
+            }
+        }
+        te.elapsed().as_secs_f64()
+    }
+
+    /// The dry pass of width `t` (see `forward_segments`), once per width: the window's whole kernel set with the
+    /// expert job replaced by zeroed slot lists, then the device drained. The token arrays must hold the window
+    /// the real pass runs next (the dry pass writes the same ring and store positions, which the real pass rewrites).
+    fn warm_width(&mut self, t: usize, pos_min: usize, pos_max: usize) {
+        if self.driver.is_some() && !self.warmed[t] {
+            let max_ratio = self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
+            if let Some(d) = &self.driver {
+                d.shared.mb.slice::<f32>(crate::mailbox::mb_y(E), crate::mailbox::AMAX * E).fill(0.0);
+            }
+            self.warm = true;
+            let p = max_ratio - 1;
+            self.launch_window(t, pos_min.max(p), pos_max.max(p), None, false);
+            self.warm = false;
+            self.gpu.sync();
+            self.warmed[t] = true;
+        }
+    }
+
+    /// Points the per-row scratch of `s` at rows [r0, r0 + t) of the chunk buffers (the layer parts read and write
+    /// `s.*` by pointer). `pre_prev` and `pre_f` alias one region: the attention part reads it, the FFN part then
+    /// writes the next layer's value. Not `shy`: the shared expert's GEMV group was bound to the scratch buffer at
+    /// load, so the slab pass copies it out instead.
+    fn chunk_views(&mut self, r0: usize, t: usize) {
+        let cb = self.chunk.as_ref().expect("chunk buffers");
+        let (hc, hcd, k) = (self.cfg.hc, self.cfg.hc * E, self.cfg.n_expert_used);
+        let v = |b: &DeviceBuf, per_row: usize| DeviceBuf::view(b.ptr + (r0 * per_row * 4) as u64, t * per_row * 4);
+        let views = [
+            (v(&cb.r, hcd), 0usize), (v(&cb.pre, hc), 1), (v(&cb.pre, hc), 2), (v(&cb.post, hc), 3), (v(&cb.comb, hc * hc), 4),
+            (v(&cb.x, E), 5), (v(&cb.ids, k), 7), (v(&cb.wts, k), 8), (v(&cb.tok, 1), 9), (v(&cb.pos, 1), 10), (v(&cb.slot, 1), 11),
+        ];
+        let topk = self.cfg.idx_top_k;
+        let cand = (v(&cb.cand_sel, self.cfg.cand_blocks.max(1)), v(&cb.cand_count, 1));
+        let sels: Vec<Option<(DeviceBuf, DeviceBuf)>> = cb.sels.iter().map(|o| o.as_ref().map(|(sb, cnt)| (v(sb, topk), v(cnt, 1)))).collect();
+        for (view, which) in views {
+            let slot: &mut DeviceBuf = match which {
+                0 => &mut self.s.r, 1 => &mut self.s.pre_prev, 2 => &mut self.s.pre_f, 3 => &mut self.s.post, 4 => &mut self.s.comb,
+                5 => &mut self.s.x, 7 => &mut self.s.ids, 8 => &mut self.s.wts, 9 => &mut self.s.tok, 10 => &mut self.s.pos, _ => &mut self.s.slot,
+            };
+            *slot = view;
+        }
+        self.s.cand_sel = cand.0;
+        self.s.cand_count = cand.1;
+        for (l, o) in sels.into_iter().enumerate() {
+            if let Some(pair) = o {
+                self.st.sels[l] = Some(pair);
+            }
+        }
+        self.erows_row0 = r0;
+    }
+
+    /// A prompt chunk of `toks` (1 to the chunk buffers' rows) for slot `slot`, layer-major: every layer runs its
+    /// attention and FFN-pre parts over the chunk in slabs of DS_TMAX rows, then the layer's routed experts over
+    /// every row of the chunk at once, each distinct expert streamed into VRAM once (the driver's chunk job: VRAM
+    /// residents first, then RAM records through the staging ring, then NVMe records), then the FFN-post parts.
+    /// The slab parts are the window kernels on views of the chunk buffers, so every row computes what windows
+    /// compute, bit for bit; the expert kernels are the window kernels indexed by selection lists. Launches are
+    /// eager (no graph). Returns the last row's logits. Needs the asynchronous driver and `QX_DS_CHUNK`.
+    pub fn forward_chunk(&mut self, slot: usize, toks: &[u32]) -> Vec<f32> {
+        let tf = std::time::Instant::now();
+        self.t_experts = 0.0;
+        let rows = toks.len();
+        let rows_max = self.chunk.as_ref().map(|c| c.rows).expect("QX_DS_CHUNK=N sets the chunk buffers at load");
+        assert!((1..=rows_max).contains(&rows), "chunk of {rows} rows (buffers for {rows_max})");
+        assert!(self.driver.is_some() && self.abufs.is_some(), "the chunk path needs the asynchronous driver");
+        assert!(slot < self.slots);
+        let (k, ne, ff, n_layer, n_vocab) = (self.cfg.n_expert_used, self.cfg.n_expert, self.cfg.ff_exp, self.cfg.n_layer, self.cfg.n_vocab);
+        let clamp_exp: Vec<f32> = self.cfg.clamp_exp.clone();
+        let pos0 = self.st.pos[slot];
+        let positions: Vec<u32> = (0..rows).map(|i| (pos0 + i) as u32).collect();
+        let slots_v: Vec<u32> = vec![slot as u32; rows];
+        let segs: Vec<(usize, u32)> = toks.iter().map(|&t| (slot, t)).collect();
+        for &t in toks {
+            assert!((t as usize) < n_vocab, "token id {t} outside the vocabulary");
+            self.st.tokens[slot].push(t);
+        }
+        // the dry passes of the slab widths, on the ordinary scratch with the first slab's arrays (the previous
+        // forward synced, so nothing is in flight)
+        let t_last = rows - (rows - 1) / DS_TMAX * DS_TMAX;
+        let t0 = rows.min(DS_TMAX);
+        self.s.tok.upload(&toks[..t0]);
+        self.s.pos.upload(&positions[..t0]);
+        self.s.slot.upload(&slots_v[..t0]);
+        let mut widths = vec![t0];
+        if t_last != t0 {
+            widths.push(t_last);
+        }
+        for &w in &widths {
+            self.warm_width(w, pos0, pos0 + w - 1);
+        }
+        // the chunk arrays and the Engram rows of every row
+        {
+            let cb = self.chunk.as_ref().unwrap();
+            cb.tok.upload(toks);
+            cb.pos.upload(&positions);
+            cb.slot.upload(&slots_v);
+            self.t_engram = self.gather_engram(&segs, &positions, &cb.erows_host, rows_max);
+        }
+        let saved = [
+            std::mem::replace(&mut self.s.r, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.pre_prev, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.pre_f, DeviceBuf::view(0, 0)),
+            std::mem::replace(&mut self.s.post, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.comb, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.x, DeviceBuf::view(0, 0)),
+            std::mem::replace(&mut self.s.ids, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.wts, DeviceBuf::view(0, 0)),
+            std::mem::replace(&mut self.s.tok, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.pos, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.slot, DeviceBuf::view(0, 0)),
+        ];
+        let saved_cand = (std::mem::replace(&mut self.s.cand_sel, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.cand_count, DeviceBuf::view(0, 0)));
+        let saved_sels: Vec<Option<(DeviceBuf, DeviceBuf)>> = self.st.sels.iter_mut().map(|o| o.take()).collect();
+        // the chunk's Engram rows in place of the window's region while the slab parts run
+        std::mem::swap(&mut self.s.erows_host, &mut self.chunk.as_mut().unwrap().erows_host);
+        self.erows_stride = rows_max;
+        let n_slabs = rows.div_ceil(DS_TMAX);
+        let slab = |si: usize| -> (usize, usize) {
+            let r0 = si * DS_TMAX;
+            (r0, (rows - r0).min(DS_TMAX))
+        };
+        let d = self.driver.as_ref().unwrap().shared.clone();
+        let mut t_moe = 0f64;
+        let (mut t_enq, mut t_sync, mut t_post) = (0f64, 0f64, 0f64);
+        let mut n_distinct = 0usize;
+        let verbose = std::env::var("QX_DS_VERBOSE").is_ok();
+        let trace = std::env::var("QX_DS_CHUNK_TRACE").is_ok();
+        for l in 0..n_layer {
+            let te = std::time::Instant::now();
+            for si in 0..n_slabs {
+                let (r0, t) = slab(si);
+                self.chunk_views(r0, t);
+                if l == 0 {
+                    self.layer_init(t, &mut None);
+                }
+                let went_on = self.layer_attn(l, t, pos0 + r0, pos0 + r0 + t - 1, &mut None, false);
+                debug_assert!(went_on);
+                self.layer_ffn_pre(l, t, &mut None);
+                if trace && l < 8 {
+                    self.gpu.sync();
+                    let x: Vec<f32> = self.s.x.download(E);
+                    let r: Vec<f32> = self.s.r.download(E);
+                    let st = |v: &[f32]| (v.iter().filter(|a| a.is_nan()).count(), v.iter().map(|a| a.abs()).fold(0f32, f32::max), v.iter().sum::<f32>());
+                    eprintln!("    trace l{l} slab{si} after ffn_pre: x nan/max/sum {:?}  r {:?}", st(&x), st(&r));
+                }
+                self.layer_shexp(l, t);
+                // the shared expert's rows out of the bound scratch into the chunk buffer
+                let shy_c = self.chunk.as_ref().unwrap().shy.ptr + (r0 * E * 4) as u64;
+                self.k("qx_ds_copy_f32", 256, (((t * E) as u32).div_ceil(256), 1, 1), &[self.s.shy.ptr, shy_c, (t * E) as u64]);
+            }
+            // the experts of the whole chunk
+            let cb = self.chunk.as_ref().unwrap();
+            self.gpu.run(MOE.kernel("qx_moe_q8k_rows", CubeDim::new_1d(256)), (rows as u32, 1, 1), &[cb.x.ptr, cb.xq.ptr, cb.xd.ptr, E as u64]);
+            t_enq += te.elapsed().as_secs_f64();
+            let ts = std::time::Instant::now();
+            self.gpu.sync();
+            t_sync += ts.elapsed().as_secs_f64();
+            let tm = std::time::Instant::now();
+            let ids: Vec<i32> = cb.ids.download(rows * k);
+            let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
+            for (a, &e) in ids.iter().enumerate() {
+                lists[e as usize].push(a as u32);
+            }
+            let mut order: Vec<usize> = (0..ne).filter(|&e| !lists[e].is_empty()).collect();
+            order.sort_by_key(|&e| (d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed), e));
+            let mut sel: Vec<u32> = Vec::with_capacity(rows * k);
+            let mut offs: Vec<usize> = Vec::with_capacity(order.len());
+            for &e in &order {
+                offs.push(sel.len());
+                sel.extend_from_slice(&lists[e]);
+            }
+            cb.sel.upload(&sel);
+            // the words carry a generation instead of being zeroed: a memset would race the driver's copy streams
+            self.chunk_gen = self.chunk_gen % 65535 + 1;
+            let generation = self.chunk_gen;
+            d.chunk_done.atomic_u64(0).store(0, std::sync::atomic::Ordering::Release);
+            d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: order.iter().map(|&e| e as u32).collect(), counts: order.iter().map(|&e| lists[e].len() as u32).collect(), slots_dev: cb.slots_tbl.ptr, generation });
+            let ex = &self.layers[l].experts;
+            let gb = ff * ex.gate_row_bytes;
+            // the expert formats differ per layer (the UD quant mixes them): the kernel variants per layer
+            let (gsuf, dsuf) = (ops::suffix_of(ex.gate_ty), ops::suffix_of(ex.down_ty));
+            let kg = static_name(format!("qx_moe_gateup_q8k_{gsuf}_w20_sel"));
+            let kd = static_name(format!("qx_moe_down_q8k_{dsuf}_sel"));
+            for (i, &e) in order.iter().enumerate() {
+                let m = lists[e].len() as u32;
+                let word = cb.slots_tbl.ptr + 8 * e as u64;
+                let sl = cb.sel.ptr + (offs[i] * 4) as u64;
+                self.gpu.run(MOE.kernel("qx_moe_wait_word", CubeDim::new_1d(1)), (1, 1, 1), &[word, generation]);
+                self.gpu.run(MOE.kernel(kg, CubeDim::new_1d(256)), (((2 * ff) as u32).div_ceil(8), m, 1), &[word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 0, sl]);
+                self.gpu.run(MOE.kernel(kd, CubeDim::new_1d(256)), ((E as u32).div_ceil(16), m, 1), &[word, cb.gu.ptr, bits(clamp_exp[l]), 0, cb.out.ptr, ff as u64, E as u64, (2 * gb) as u64, ex.down_row_bytes as u64, sl]);
+                self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, (i + 1) as u64]);
+            }
+            n_distinct += order.len();
+            t_moe += tm.elapsed().as_secs_f64();
+            let tp = std::time::Instant::now();
+            let (out_ptr, shy_ptr) = (cb.out.ptr, cb.shy.ptr);
+            let ones = self.s.ones_slots.ptr;
+            if verbose && pos0 == 0 {
+                eprintln!("  chunk layer {l}: {} distinct experts ({} VRAM, {} RAM, {} NVMe)", order.len(), order.iter().filter(|&&e| d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed) == 0).count(), order.iter().filter(|&&e| d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed) == 1).count(), order.iter().filter(|&&e| d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed) == 2).count());
+            }
+            for si in 0..n_slabs {
+                let (r0, t) = slab(si);
+                self.chunk_views(r0, t);
+                let o = out_ptr + (r0 * k * E * 4) as u64;
+                self.layer_ffn_post(l, t, o, o, ones, shy_ptr + (r0 * E * 4) as u64, &mut None);
+                if trace && l < 8 {
+                    self.gpu.sync();
+                    let y: Vec<f32> = self.s.y.download(E);
+                    let r: Vec<f32> = self.s.r.download(E);
+                    let out: Vec<f32> = DeviceBuf::view(o, k * E * 4).download(k * E);
+                    let st = |v: &[f32]| (v.iter().filter(|a| a.is_nan()).count(), v.iter().map(|a| a.abs()).fold(0f32, f32::max), v.iter().sum::<f32>());
+                    eprintln!("    trace l{l} slab{si} after ffn_post: experts(row0) {:?} y {:?} r {:?}", st(&out), st(&y), st(&r));
+                }
+            }
+            t_post += tp.elapsed().as_secs_f64();
+        }
+        let (r0, t) = slab(n_slabs - 1);
+        self.chunk_views(r0, t);
+        self.layer_head(t, &mut None);
+        self.gpu.sync();
+        let logits = self.s.logits.download_at::<f32>((t - 1) * n_vocab * 4, n_vocab);
+        // the window scratch back
+        let [r, pre_prev, pre_f, post, comb, x, ids_b, wts, tok, pos, slot_b] = saved;
+        self.s.r = r; self.s.pre_prev = pre_prev; self.s.pre_f = pre_f; self.s.post = post; self.s.comb = comb; self.s.x = x;
+        self.s.ids = ids_b; self.s.wts = wts; self.s.tok = tok; self.s.pos = pos; self.s.slot = slot_b;
+        std::mem::swap(&mut self.s.erows_host, &mut self.chunk.as_mut().unwrap().erows_host);
+        self.s.cand_sel = saved_cand.0;
+        self.s.cand_count = saved_cand.1;
+        self.st.sels = saved_sels;
+        self.erows_stride = DS_TMAX;
+        self.erows_row0 = 0;
+        self.st.pos[slot] += rows;
+        d.tokens_done.fetch_add(rows as u64, std::sync::atomic::Ordering::Release);
+        self.adapt().expect("tier promotions");
+        self.t_phase = [0.0, t_moe, 0.0, 0.0, 0.0];
+        self.t_forward = tf.elapsed().as_secs_f64();
+        if std::env::var("QX_DS_VERBOSE").is_ok() {
+            eprintln!("chunk of {rows} rows at {pos0}: {:.0} ms ({:.2} ms per row; host: slab enqueue {:.0} ms, sync on the slab passes {:.0}, expert enqueue {:.0}, post enqueue {:.0}; {} distinct experts per layer, engram {:.0} ms)", self.t_forward * 1e3, self.t_forward * 1e3 / rows as f64, t_enq * 1e3, t_sync * 1e3, t_moe * 1e3, t_post * 1e3, n_distinct / n_layer, self.t_engram * 1e3);
+        }
+        logits
     }
 
     /// One token of slot 0 at its position; returns its logits. `act` receives named activations (each one syncs).
@@ -1285,11 +1692,36 @@ impl<'a> DsEngine<'a> {
     /// of one-token steps. Windows of more than one token need the asynchronous expert driver; `act` (activation
     /// dumps) only with one token.
     pub fn forward_segments(&mut self, toks: &[(usize, u32)], act: Option<&mut dyn FnMut(&str, Vec<f32>)>) -> Vec<f32> {
+        self.forward_segments_opt(toks, act, false)
+    }
+
+    /// The last layer whose compressed store and index keys are its own (the KV source of every layer above it).
+    fn kv_last(&self) -> usize {
+        (0..self.cfg.n_layer).filter(|&l| self.cfg.kv_src[l] == l as i32).max().unwrap_or(self.cfg.n_layer - 1)
+    }
+
+    /// Prompt positions that must still follow a window for it to run KV-only (`forward_segments_opt`): the layers
+    /// above the last KV source see earlier positions only through that source's store and keys and their own
+    /// sliding windows, so a position needs the full stack only if a later position within n_swa does at the layer
+    /// above, and so on up the stack: n_swa + (n_layer - kv_last) * (n_swa - 1) positions before the prompt's end,
+    /// plus n_swa so that a rewind within the last DS_TMAX positions still finds exact rings at every layer
+    /// (2,796 here). Windows of a prompt with at least this many positions after them run KV-only exactly: every
+    /// kept position computes what the full pass computes, bit for bit.
+    pub fn prompt_keep(&self) -> usize {
+        2 * self.cfg.n_swa + (self.cfg.n_layer - self.kv_last()) * (self.cfg.n_swa - 1)
+    }
+
+    /// `forward_segments`, KV-only when `kv_only`: the window runs the layers up to the last KV source and stops
+    /// after that layer's ring, store and index-key writes (no attention output, no experts there, nothing
+    /// above), and returns no logits. Only for prompt windows at least `prompt_keep` positions before the end of
+    /// their slot's prompt, all tokens in one slot's prompt; the caller decides.
+    pub fn forward_segments_opt(&mut self, toks: &[(usize, u32)], act: Option<&mut dyn FnMut(&str, Vec<f32>)>, kv_only: bool) -> Vec<f32> {
         let tf = std::time::Instant::now();
         self.t_experts = 0.0;
         let t = toks.len();
         assert!((1..=DS_TMAX).contains(&t), "window of {t} tokens");
         assert!(t == 1 || (self.driver.is_some() && act.is_none()), "windows need the asynchronous driver and no dumps");
+        assert!(!kv_only || (self.driver.is_some() && act.is_none()), "KV-only windows need the asynchronous driver and no dumps");
         // positions: each slot's tokens continue from its position, in order
         let mut positions: Vec<u32> = Vec::with_capacity(t);
         let mut slots_v: Vec<u32> = Vec::with_capacity(t);
@@ -1325,54 +1757,8 @@ impl<'a> DsEngine<'a> {
             }
         }
         self.t_phase[0] = tp.elapsed().as_secs_f64();
-        // the Engram rows of every Engram layer and token, gathered on the host into the mapped regions
-        // (region ei holds token n's rows at n * cols * dim) before any launch
+        self.t_engram = self.gather_engram(toks, &positions, &self.s.erows_host, DS_TMAX);
         let c = &self.cfg;
-        let ed = c.engram_dim;
-        let n_e = c.engram_cols() * ed;
-        let te = std::time::Instant::now();
-        let all_rows: Vec<Vec<u64>> = (0..c.engram_layers.len()).flat_map(|ei| (0..t).map(move |n| (ei, n))).map(|(ei, n)| c.engram_rows(ei, &self.st.tokens[toks[n].0], positions[n] as usize)).collect();
-        if let (Some((f, pack)), Some(ring)) = (&self.engram_pack, &self.engram_ring) {
-            use io_uring::{opcode, types};
-            use std::os::fd::AsRawFd;
-            let rb = pack.ple.row_bytes as usize;
-            let flat: Vec<u64> = all_rows.iter().flatten().copied().collect();
-            let mut raw = vec![0u8; flat.len() * rb];
-            let mut ring = ring.borrow_mut();
-            let mut next = 0;
-            let mut done = 0;
-            while done < flat.len() {
-                while next < flat.len() && next - done < 120 {
-                    let e = opcode::Read::new(types::Fd(f.as_raw_fd()), unsafe { raw.as_mut_ptr().add(next * rb) }, rb as u32).offset(pack.ple_row(flat[next])).build().user_data(next as u64);
-                    unsafe { ring.submission().push(&e).expect("engram io_uring queue") };
-                    next += 1;
-                }
-                ring.submit_and_wait(1).expect("engram io_uring submit");
-                for cqe in ring.completion() {
-                    assert!(cqe.result() == rb as i32, "engram row read returned {}", cqe.result());
-                    done += 1;
-                }
-            }
-            let ty = qx_pack::ggml::GgmlType::from_id(13).unwrap(); // Q5_K
-            let mut i = 0;
-            for (ri, rows) in all_rows.iter().enumerate() {
-                let (ei, n) = (ri / t, ri % t);
-                let dst = self.s.erows_host.slice::<f32>((ei * DS_TMAX + n) * n_e * 4, n_e);
-                for j in 0..rows.len() {
-                    qx_pack::dequant(ty, &raw[i * rb..(i + 1) * rb], &mut dst[j * ed..(j + 1) * ed]);
-                    i += 1;
-                }
-            }
-        } else {
-            for (ri, rows) in all_rows.iter().enumerate() {
-                let (ei, n) = (ri / t, ri % t);
-                let dst = self.s.erows_host.slice::<f32>((ei * DS_TMAX + n) * n_e * 4, n_e);
-                for (j, &r) in rows.iter().enumerate() {
-                    self.engram_row(r, &mut dst[j * ed..(j + 1) * ed]);
-                }
-            }
-        }
-        self.t_engram = te.elapsed().as_secs_f64();
         // A captured graph per window width replays the launches (`QX_GRAPH=0` disables): only in the
         // asynchronous mode (no host work between launches), without activation dumps, and once every compressed
         // store has a visible row (pos + 1 >= the largest ratio), so the launch set is the same for every window
@@ -1388,39 +1774,34 @@ impl<'a> DsEngine<'a> {
         // launches the width's whole kernel set (positions clamped so the compressed-store kernels are included;
         // each kernel bounds itself by the true positions in `s.pos`) with the expert job replaced by zeroed slot
         // lists, then the device is drained. It writes the same ring and store positions the real pass rewrites.
-        if self.driver.is_some() && !self.warmed[t] {
-            if let Some(d) = &self.driver {
-                d.shared.mb.slice::<f32>(crate::mailbox::mb_y(E), crate::mailbox::AMAX * E).fill(0.0);
-            }
-            self.warm = true;
-            let p = max_ratio - 1;
-            self.launch_window(t, pos_min.max(p), pos_max.max(p), None);
-            self.warm = false;
-            self.gpu.sync();
-            self.warmed[t] = true;
-        }
-        let eligible = self.driver.is_some() && act.is_none() && pos_min + 1 >= max_ratio && !std::env::var("QX_GRAPH").is_ok_and(|v| v == "0") && std::env::var("QX_DS_SYNC").is_err() && std::env::var("QX_DS_TRACE").is_err();
+        self.warm_width(t, pos_min, pos_max);
+        let eligible = self.driver.is_some() && act.is_none() && pos_min + 1 >= max_ratio && !self.replaying && !std::env::var("QX_GRAPH").is_ok_and(|v| v == "0") && std::env::var("QX_DS_SYNC").is_err() && std::env::var("QX_DS_TRACE").is_err();
+        let captured = if kv_only { &self.graphs_kv[t] } else { &self.graphs[t] };
         if !eligible {
-            self.launch_window(t, pos_min, pos_max, act);
-        } else if let Some(g) = &self.graphs[t] {
+            self.launch_window(t, pos_min, pos_max, act, kv_only);
+        } else if let Some(g) = captured {
             // SAFETY: every buffer the graph reads or writes is owned by `self` and outlives it.
             unsafe { g.replay().expect("graph replay") };
         } else {
             self.gpu.client.graph_prepare().expect("graph_prepare");
-            self.launch_window(t, pos_min, pos_max, None);
+            self.launch_window(t, pos_min, pos_max, None, kv_only);
             // Drain the eager run, so no expert job is in flight while the device records nothing, then keep the
             // driver out of its event syncs for the recording (see `Shared::capture`).
             self.gpu.sync();
             let shared = self.driver.as_ref().map(|d| d.shared.clone());
             let not_capturing = shared.as_ref().map(|s| s.capture.lock().unwrap());
             self.gpu.client.start_capture().expect("start_capture");
-            self.launch_window(t, pos_min, pos_max, None);
+            self.launch_window(t, pos_min, pos_max, None, kv_only);
             let g = self.gpu.client.stop_capture().expect("stop_capture");
             drop(not_capturing);
             if std::env::var("QX_DS_VERBOSE").is_ok() {
-                eprintln!("window graph ({t} tokens) captured at position {pos_min}");
+                eprintln!("window graph ({t} tokens{}) captured at position {pos_min}", if kv_only { ", KV-only" } else { "" });
             }
-            self.graphs[t] = Some(g);
+            if kv_only {
+                self.graphs_kv[t] = Some(g);
+            } else {
+                self.graphs[t] = Some(g);
+            }
         }
         self.t_phase[1] = tp.elapsed().as_secs_f64();
         let tp = std::time::Instant::now();
@@ -1439,7 +1820,7 @@ impl<'a> DsEngine<'a> {
         }
         self.adapt().expect("tier promotions");
         let tp = std::time::Instant::now();
-        let out = self.s.logits.download(self.cfg.n_vocab * t);
+        let out = if kv_only { Vec::new() } else { self.s.logits.download(self.cfg.n_vocab * t) };
         self.t_phase[4] = tp.elapsed().as_secs_f64();
         self.t_forward = tf.elapsed().as_secs_f64();
         out
@@ -1447,217 +1828,277 @@ impl<'a> DsEngine<'a> {
 
     /// Queues a window's launches (everything between the uploads and the final sync): `t` tokens whose
     /// positions lie in [pos, last] (the device arrays hold each token's own).
-    fn launch_window(&mut self, t: usize, pos: usize, last: usize, mut act: Option<&mut dyn FnMut(&str, Vec<f32>)>) {
+    /// Downloads `n` floats of `b` to the activation dump `act` (each dump syncs the device).
+    fn dump(&self, name: String, b: &DeviceBuf, n: usize, act: &mut Option<&mut dyn FnMut(&str, Vec<f32>)>) {
+        if let Some(f) = act {
+            self.gpu.sync();
+            f(&name, b.download(n));
+        }
+    }
+
+    /// Queues a window's launches (everything between the uploads and the final sync): `t` tokens whose
+    /// positions lie in [pos, last] (the device arrays hold each token's own). The layer body is in four parts
+    /// (`layer_attn`, `layer_ffn_pre`, the experts, `layer_ffn_post`) that the chunk path (`forward_chunk`)
+    /// reuses slab by slab, layer-major.
+    fn launch_window(&mut self, t: usize, pos: usize, last: usize, mut act: Option<&mut dyn FnMut(&str, Vec<f32>)>, kv_only: bool) {
+        self.layer_init(t, &mut act);
+        for l in 0..self.cfg.n_layer {
+            if !self.layer_attn(l, t, pos, last, &mut act, kv_only) {
+                return;
+            }
+            self.layer_ffn_pre(l, t, &mut act);
+            let (combine_gpu, cpu_rows, slots_ptr) = self.layer_moe_window(l, t, &mut act);
+            self.layer_ffn_post(l, t, combine_gpu, cpu_rows, slots_ptr, self.s.shy.ptr, &mut act);
+            std::mem::swap(&mut self.s.pre_prev, &mut self.s.pre_f);
+        }
+        self.layer_head(t, &mut act);
+    }
+
+    /// The embeddings of the window's tokens into the hyper-connection streams.
+    fn layer_init(&self, t: usize, act: &mut Option<&mut dyn FnMut(&str, Vec<f32>)>) {
+        let c = &self.cfg;
+        let hcd = c.hc * E;
+        self.trace("dequant_gather");
+        ops::dequant_gather(&self.gpu, self.embd.ty, self.embd.buf.ptr, self.s.e.ptr, t, self.embd.cols, self.s.tok.ptr);
+        self.trace_done();
+        self.k("qx_ds_hc_init", 256, ((hcd as u32).div_ceil(256), t as u32, 1), &[self.s.r.ptr, self.s.e.ptr, E as u64, c.hc as u64]);
+        self.dump("hc_init".into(), &self.s.r, hcd, act);
+    }
+
+    /// The final norm and the vocabulary head over the window's rows (logits in `s.logits`).
+    fn layer_head(&self, t: usize, act: &mut Option<&mut dyn FnMut(&str, Vec<f32>)>) {
+        self.hc_pre(&self.s.pre_prev, t);
+        self.dump("hc_out".into(), &self.s.xpre, E, act);
+        self.rms(self.s.xpre.ptr, self.output_norm.ptr, self.s.x.ptr, E, t);
+        self.dump("result_norm".into(), &self.s.x, E, act);
+        self.mgt(&self.g_out, self.s.x.ptr, E, t, "g_out");
+    }
+
+    /// Layer `l`'s Engram and attention sublayer for `t` rows at positions [pos, last], through its hc_post.
+    /// Returns false when a KV-only window stops here (the last KV source's ring, store and keys are written).
+    fn layer_attn(&self, l: usize, t: usize, pos: usize, last: usize, act: &mut Option<&mut dyn FnMut(&str, Vec<f32>)>, kv_only: bool) -> bool {
+        let kv_last = self.kv_last();
         let c = &self.cfg;
         let (hc, hcd) = (c.hc, c.hc * E);
         let tt = t as u32;
-        let gpu = &self.gpu;
-        let dump = |name: String, b: &DeviceBuf, n: usize, act: &mut Option<&mut dyn FnMut(&str, Vec<f32>)>| {
-            if let Some(f) = act {
-                gpu.sync();
-                f(&name, b.download(n));
-            }
-        };
-        self.trace("dequant_gather");
-        ops::dequant_gather(gpu, self.embd.ty, self.embd.buf.ptr, self.s.e.ptr, t, self.embd.cols, self.s.tok.ptr);
-        self.trace_done();
-        self.k("qx_ds_hc_init", 256, ((hcd as u32).div_ceil(256), tt, 1), &[self.s.r.ptr, self.s.e.ptr, E as u64, hc as u64]);
-        dump("hc_init".into(), &self.s.r, hcd, &mut act);
-        let mut have_prev = false;
-        for l in 0..c.n_layer {
-            let w = &self.layers[l];
-            let ratio = c.ratio[l];
-            if let Some((g_ekv, egate)) = &w.engram {
-                let ei = c.engram_layers.iter().position(|&x| x == l).unwrap();
-                let n = c.engram_cols() * c.engram_dim;
-                self.k("qx_ds_copy_f32", 256, (((n * t) as u32).div_ceil(256), 1, 1), &[self.s.erows_host.dptr + (ei * DS_TMAX * n * 4) as u64, self.s.erows.ptr, (n * t) as u64]);
-                self.mgt(g_ekv, self.s.erows.ptr, n, t, "engram_kv");
-                dump(format!("engram_kv-{l}"), &self.s.ekv, (hc + 1) * E, &mut act);
-                self.k("qx_ds_engram_gate", 256, (hc as u32, tt, 1), &[self.s.r.ptr, self.s.ekv.ptr, egate.ptr, E as u64, bits(1e-20), self.s.egates.ptr]);
-                dump(format!("engram_gate-{l}"), &self.s.egates, hc, &mut act);
-                dump(format!("engram_out-{l}"), &self.s.r, hcd, &mut act);
-            }
-            // attention
-            self.hc_terms(&w.hc_attn, &self.s.pre_a, t);
-            dump(format!("hc_mixes-{l}"), &self.s.mixsum, 24, &mut act);
-            dump(format!("hc_pre-{l}"), &self.s.pre_a, hc, &mut act);
-            dump(format!("hc_post-{l}"), &self.s.post, hc, &mut act);
-            dump(format!("hc_comb-{l}"), &self.s.comb, hc * hc, &mut act);
-            self.hc_pre(if have_prev { &self.s.pre_prev } else { &self.s.pre_first }, t);
-            dump(format!("hc_attn_pre-{l}"), &self.s.xpre, E, &mut act);
-            self.rms(self.s.xpre.ptr, w.attn_norm.ptr, self.s.x.ptr, E, t);
-            dump(format!("attn_norm-{l}"), &self.s.x, E, &mut act);
-            self.mgt(&w.g_x, self.s.x.ptr, E, t, "g_x");
-            self.rms(self.s.qr_raw.ptr, w.q_a_norm.ptr, self.s.qr.ptr, c.q_lora, t);
-            dump(format!("qr_norm-{l}"), &self.s.qr, c.q_lora, &mut act);
-            self.mgt(&w.g_qr, self.s.qr.ptr, c.q_lora, t, "g_qr");
-            let comp = ratio != 0;
-            let nope = c.head_dim - c.n_rot;
-            self.rope(self.s.q.ptr, c.n_head, c.head_dim, nope, comp, 0, false, t);
-            dump(format!("q-{l}"), &self.s.q, c.n_head * c.head_dim, &mut act);
-            self.rms(self.s.kv_raw.ptr, w.kv_norm.ptr, self.s.kv.ptr, c.head_dim, t);
-            self.rope(self.s.kv.ptr, 1, c.head_dim, nope, comp, 0, false, t);
-            dump(format!("kv-{l}"), &self.s.kv, c.head_dim, &mut act);
-            self.k("qx_ds_kv_append", 256, (tt, 1, 1), &[self.s.kv.ptr, self.st.ring_tables[l].ptr, self.ring_w as u64, self.s.pos.ptr, self.s.slot.ptr, c.head_dim as u64]);
-            let row = c.head_dim + c.idx_dim;
-            if w.has_comp {
-                let (_, st, _, pt) = self.st.stores[l].as_ref().unwrap();
-                let score = if ratio > 1 { self.s.cscore.ptr } else { 0 };
-                self.k("qx_ds_compress", 256, (1, 1, 1), &[self.s.ckv.ptr, score, pt.ptr, st.ptr, w.comp_norm.as_ref().unwrap().ptr, self.s.comp_tmp.ptr, self.s.flag.ptr, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, c.head_dim as u64, row as u64, bits(1e-20), t as u64]);
-                if (pos + 1) % ratio == 0 {
-                    dump(format!("comp_latent-{l}"), &self.s.comp_tmp, c.head_dim, &mut act);
-                }
-                self.mgt(w.g_ik.as_ref().unwrap(), self.s.comp_tmp.ptr, c.head_dim, t, "g_ik");
-                let (base, fs, c0, c1, ext) = rope_params(c, true);
-                self.k("qx_ds_idx_key_commit", 128, (tt, 1, 1), &[self.s.ik.ptr, st.ptr, w.idx_k_norm.as_ref().unwrap().ptr, self.s.flag.ptr, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, c.idx_dim as u64, row as u64, c.head_dim as u64, bits(1e-20)]);
-                // the latent at [448, 512) and the key at [512 + 64, 640), both at the group's first position
-                self.k("qx_ds_rope_row", (c.n_rot / 2) as u32, (tt, 1, 1), &[st.ptr, self.s.flag.ptr, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, row as u64, nope as u64, c.n_rot as u64, bits(base), bits(fs), bits(c0), bits(c1), ext]);
-                self.k("qx_ds_rope_row", (c.n_rot / 2) as u32, (tt, 1, 1), &[st.ptr, self.s.flag.ptr, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, row as u64, (c.head_dim + c.idx_dim - c.n_rot) as u64, c.n_rot as u64, bits(base), bits(fs), bits(c0), bits(c1), ext]);
-            }
-            // the last token's visible rows bound the window's grids; each kernel bounds its own token
-            let n_visible = if comp { (last + 1) / ratio } else { 0 };
-            let mut sel: Option<(u64, u64, u64)> = None; // (sel, count, store table)
-            if comp && n_visible > 0 {
-                let src = c.kv_src[l] as usize;
-                let tsrc = c.topk_src[l] as usize;
-                let store_table = self.st.stores[src].as_ref().unwrap().1.ptr;
-                if w.has_idx_q {
-                    self.rope(self.s.iq.ptr, c.idx_heads, c.idx_dim, c.idx_dim - c.n_rot, comp, 0, false, t);
-                    let max_rows = self.max_rows as u64;
-                    // QX_DS_IDX_KERNEL=1 keeps the original scorer; 2 (default) the shared-memory one, bit-identical
-                    static IDX_KERNEL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
-                    let idx_entry = *IDX_KERNEL.get_or_init(|| if std::env::var("QX_DS_IDX_KERNEL").is_ok_and(|v| v == "1") { "qx_ds_idx_score" } else { "qx_ds_idx_score2" });
-                    self.k(idx_entry, 256, ((self.max_rows as u32).div_ceil(8), tt, 1), &[self.s.iq.ptr, self.s.iw.ptr, store_table, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, c.idx_dim as u64, row as u64, c.head_dim as u64, self.s.scores.ptr, max_rows, bits(1.0 / ((c.idx_heads * c.idx_dim) as f32).sqrt())]);
-                    dump(format!("idx_score-{l}"), &self.s.scores, n_visible, &mut act);
-                    let (sb, cb) = self.st.sels[l].as_ref().unwrap();
-                    let bs = c.cand_bs.max(1);
-                    let n_blk = n_visible.div_ceil(bs);
-                    let words = self.max_rows.div_ceil(bs * 32) as u64;
-                    if c.cand_src == l as i32 {
-                        let max_blocks = self.max_rows.div_ceil(bs) as u64;
-                        self.k("qx_ds_block_max", 256, ((max_blocks as u32).div_ceil(256), tt, 1), &[self.s.scores.ptr, self.s.bmax.ptr, self.s.pos.ptr, ratio as u64, bs as u64, max_rows, max_blocks]);
-                        dump(format!("cand_block_score-{l}"), &self.s.bmax, n_blk, &mut act);
-                        // top blocks: the scores are the block maxima, "rows" are blocks: positions / (ratio * bs)
-                        self.k("qx_ds_topk", 1024, (tt, 1, 1), &[self.s.bmax.ptr, c.cand_blocks as u64, self.s.cand_sel.ptr, self.s.cand_count.ptr, self.s.pos.ptr, (ratio * bs) as u64, max_blocks]);
-                    } else if c.cand_src >= 0 && (c.cand_src as usize) < l {
-                        self.k("qx_ds_zero_u32", 256, (((words * t as u64) as u32).div_ceil(256), 1, 1), &[self.s.inside.ptr, words * t as u64]);
-                        self.k("qx_ds_mark_blocks", 256, ((c.cand_blocks as u32).div_ceil(256), tt, 1), &[self.s.cand_sel.ptr, self.s.cand_count.ptr, self.s.inside.ptr, c.cand_blocks as u64, words]);
-                        self.k("qx_ds_cand_mask", 256, ((self.max_rows as u32).div_ceil(256), tt, 1), &[self.s.scores.ptr, self.s.inside.ptr, self.s.pos.ptr, ratio as u64, bs as u64, max_rows, words]);
-                    }
-                    self.k("qx_ds_topk", 1024, (tt, 1, 1), &[self.s.scores.ptr, c.idx_top_k as u64, sb.ptr, cb.ptr, self.s.pos.ptr, ratio as u64, max_rows]);
-                }
-                let (sb, cb) = self.st.sels[tsrc].as_ref().expect("top-k source");
-                sel = Some((sb.ptr, cb.ptr, store_table));
-            }
-            let (sp, cp, stp) = sel.unwrap_or((0, 0, 0));
-            // the attention in slices of ATTN_SLICE tokens (the partials buffer is sized for one slice); the
-            // kernels index tokens from the pointers they get, so each slice passes offset pointers
-            let hd = c.head_dim;
-            for s0 in (0..t).step_by(ATTN_SLICE) {
-                let ts = (t - s0).min(ATTN_SLICE);
-                let (q, o, ps, sl) = (self.s.q.ptr + (s0 * c.n_head * hd * 4) as u64, self.s.attn.ptr + (s0 * c.n_head * hd * 4) as u64, self.s.pos.ptr + (s0 * 4) as u64, self.s.slot.ptr + (s0 * 4) as u64);
-                let (sps, cps) = if sp != 0 { (sp + (s0 * c.idx_top_k * 4) as u64, cp + (s0 * 4) as u64) } else { (0, 0) };
-                if std::env::var("QX_DS_ATTN").is_ok_and(|v| v == "old") {
-                    self.k("qx_ds_attn", 256, (c.n_head as u32, ts as u32, 1), &[q, self.st.ring_tables[l].ptr, self.ring_w as u64, ps, sl, sps, cps, stp, row as u64, w.sinks.ptr, o, bits(1.0 / (hd as f32).sqrt()), c.n_swa as u64, c.idx_top_k as u64, hd as u64]);
-                } else {
-                    let chunks = self.attn_chunks as u64;
-                    self.k("qx_ds_attn_part", 256, ((c.n_head / 8) as u32, chunks as u32, ts as u32), &[q, self.st.ring_tables[l].ptr, self.ring_w as u64, ps, sl, sps, cps, stp, row as u64, w.sinks.ptr, o, bits(1.0 / (hd as f32).sqrt()), c.n_swa as u64, c.idx_top_k as u64, hd as u64, self.s.attn_part.ptr, chunks]);
-                    self.k("qx_ds_attn_merge", 256, (c.n_head as u32, ts as u32, 1), &[self.s.attn_part.ptr, w.sinks.ptr, o, chunks, hd as u64]);
-                }
-            }
-            dump(format!("{}-{l}", if sel.is_some() { "attn_comp" } else { "attn_raw" }), &self.s.attn, c.n_head * c.head_dim, &mut act);
-            self.rope(self.s.attn.ptr, c.n_head, c.head_dim, nope, comp, 0, true, t);
-            dump(format!("attn_derope-{l}"), &self.s.attn, c.n_head * c.head_dim, &mut act);
-            let gd = c.n_head / c.o_groups * c.head_dim;
-            for (gi, g) in w.wo_a.iter().enumerate() {
-                self.mgt(g, self.s.attn.ptr + (gi * gd * 4) as u64, c.n_head * c.head_dim, t, "wo_a");
-            }
-            // the groups' rows per token, contiguous for the second projection
-            self.k("qx_ds_regroup", 256, (((c.o_groups * c.o_lora) as u32).div_ceil(256), tt, 1), &[self.s.oag.ptr, self.s.oa.ptr, c.o_groups as u64, c.o_lora as u64, DS_TMAX as u64]);
-            dump(format!("attn_wo_a-{l}"), &self.s.oa, c.o_groups * c.o_lora, &mut act);
-            self.mgt(&w.g_ob, self.s.oa.ptr, c.o_groups * c.o_lora, t, "g_ob");
-            dump(format!("attn_out-{l}"), &self.s.y, E, &mut act);
-            self.hc_post(t);
-            dump(format!("hc_attn_post-{l}"), &self.s.r, hcd, &mut act);
-            // FFN
-            self.hc_terms(&w.hc_ffn, &self.s.pre_f, t);
-            self.hc_pre(&self.s.pre_a, t);
-            dump(format!("hc_ffn_pre-{l}"), &self.s.xpre, E, &mut act);
-            self.rms(self.s.xpre.ptr, w.ffn_norm.ptr, self.s.x.ptr, E, t);
-            dump(format!("ffn_norm-{l}"), &self.s.x, E, &mut act);
-            self.mgt(&w.g_ffn, self.s.x.ptr, E, t, "g_ffn");
-            dump(format!("ffn_moe_logits-{l}"), &self.s.logits_r, c.n_expert, &mut act);
-            self.k("qx_ds_route", 32, (tt, 1, 1), &[self.s.logits_r.ptr, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, self.s.ids.ptr, self.s.wts.ptr, bits(c.w_scale)]);
-            let k = c.n_expert_used;
-            // QX_DS_NOEXPERTS=1: skip the routed experts (a timing knob: the dense and attention cost alone)
-            let no_experts = std::env::var("QX_DS_NOEXPERTS").is_ok_and(|v| v == "1");
-            let mut shexp_done = false;
-            let (combine_gpu, cpu_rows, slots_ptr) = if no_experts {
-                self.s.yk.zero();
-                (self.s.yk.ptr, self.s.yk.ptr, self.s.ones_slots.ptr)
-            } else if let (Some(d), Some(ab)) = (&self.driver, &self.abufs) {
-                // the misses to the driver's mailbox (x quantized to Q8_K on the way), the residents on the GPU,
-                // then wait for the CPU's rows: no host involvement
-                let mb = d.shared.mb.dptr;
-                let stage_share = if t >= ab.stage_wide_min { ab.stage_share } else { ab.stage_share_decode };
-                self.trace("qx_moe_post");
-                gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (tt, 1, 1), &[mb, ab.table_dev.ptr, (l * c.n_expert) as u64, self.s.ids.ptr, self.s.wts.ptr, self.s.x.ptr, ab.step.ptr, l as u64, k as u64, E as u64, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, t as u64 | ((self.warm as u64) << 32), ab.rtable_dev.ptr, ab.gpu_share, stage_share, ab.slots_all.ptr, ab.slots_stg.ptr, ab.stage_cap as u64]);
-                self.trace_done();
-                self.dsync("post");
-                self.launch_resident(l, k, t, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, ab.gu.ptr, ab.gpu_out.ptr);
-                self.dsync("resident");
-                // the shared expert while the pool works on the misses
-                self.k("qx_ds_silu_mul_clamp", 256, (((c.ff_exp * t) as u32).div_ceil(256), 1, 1), &[self.s.shg.ptr, self.s.shu.ptr, self.s.shh.ptr, (c.ff_exp * t) as u64, bits(c.clamp_shexp[l])]);
-                self.mgt(&w.g_shd, self.s.shh.ptr, c.ff_exp, t, "g_shd");
-                if stage_share > 0 {
-                    // the staged experts: their records and slot addresses land on the copy stream, then the
-                    // same kernels over the staged slot array (zero where nothing is staged)
-                    self.trace("qx_moe_wait_staged");
-                    gpu.run(STEP.kernel("qx_moe_wait_staged", CubeDim::new_1d(1)), (1, 1, 1), &[mb, ab.step.ptr]);
-                    self.trace_done();
-                    self.launch_resident(l, k, t, ab.slots_stg.ptr, ab.xq.ptr, ab.xd.ptr, ab.gu.ptr, ab.gpu_out.ptr);
-                }
-                self.trace("qx_moe_wait");
-                gpu.run(STEP.kernel("qx_moe_wait", CubeDim::new_1d(1)), (1, 1, 1), &[mb, ab.step.ptr]);
-                self.trace_done();
-                self.dsync("wait");
-                shexp_done = true;
-                (ab.gpu_out.ptr, mb + crate::mailbox::mb_y(E) as u64, ab.slots_all.ptr)
-            } else {
-                assert!(t == 1, "the host-driven expert paths take one token");
-                gpu.sync();
-                let ids: Vec<i32> = self.s.ids.download(k);
-                let x: Vec<f32> = self.s.x.download(E);
-                let te = std::time::Instant::now();
-                let combine_gpu = if self.tiers.is_some() {
-                    self.experts_tiered(l, &x, &ids).expect("experts");
-                    self.tiers.as_ref().unwrap().borrow().gpu_out.ptr
-                } else {
-                    self.experts_gguf(l, &x, &ids);
-                    self.s.yk.ptr
-                };
-                self.t_experts += te.elapsed().as_secs_f64();
-                let slots_ptr = self.tiers.as_ref().map_or(self.s.ones_slots.ptr, |t| t.borrow().slots.ptr);
-                (combine_gpu, self.s.yk.ptr, slots_ptr)
-            };
-            if !shexp_done {
-                self.k("qx_ds_silu_mul_clamp", 256, (((c.ff_exp * t) as u32).div_ceil(256), 1, 1), &[self.s.shg.ptr, self.s.shu.ptr, self.s.shh.ptr, (c.ff_exp * t) as u64, bits(c.clamp_shexp[l])]);
-                self.mgt(&w.g_shd, self.s.shh.ptr, c.ff_exp, t, "g_shd");
-            }
-            dump(format!("ffn_shexp-{l}"), &self.s.shy, E, &mut act);
-            self.k("qx_ds_moe_combine", 256, ((E as u32).div_ceil(256), tt, 1), &[combine_gpu, k as u64, cpu_rows, self.s.y.ptr, E as u64, slots_ptr, self.s.wts.ptr, self.s.shy.ptr]);
-            self.dsync("combine");
-            dump(format!("ffn_out-{l}"), &self.s.y, E, &mut act);
-            self.hc_post(t);
-            dump(format!("l_out-{l}"), &self.s.r, hcd, &mut act);
-            self.dsync("layer");
-            std::mem::swap(&mut self.s.pre_prev, &mut self.s.pre_f);
-            have_prev = true;
+        let w = &self.layers[l];
+        let ratio = c.ratio[l];
+        if let Some((g_ekv, egate)) = &w.engram {
+            let ei = c.engram_layers.iter().position(|&x| x == l).unwrap();
+            let n = c.engram_cols() * c.engram_dim;
+            self.k("qx_ds_copy_f32", 256, (((n * t) as u32).div_ceil(256), 1, 1), &[self.s.erows_host.dptr + (ei * self.erows_stride * n * 4) as u64 + (self.erows_row0 * n * 4) as u64, self.s.erows.ptr, (n * t) as u64]);
+            self.mgt(g_ekv, self.s.erows.ptr, n, t, "engram_kv");
+            self.dump(format!("engram_kv-{l}"), &self.s.ekv, (hc + 1) * E, act);
+            self.k("qx_ds_engram_gate", 256, (hc as u32, tt, 1), &[self.s.r.ptr, self.s.ekv.ptr, egate.ptr, E as u64, bits(1e-20), self.s.egates.ptr]);
+            self.dump(format!("engram_gate-{l}"), &self.s.egates, hc, act);
+            self.dump(format!("engram_out-{l}"), &self.s.r, hcd, act);
         }
-        self.hc_pre(&self.s.pre_prev, t);
-        dump("hc_out".into(), &self.s.xpre, E, &mut act);
-        self.rms(self.s.xpre.ptr, self.output_norm.ptr, self.s.x.ptr, E, t);
-        dump("result_norm".into(), &self.s.x, E, &mut act);
-        self.mgt(&self.g_out, self.s.x.ptr, E, t, "g_out");
+        // attention
+        self.hc_terms(&w.hc_attn, &self.s.pre_a, t);
+        self.dump(format!("hc_mixes-{l}"), &self.s.mixsum, 24, act);
+        self.dump(format!("hc_pre-{l}"), &self.s.pre_a, hc, act);
+        self.dump(format!("hc_post-{l}"), &self.s.post, hc, act);
+        self.dump(format!("hc_comb-{l}"), &self.s.comb, hc * hc, act);
+        self.hc_pre(if l > 0 { &self.s.pre_prev } else { &self.s.pre_first }, t);
+        self.dump(format!("hc_attn_pre-{l}"), &self.s.xpre, E, act);
+        self.rms(self.s.xpre.ptr, w.attn_norm.ptr, self.s.x.ptr, E, t);
+        self.dump(format!("attn_norm-{l}"), &self.s.x, E, act);
+        self.mgt(&w.g_x, self.s.x.ptr, E, t, "g_x");
+        self.rms(self.s.qr_raw.ptr, w.q_a_norm.ptr, self.s.qr.ptr, c.q_lora, t);
+        self.dump(format!("qr_norm-{l}"), &self.s.qr, c.q_lora, act);
+        self.mgt(&w.g_qr, self.s.qr.ptr, c.q_lora, t, "g_qr");
+        let comp = ratio != 0;
+        let nope = c.head_dim - c.n_rot;
+        self.rope(self.s.q.ptr, c.n_head, c.head_dim, nope, comp, 0, false, t);
+        self.dump(format!("q-{l}"), &self.s.q, c.n_head * c.head_dim, act);
+        self.rms(self.s.kv_raw.ptr, w.kv_norm.ptr, self.s.kv.ptr, c.head_dim, t);
+        self.rope(self.s.kv.ptr, 1, c.head_dim, nope, comp, 0, false, t);
+        self.dump(format!("kv-{l}"), &self.s.kv, c.head_dim, act);
+        self.k("qx_ds_kv_append", 256, (tt, 1, 1), &[self.s.kv.ptr, self.st.ring_tables[l].ptr, self.ring_w as u64, self.s.pos.ptr, self.s.slot.ptr, c.head_dim as u64]);
+        let row = c.head_dim + c.idx_dim;
+        if w.has_comp && !self.replaying {
+            let (_, st, _, pt) = self.st.stores[l].as_ref().unwrap();
+            let score = if ratio > 1 { self.s.cscore.ptr } else { 0 };
+            self.k("qx_ds_compress", 256, (1, 1, 1), &[self.s.ckv.ptr, score, pt.ptr, st.ptr, w.comp_norm.as_ref().unwrap().ptr, self.s.comp_tmp.ptr, self.s.flag.ptr, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, c.head_dim as u64, row as u64, bits(1e-20), t as u64]);
+            if (pos + 1) % ratio == 0 {
+                self.dump(format!("comp_latent-{l}"), &self.s.comp_tmp, c.head_dim, act);
+            }
+            self.mgt(w.g_ik.as_ref().unwrap(), self.s.comp_tmp.ptr, c.head_dim, t, "g_ik");
+            let (base, fs, c0, c1, ext) = rope_params(c, true);
+            self.k("qx_ds_idx_key_commit", 128, (tt, 1, 1), &[self.s.ik.ptr, st.ptr, w.idx_k_norm.as_ref().unwrap().ptr, self.s.flag.ptr, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, c.idx_dim as u64, row as u64, c.head_dim as u64, bits(1e-20)]);
+            // the latent at [448, 512) and the key at [512 + 64, 640), both at the group's first position
+            self.k("qx_ds_rope_row", (c.n_rot / 2) as u32, (tt, 1, 1), &[st.ptr, self.s.flag.ptr, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, row as u64, nope as u64, c.n_rot as u64, bits(base), bits(fs), bits(c0), bits(c1), ext]);
+            self.k("qx_ds_rope_row", (c.n_rot / 2) as u32, (tt, 1, 1), &[st.ptr, self.s.flag.ptr, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, row as u64, (c.head_dim + c.idx_dim - c.n_rot) as u64, c.n_rot as u64, bits(base), bits(fs), bits(c0), bits(c1), ext]);
+        }
+        // KV-only: the last KV source's ring, store and keys are written; its attention output, its experts
+        // and every layer above feed only this position's own logits, which nothing needs (`prompt_keep`)
+        if kv_only && l == kv_last {
+            return false;
+        }
+        // the last token's visible rows bound the window's grids; each kernel bounds its own token
+        let n_visible = if comp { (last + 1) / ratio } else { 0 };
+        let mut sel: Option<(u64, u64, u64)> = None; // (sel, count, store table)
+        if comp && n_visible > 0 {
+            let src = c.kv_src[l] as usize;
+            let tsrc = c.topk_src[l] as usize;
+            let store_table = self.st.stores[src].as_ref().unwrap().1.ptr;
+            if w.has_idx_q {
+                self.rope(self.s.iq.ptr, c.idx_heads, c.idx_dim, c.idx_dim - c.n_rot, comp, 0, false, t);
+                let max_rows = self.max_rows as u64;
+                // QX_DS_IDX_KERNEL=1 keeps the original scorer; 2 (default) the shared-memory one, bit-identical
+                static IDX_KERNEL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+                let idx_entry = *IDX_KERNEL.get_or_init(|| if std::env::var("QX_DS_IDX_KERNEL").is_ok_and(|v| v == "1") { "qx_ds_idx_score" } else { "qx_ds_idx_score2" });
+                self.k(idx_entry, 256, ((self.max_rows as u32).div_ceil(8), tt, 1), &[self.s.iq.ptr, self.s.iw.ptr, store_table, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, c.idx_dim as u64, row as u64, c.head_dim as u64, self.s.scores.ptr, max_rows, bits(1.0 / ((c.idx_heads * c.idx_dim) as f32).sqrt())]);
+                self.dump(format!("idx_score-{l}"), &self.s.scores, n_visible, act);
+                let (sb, cb) = self.st.sels[l].as_ref().unwrap();
+                let bs = c.cand_bs.max(1);
+                let n_blk = n_visible.div_ceil(bs);
+                let words = self.max_rows.div_ceil(bs * 32) as u64;
+                if c.cand_src == l as i32 {
+                    let max_blocks = self.max_rows.div_ceil(bs) as u64;
+                    self.k("qx_ds_block_max", 256, ((max_blocks as u32).div_ceil(256), tt, 1), &[self.s.scores.ptr, self.s.bmax.ptr, self.s.pos.ptr, ratio as u64, bs as u64, max_rows, max_blocks]);
+                    self.dump(format!("cand_block_score-{l}"), &self.s.bmax, n_blk, act);
+                    // top blocks: the scores are the block maxima, "rows" are blocks: positions / (ratio * bs)
+                    self.k("qx_ds_topk", 1024, (tt, 1, 1), &[self.s.bmax.ptr, c.cand_blocks as u64, self.s.cand_sel.ptr, self.s.cand_count.ptr, self.s.pos.ptr, (ratio * bs) as u64, max_blocks]);
+                } else if c.cand_src >= 0 && (c.cand_src as usize) < l {
+                    self.k("qx_ds_zero_u32", 256, (((words * t as u64) as u32).div_ceil(256), 1, 1), &[self.s.inside.ptr, words * t as u64]);
+                    self.k("qx_ds_mark_blocks", 256, ((c.cand_blocks as u32).div_ceil(256), tt, 1), &[self.s.cand_sel.ptr, self.s.cand_count.ptr, self.s.inside.ptr, c.cand_blocks as u64, words]);
+                    self.k("qx_ds_cand_mask", 256, ((self.max_rows as u32).div_ceil(256), tt, 1), &[self.s.scores.ptr, self.s.inside.ptr, self.s.pos.ptr, ratio as u64, bs as u64, max_rows, words]);
+                }
+                self.k("qx_ds_topk", 1024, (tt, 1, 1), &[self.s.scores.ptr, c.idx_top_k as u64, sb.ptr, cb.ptr, self.s.pos.ptr, ratio as u64, max_rows]);
+            }
+            let (sb, cb) = self.st.sels[tsrc].as_ref().expect("top-k source");
+            sel = Some((sb.ptr, cb.ptr, store_table));
+        }
+        let (sp, cp, stp) = sel.unwrap_or((0, 0, 0));
+        // the attention in slices of ATTN_SLICE tokens (the partials buffer is sized for one slice); the
+        // kernels index tokens from the pointers they get, so each slice passes offset pointers
+        let hd = c.head_dim;
+        for s0 in (0..t).step_by(ATTN_SLICE) {
+            let ts = (t - s0).min(ATTN_SLICE);
+            let (q, o, ps, sl) = (self.s.q.ptr + (s0 * c.n_head * hd * 4) as u64, self.s.attn.ptr + (s0 * c.n_head * hd * 4) as u64, self.s.pos.ptr + (s0 * 4) as u64, self.s.slot.ptr + (s0 * 4) as u64);
+            let (sps, cps) = if sp != 0 { (sp + (s0 * c.idx_top_k * 4) as u64, cp + (s0 * 4) as u64) } else { (0, 0) };
+            if std::env::var("QX_DS_ATTN").is_ok_and(|v| v == "old") {
+                self.k("qx_ds_attn", 256, (c.n_head as u32, ts as u32, 1), &[q, self.st.ring_tables[l].ptr, self.ring_w as u64, ps, sl, sps, cps, stp, row as u64, w.sinks.ptr, o, bits(1.0 / (hd as f32).sqrt()), c.n_swa as u64, c.idx_top_k as u64, hd as u64]);
+            } else {
+                let chunks = self.attn_chunks as u64;
+                self.k("qx_ds_attn_part", 256, ((c.n_head / 8) as u32, chunks as u32, ts as u32), &[q, self.st.ring_tables[l].ptr, self.ring_w as u64, ps, sl, sps, cps, stp, row as u64, w.sinks.ptr, o, bits(1.0 / (hd as f32).sqrt()), c.n_swa as u64, c.idx_top_k as u64, hd as u64, self.s.attn_part.ptr, chunks]);
+                self.k("qx_ds_attn_merge", 256, (c.n_head as u32, ts as u32, 1), &[self.s.attn_part.ptr, w.sinks.ptr, o, chunks, hd as u64]);
+            }
+        }
+        self.dump(format!("{}-{l}", if sel.is_some() { "attn_comp" } else { "attn_raw" }), &self.s.attn, c.n_head * c.head_dim, act);
+        self.rope(self.s.attn.ptr, c.n_head, c.head_dim, nope, comp, 0, true, t);
+        self.dump(format!("attn_derope-{l}"), &self.s.attn, c.n_head * c.head_dim, act);
+        let gd = c.n_head / c.o_groups * c.head_dim;
+        for (gi, g) in w.wo_a.iter().enumerate() {
+            self.mgt(g, self.s.attn.ptr + (gi * gd * 4) as u64, c.n_head * c.head_dim, t, "wo_a");
+        }
+        // the groups' rows per token, contiguous for the second projection
+        self.k("qx_ds_regroup", 256, (((c.o_groups * c.o_lora) as u32).div_ceil(256), tt, 1), &[self.s.oag.ptr, self.s.oa.ptr, c.o_groups as u64, c.o_lora as u64, DS_TMAX as u64]);
+        self.dump(format!("attn_wo_a-{l}"), &self.s.oa, c.o_groups * c.o_lora, act);
+        self.mgt(&w.g_ob, self.s.oa.ptr, c.o_groups * c.o_lora, t, "g_ob");
+        self.dump(format!("attn_out-{l}"), &self.s.y, E, act);
+        self.hc_post(t);
+        self.dump(format!("hc_attn_post-{l}"), &self.s.r, hcd, act);
+        true
+    }
+
+    /// Layer `l`'s FFN sublayer up to the routing: the hc terms (into `pre_f`), the norm into `x`, the router
+    /// logits and the selections (`ids`, `wts`).
+    fn layer_ffn_pre(&self, l: usize, t: usize, act: &mut Option<&mut dyn FnMut(&str, Vec<f32>)>) {
+        let c = &self.cfg;
+        let w = &self.layers[l];
+        self.hc_terms(&w.hc_ffn, &self.s.pre_f, t);
+        self.hc_pre(&self.s.pre_a, t);
+        self.dump(format!("hc_ffn_pre-{l}"), &self.s.xpre, E, act);
+        self.rms(self.s.xpre.ptr, w.ffn_norm.ptr, self.s.x.ptr, E, t);
+        self.dump(format!("ffn_norm-{l}"), &self.s.x, E, act);
+        self.mgt(&w.g_ffn, self.s.x.ptr, E, t, "g_ffn");
+        self.dump(format!("ffn_moe_logits-{l}"), &self.s.logits_r, c.n_expert, act);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[self.s.logits_r.ptr, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, self.s.ids.ptr, self.s.wts.ptr, bits(c.w_scale)]);
+    }
+
+    /// The shared expert of layer `l` (`shg`, `shu` from the FFN GEMV group into `shy`).
+    fn layer_shexp(&self, l: usize, t: usize) {
+        let c = &self.cfg;
+        self.k("qx_ds_silu_mul_clamp", 256, (((c.ff_exp * t) as u32).div_ceil(256), 1, 1), &[self.s.shg.ptr, self.s.shu.ptr, self.s.shh.ptr, (c.ff_exp * t) as u64, bits(c.clamp_shexp[l])]);
+        self.mgt(&self.layers[l].g_shd, self.s.shh.ptr, c.ff_exp, t, "g_shd");
+    }
+
+    /// The routed experts of a window (the asynchronous driver, or the host paths for one token), with the
+    /// shared expert run where it overlaps best. Returns (GPU outputs, CPU rows, slot flags) for the combine.
+    fn layer_moe_window(&mut self, l: usize, t: usize, _act: &mut Option<&mut dyn FnMut(&str, Vec<f32>)>) -> (u64, u64, u64) {
+        let c = &self.cfg;
+        let tt = t as u32;
+        let gpu = &self.gpu;
+        let k = c.n_expert_used;
+        // QX_DS_NOEXPERTS=1: skip the routed experts (a timing knob: the dense and attention cost alone)
+        let no_experts = std::env::var("QX_DS_NOEXPERTS").is_ok_and(|v| v == "1");
+        let mut shexp_done = false;
+        let out = if no_experts {
+            self.s.yk.zero();
+            (self.s.yk.ptr, self.s.yk.ptr, self.s.ones_slots.ptr)
+        } else if let (Some(d), Some(ab)) = (&self.driver, &self.abufs) {
+            // the misses to the driver's mailbox (x quantized to Q8_K on the way), the residents on the GPU,
+            // then wait for the CPU's rows: no host involvement
+            let mb = d.shared.mb.dptr;
+            let stage_share = if t >= ab.stage_wide_min { ab.stage_share } else { ab.stage_share_decode };
+            self.trace("qx_moe_post");
+            gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (tt, 1, 1), &[mb, ab.table_dev.ptr, (l * c.n_expert) as u64, self.s.ids.ptr, self.s.wts.ptr, self.s.x.ptr, ab.step.ptr, l as u64, k as u64, E as u64, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, t as u64 | ((self.warm as u64) << 32), ab.rtable_dev.ptr, ab.gpu_share, stage_share, ab.slots_all.ptr, ab.slots_stg.ptr, ab.stage_cap as u64]);
+            self.trace_done();
+            self.dsync("post");
+            self.launch_resident(l, k, t, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, ab.gu.ptr, ab.gpu_out.ptr);
+            self.dsync("resident");
+            // the shared expert while the pool works on the misses
+            self.layer_shexp(l, t);
+            if stage_share > 0 {
+                // the staged experts: their records and slot addresses land on the copy stream, then the
+                // same kernels over the staged slot array (zero where nothing is staged)
+                self.trace("qx_moe_wait_staged");
+                gpu.run(STEP.kernel("qx_moe_wait_staged", CubeDim::new_1d(1)), (1, 1, 1), &[mb, ab.step.ptr]);
+                self.trace_done();
+                self.launch_resident(l, k, t, ab.slots_stg.ptr, ab.xq.ptr, ab.xd.ptr, ab.gu.ptr, ab.gpu_out.ptr);
+            }
+            self.trace("qx_moe_wait");
+            gpu.run(STEP.kernel("qx_moe_wait", CubeDim::new_1d(1)), (1, 1, 1), &[mb, ab.step.ptr]);
+            self.trace_done();
+            self.dsync("wait");
+            shexp_done = true;
+            (ab.gpu_out.ptr, mb + crate::mailbox::mb_y(E) as u64, ab.slots_all.ptr)
+        } else {
+            assert!(t == 1, "the host-driven expert paths take one token");
+            gpu.sync();
+            let ids: Vec<i32> = self.s.ids.download(k);
+            let x: Vec<f32> = self.s.x.download(E);
+            let te = std::time::Instant::now();
+            let combine_gpu = if self.tiers.is_some() {
+                self.experts_tiered(l, &x, &ids).expect("experts");
+                self.tiers.as_ref().unwrap().borrow().gpu_out.ptr
+            } else {
+                self.experts_gguf(l, &x, &ids);
+                self.s.yk.ptr
+            };
+            self.t_experts += te.elapsed().as_secs_f64();
+            let slots_ptr = self.tiers.as_ref().map_or(self.s.ones_slots.ptr, |t| t.borrow().slots.ptr);
+            (combine_gpu, self.s.yk.ptr, slots_ptr)
+        };
+        if !shexp_done {
+            self.layer_shexp(l, t);
+        }
+        out
+    }
+
+    /// Layer `l`'s FFN sublayer after the experts: the combine of the k outputs with the shared expert into `y`,
+    /// then hc_post into the streams.
+    fn layer_ffn_post(&self, l: usize, t: usize, combine_gpu: u64, cpu_rows: u64, slots_ptr: u64, shy: u64, act: &mut Option<&mut dyn FnMut(&str, Vec<f32>)>) {
+        let c = &self.cfg;
+        let hcd = c.hc * E;
+        self.dump(format!("ffn_shexp-{l}"), &self.s.shy, E, act);
+        self.k("qx_ds_moe_combine", 256, ((E as u32).div_ceil(256), t as u32, 1), &[combine_gpu, c.n_expert_used as u64, cpu_rows, self.s.y.ptr, E as u64, slots_ptr, self.s.wts.ptr, shy]);
+        self.dsync("combine");
+        self.dump(format!("ffn_out-{l}"), &self.s.y, E, act);
+        self.hc_post(t);
+        self.dump(format!("l_out-{l}"), &self.s.r, hcd, act);
+        self.dsync("layer");
     }
 }

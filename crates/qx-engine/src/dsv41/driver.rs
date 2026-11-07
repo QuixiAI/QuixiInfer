@@ -41,6 +41,27 @@ pub struct Shared {
     /// the previous window's promotion copies are still in flight). The driver takes this lock around each such
     /// call; a capture never waits for the driver, so neither side can deadlock.
     pub capture: std::sync::Mutex<()>,
+    /// The chunk path (`DsEngine::forward_chunk`): one job per layer, posted by the engine and served here, which
+    /// writes each expert's slot word (its VRAM address, or the staging slot its record is copied into) behind the
+    /// copy; the GPU's per-expert launches wait on the word. `chunk_done` is the host-mapped word the GPU marks
+    /// with the ordinal of the last expert it finished (release), which gates the staging slots' reuse.
+    pub chunk_jobs: std::sync::Mutex<std::collections::VecDeque<ChunkJob>>,
+    pub chunk_done: HostMapped,
+    /// Per global expert: 0 in VRAM, 1 in RAM, 2 on NVMe (kept by the driver; the engine orders a chunk's experts
+    /// by it so the GPU meets the fast ones first).
+    pub tier_of: Vec<std::sync::atomic::AtomicU8>,
+}
+
+/// A chunk's MoE for one layer: the distinct experts in the order the GPU's launches wait for them, each with its
+/// selection count (for the scores), and the device table (u64 per expert of the layer) of slot words to fill.
+pub struct ChunkJob {
+    pub layer: usize,
+    pub experts: Vec<u32>,
+    pub counts: Vec<u32>,
+    pub slots_dev: u64,
+    /// The job's generation (1..65535, in the words' top 16 bits): the GPU waits for it, so the table is never
+    /// zeroed between jobs.
+    pub generation: u64,
 }
 
 /// Per layer: the expert formats and record geometry.
@@ -111,6 +132,9 @@ impl Driver {
             profile_req: AtomicBool::new(false),
             profile: std::sync::Mutex::new(None),
             capture: std::sync::Mutex::new(()),
+            chunk_jobs: std::sync::Mutex::new(Default::default()),
+            chunk_done: HostMapped::new(64),
+            tier_of: (0..host.table.len()).map(|g| std::sync::atomic::AtomicU8::new(if host.table[g] != 0 { 0 } else if host.rtable[g] != 0 { 1 } else { 2 })).collect(),
         });
         let sh = shared.clone();
         // the thread finishes its CUDA set-up (streams, events, pinned words) before any window can post a job:
@@ -135,6 +159,8 @@ impl Drop for Driver {
 struct Loop {
     host: Host,
     pool: Pool,
+    /// For the tier mirror (`note_tier`); set once the loop runs.
+    shared: Option<Arc<Shared>>,
     stream: cudarc::driver::sys::CUstream,
     /// Pinned words the table writes copy from (a ring, never reused in flight).
     words: HostMapped,
@@ -168,6 +194,14 @@ impl Loop {
             cudarc::driver::sys::cuMemcpyHtoDAsync_v2(self.host.table_dev + 8 * g as u64, self.words.ptr.add(i * 8) as *const _, 8, self.stream).result().expect("table write");
         }
         self.host.table[g] = v;
+        self.note_tier(g);
+    }
+
+    /// Keeps `Shared::tier_of` in step with the tables.
+    fn note_tier(&self, g: usize) {
+        if let Some(sh) = &self.shared {
+            sh.tier_of[g].store(if self.host.table[g] != 0 { 0 } else if self.host.rtable[g] != 0 { 1 } else { 2 }, Ordering::Relaxed);
+        }
     }
 
     /// Writes one u64 to device memory on the copy stream (from the pinned words ring).
@@ -195,6 +229,97 @@ impl Loop {
             cudarc::driver::sys::cuMemcpyHtoDAsync_v2(self.host.rtable_dev + 8 * g as u64, self.words.ptr.add(i * 8) as *const _, 8, self.stream).result().expect("ram table write");
         }
         self.host.rtable[g] = v;
+        self.note_tier(g);
+    }
+
+    /// Serves a chunk job: every expert's slot word is written behind what makes it readable. VRAM residents at
+    /// once; RAM residents copied into the staging area (a ring of `stage_cap` slots over the copy streams, a
+    /// slot reused only once the GPU's progress mark passed its last user); NVMe records read into the store's
+    /// landing places in batches of the queue, then copied the same way. The engine ordered the experts VRAM, RAM,
+    /// NVMe, so the GPU meets each tier's records as they land.
+    fn serve_chunk(&mut self, sh: &Shared, job: ChunkJob) {
+        let (l, ne) = (job.layer, self.host.n_expert);
+        for (&e, &c) in job.experts.iter().zip(&job.counts) {
+            self.host.score[l * ne + e as usize] += c as f64;
+        }
+        let n_slots = self.host.stage_cap.max(1);
+        let rec_max = self.host.classes.iter().map(|c| c.0).max().unwrap_or(0) as u64;
+        let mut slot_user: Vec<u64> = vec![0; n_slots];
+        let mut next_slot = 0usize;
+        let mut next_stream = 0usize;
+        let done = sh.chunk_done.atomic_u64(0);
+        let t0 = std::time::Instant::now();
+        let (mut n_vram, mut n_ram, mut n_nvme) = (0u64, 0u64, 0u64);
+        // the copy of one record from `src` into the next staging slot, its word written behind it
+        let mut stage = |lp: &mut Loop, g: usize, e: u32, src: *const u8, ord: u64, slot_user: &mut Vec<u64>, next_slot: &mut usize, next_stream: &mut usize| {
+            let s = *next_slot;
+            *next_slot = (*next_slot + 1) % n_slots;
+            // the slot's previous user must be done on the GPU (its ordinal marked)
+            while done.load(Ordering::Acquire) < slot_user[s] {
+                std::hint::spin_loop();
+            }
+            slot_user[s] = ord;
+            let dst = lp.host.stage_base + s as u64 * rec_max;
+            let nb = lp.host.store.record_bytes(g);
+            let si = *next_stream % lp.stage_streams.len();
+            *next_stream += 1;
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dst, src as *const _, nb, lp.stage_streams[si]).result().expect("chunk stage copy");
+            }
+            let st = lp.stage_streams[si];
+            lp.write_word_on(st, job.slots_dev + 8 * e as u64, dst | (job.generation << 48));
+        };
+        // NVMe records: the ones not in RAM when their turn comes, read in batches of the landing places
+        let mut i = 0usize;
+        while i < job.experts.len() {
+            let e = job.experts[i];
+            let g = l * ne + e as usize;
+            let ord = i as u64 + 1;
+            if self.host.table[g] != 0 {
+                let v = self.host.table[g] | (job.generation << 48);
+                self.write_word(job.slots_dev + 8 * e as u64, v);
+                n_vram += 1;
+                i += 1;
+            } else if self.host.store.in_ram(g) {
+                let src = self.host.store.place[g] as *const u8;
+                stage(self, g, e, src, ord, &mut slot_user, &mut next_slot, &mut next_stream);
+                n_ram += 1;
+                i += 1;
+            } else {
+                // a batch of consecutive NVMe records from here (the engine put them last)
+                let mut batch: Vec<usize> = Vec::new();
+                let mut j = i;
+                while j < job.experts.len() && batch.len() < 48 {
+                    let gj = l * ne + job.experts[j] as usize;
+                    if self.host.table[gj] != 0 || self.host.store.in_ram(gj) {
+                        break;
+                    }
+                    batch.push(gj);
+                    j += 1;
+                }
+                let tw = std::time::Instant::now();
+                let ptrs = self.host.store.fetch(&batch).expect("chunk NVMe fetch");
+                sh.fetch_ns.fetch_add(tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                for (bi, &gj) in batch.iter().enumerate() {
+                    let ej = job.experts[i + bi];
+                    stage(self, gj, ej, ptrs[bi], (i + bi) as u64 + 1, &mut slot_user, &mut next_slot, &mut next_stream);
+                }
+                // the landing places are reused by the next batch: its reads must not start before these copies read them
+                for si in 0..self.stage_streams.len() {
+                    unsafe {
+                        cudarc::driver::result::event::record(self.stage_events[si], self.stage_streams[si]).expect("event record");
+                        cudarc::driver::result::event::synchronize(self.stage_events[si]).expect("chunk stage copies");
+                    }
+                }
+                n_nvme += batch.len() as u64;
+                i = j;
+            }
+        }
+        sh.vram_hits.fetch_add(n_vram, Ordering::Relaxed);
+        sh.staged_hits.fetch_add(n_ram, Ordering::Relaxed);
+        sh.nvme_misses.fetch_add(n_nvme, Ordering::Relaxed);
+        sh.stage_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.missed.extend(job.experts.iter().map(|&e| l * ne + e as usize).filter(|&g| self.host.table[g] == 0));
     }
 
     /// Answers one MoE job.
@@ -496,7 +621,7 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     let n_stage_streams: usize = std::env::var("QX_DS_STAGE_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 8);
     let stage_streams: Vec<cudarc::driver::sys::CUstream> = (0..n_stage_streams).map(|_| unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("stage stream")).collect();
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
-    let mut lp = Loop { host, pool, stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events };
+    let mut lp = Loop { host, pool, shared: Some(sh.clone()), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events };
     // exercise every copy path once before a window can wait on this thread: whatever the CUDA driver
     // loads or allocates on a stream's first copy then happens while the device is idle
     let scratch = qx_gpu::mem::DeviceBuf::new(64);
@@ -529,6 +654,11 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
         if seq != last_job {
             last_job = seq;
             lp.serve(&sh, seq);
+            worked = true;
+        }
+        let chunk = sh.chunk_jobs.lock().unwrap().pop_front();
+        if let Some(job) = chunk {
+            lp.serve_chunk(&sh, job);
             worked = true;
         }
         let td = sh.tokens_done.load(Ordering::Acquire);

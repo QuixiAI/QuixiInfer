@@ -213,6 +213,9 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         }
         let mut width_hist: std::collections::BTreeMap<usize, usize> = Default::default();
         let prefix_on = !std::env::var("QX_DS_PREFIX").is_ok_and(|v| v == "0");
+        let skip_on = !std::env::var("QX_DS_SKIP").is_ok_and(|v| v == "0");
+        let keep = eng.prompt_keep();
+        let mut kv_only_windows = 0usize;
         let stats = std::env::var("QX_SCHED_STATS").is_ok();
         let group = eng.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
         let mut last_save: Option<std::time::Instant> = None;
@@ -308,7 +311,13 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 continue;
             }
             *width_hist.entry(segs.len()).or_default() += 1;
-            let out = eng.forward_segments(&segs, None);
+            // a window of prompt chunks only, each at least prompt_keep() positions before its prompt's end, runs
+            // KV-only (QX_DS_SKIP=0 disables): exact for every kept position, about half the work
+            let kv_only = skip_on && d == 0 && plan.iter().all(|&(ri, n, _)| running[ri].job.prompt.len() - (running[ri].read + n) >= keep);
+            if kv_only {
+                kv_only_windows += 1;
+            }
+            let out = eng.forward_segments_opt(&segs, None, kv_only);
             steps += 1;
             if stats {
                 let now = std::time::Instant::now();
@@ -382,7 +391,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 }
             }
             if stats && (steps % 200 == 0 || running.is_empty()) {
-                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}", running.len(), waiting.len(), width_hist);
+                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}", running.len(), waiting.len(), width_hist);
                 if acc_steps > 0 {
                     let k = acc_steps as f64 / 1e3;
                     // the wall between forwards is everything outside the engine: host sampling, detokenizing,

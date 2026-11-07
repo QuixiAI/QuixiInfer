@@ -111,7 +111,7 @@ def main():
     print(f"{'conc':>4} {'reqs':>4} {'tokens':>6} {'prompt':>7} {'wall s':>7} {'agg tok/s':>9} {'per-req tok/s':>13} {'TTFT med':>8} {'TTFT p90':>8}", flush=True)
     for c in [int(x) for x in a.levels.split(",")]:
         r = level(a.url, c, a.rounds, a.max_tokens, a.temperature, a.unique, a.turns)
-        print(f"{r['c']:>4} {r['requests']:>4} {r['tokens']:>6} {r['prompt_tokens']:>7} {r['wall']:>7.1f} {r['agg']:>9.1f} {r['per_req']:>13.1f} {r['ttft_med']:>8.2f} {r['ttft_p90']:>8.2f}", flush=True)
+        print(f"{r['c']:>4} {r['requests']:>4} {r['tokens']:>6} {r['prompt_tokens']:>7} {r['wall']:>7.1f} {r['agg']:>9.2f} {r['per_req']:>13.2f} {r['ttft_med']:>8.2f} {r['ttft_p90']:>8.2f}", flush=True)
 
 if __name__ == "__main__":
     main()

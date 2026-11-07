@@ -232,6 +232,9 @@ invented one. The aggregate score lives in `scoreboard.md`.
   256k, and the same mechanism in serving after every prompt.
 - **Next action:** a mapped-buffer path for `tok`, `pos` and `slot`; measure `decode256k` and `serve256k3`.
 - **Kill criteria:** under 3% on both.
+- **Concluded 2026-11-06: FLAT** (decode256k -1.5%, serve256k3 -0.3%, inside the spreads). Kept as the default
+  (no cost; the stall it removes is in the first steps after a prompt, which no scored case samples). Removed
+  from the beam; a TTFT case would be where it shows.
 
 ### 11. The long-prompt layer skip: KV-only windows (new 2026-11-06, from Strata's `prompt skip`)
 

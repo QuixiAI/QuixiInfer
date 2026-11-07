@@ -84,7 +84,13 @@ fn main() -> anyhow::Result<()> {
                 let snap = eng.snapshot(0);
                 let file = format!("{path}-{p}.state");
                 snap.write(std::path::Path::new(&file)).expect("state write");
-                eprintln!("saved {p} positions ({:.2} GB) to {file} in {:.2}s", snap.bytes() as f64 / 1e9, t0.elapsed().as_secs_f64());
+                // the tiers' live ranking beside it: a resume that loads it (QX_DS_PROFILE) starts with the
+                // placement the pass had reached, not the static profile's
+                let prof = format!("{path}-{p}.profile");
+                match eng.save_profile(std::path::Path::new(&prof)) {
+                    Ok(()) => eprintln!("saved {p} positions ({:.2} GB) to {file} and the tier ranking to {prof} in {:.2}s", snap.bytes() as f64 / 1e9, t0.elapsed().as_secs_f64()),
+                    Err(e) => eprintln!("saved {p} positions ({:.2} GB) to {file} in {:.2}s; ranking not saved: {e:#}", snap.bytes() as f64 / 1e9, t0.elapsed().as_secs_f64()),
+                }
             }
         }
     };
@@ -114,14 +120,35 @@ fn main() -> anyhow::Result<()> {
             let mut tail_times: Vec<f64> = Vec::new();
             let mut tail_phase = [0f64; 5];
             let mut tail_engram = 0f64;
+            // QX_DS_SKIP=1: windows with at least prompt_keep() positions after them run KV-only (no logits for
+            // those positions; the kept tail is bit for bit the full pass's)
+            let skip = std::env::var("QX_DS_SKIP").is_ok_and(|v| v == "1");
+            let keep = eng.prompt_keep();
+            let mut kv_only_windows = 0usize;
+            // QX_DS_CHUNK=N (the chunk path, layer-major in chunks of N rows): the prompt before the tail in chunks
+            // instead of windows; a chunk returns its last row's logits only
+            let chunk = std::env::var("QX_DS_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
             let mut p = start;
             while p < toks.len() {
                 save_if_due(&mut eng, p);
-                let cap = if p >= toks.len() - tail { 1 } else { window.min(toks.len() - tail - p) };
+                let cap = if p >= toks.len() - tail { 1 } else if chunk > 0 { chunk.min(toks.len() - tail - p) } else { window.min(toks.len() - tail - p) };
                 let w = &toks[p..(p + cap).min(toks.len())];
-                let logits = eng.forward_window(w, None);
+                let kv_only = skip && w.len() > 1 && toks.len() - (p + w.len()) >= keep;
+                let logits = if chunk > 0 && w.len() > 1 {
+                    let last = eng.forward_chunk(0, w);
+                    // the chunk's rows but the last carry no logits: pad so the row index stays the position
+                    let mut v = vec![0f32; last.len() * (w.len() - 1)];
+                    v.extend_from_slice(&last);
+                    v
+                } else if kv_only {
+                    kv_only_windows += 1;
+                    let segs: Vec<(usize, u32)> = w.iter().map(|&t| (0usize, t)).collect();
+                    eng.forward_segments_opt(&segs, None, true)
+                } else {
+                    eng.forward_window(w, None)
+                };
                 let nv = logits.len() / w.len();
-                for (i, row) in logits.chunks(nv).enumerate() {
+                for (i, row) in logits.chunks(nv.max(1)).enumerate().filter(|_| nv > 0) {
                     if p + i >= dump_from {
                         dump_row(&mut dump_file, row);
                     }
@@ -154,6 +181,9 @@ fn main() -> anyhow::Result<()> {
             let last = &per_tok[n.saturating_sub(32)..];
             let last_ms = last.iter().sum::<f64>() * 1e3 / last.len().max(1) as f64;
             println!("windows of {window}: {} tokens, {:.1} ms per token ({:.1} ms engram gather), {:.1} tok/s; last {}: {:.1} ms per token, {:.1} tok/s; tokens {:?}", n, t_all * 1e3 / n as f64, t_eng * 1e3 / n as f64, n as f64 / t_all, last.len(), last_ms, 1e3 / last_ms, &out_toks[..out_toks.len().min(24)]);
+            if skip {
+                println!("KV-only windows: {kv_only_windows} (prompt_keep {keep})");
+            }
             save_if_due(&mut eng, toks.len());
             if !tail_times.is_empty() {
                 let m = tail_times.iter().sum::<f64>() * 1e3 / tail_times.len() as f64;

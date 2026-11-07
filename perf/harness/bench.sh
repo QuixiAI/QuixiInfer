@@ -69,6 +69,11 @@ TOKENS=perf/data/route1k.tokens
 TOKENS16K=perf/data/route16k.tokens
 TOKENS256K=perf/data/wiki256k.tokens
 STATES=perf/states   # the saved 256k states the set D cases resume from (perf/states/README.md)
+# the tier ranking the pass had reached at each state (written beside it since 2026-11-06): a resume that loads it
+# measures the warm placement, not 16k tokens of adaptation from the static profile. Empty when the state predates it.
+PROF245760=""; PROF262144=""
+if [ -e $STATES/wiki256k-245760.profile ]; then PROF245760="QX_DS_PROFILE=$STATES/wiki256k-245760.profile"; fi
+if [ -e $STATES/wiki256k-262144.profile ]; then PROF262144="QX_DS_PROFILE=$STATES/wiki256k-262144.profile"; fi
 B=target/release/qx-ds-check
 SERVER=target/release/quixiinfer
 PORT=${QX_PERF_PORT:-8089}
@@ -137,9 +142,9 @@ fi
 # of 128; serve256k is the server at --ctx 262144. The states come from one full pass (perf/states/README.md).
 declare -A ARGS=( [decode]="" [prefill64]="QX_DS_WINDOW=64" [prefill32]="QX_DS_WINDOW=32" [prefill128]="QX_DS_WINDOW=128"
                   [prefill2]="QX_DS_WINDOW=2" [prefill4]="QX_DS_WINDOW=4" [prefill8]="QX_DS_WINDOW=8"
-                  [long16k]="QX_DS_WINDOW=128 QX_DS_TAIL=64" [serve]="" [serve256k]=""
-                  [decode256k]="QX_DS_LOAD_STATE=$STATES/wiki256k-262144.state"
-                  [prefill256k]="QX_DS_WINDOW=128 QX_DS_LOAD_STATE=$STATES/wiki256k-245760.state" )
+                  [long16k]="QX_DS_WINDOW=128 QX_DS_TAIL=64 QX_DS_SKIP=1" [serve]="" [serve256k]=""
+                  [decode256k]="QX_DS_LOAD_STATE=$STATES/wiki256k-262144.state $PROF262144"
+                  [prefill256k]="QX_DS_WINDOW=128 QX_DS_SKIP=1 QX_DS_LOAD_STATE=$STATES/wiki256k-245760.state $PROF245760" )
 declare -A TOKF=( [long16k]="$TOKENS16K" [decode256k]="$TOKENS256K" [prefill256k]="$TOKENS256K" )
 declare -A COUNT=( [long16k]=16384 [decode256k]=262208 [prefill256k]=262144 )
 declare -A TMO=( [long16k]=2400 [decode256k]=900 [prefill256k]=1500 )
@@ -155,7 +160,9 @@ for c in "${CASE_LIST[@]}"; do [ -n "${ARGS[$c]+x}" ] || { echo "unknown case $c
 # unmeasured requests (the tiers adapt over the first requests, as they do over route1k's first hundred tokens).
 # Greedy sampling, so the replies and their lengths repeat from run to run.
 serve_case() {
-  local r=$1 name=${2:-serve} ctx=${3:-8192} slog="$RUN/logs/$name-$r.server.log" log="$RUN/logs/$name-$r.log"
+  # (two statements: `local` expands every word before it assigns any, so $name is unbound in the same one)
+  local r=$1 name=${2:-serve} ctx=${3:-8192}
+  local slog="$RUN/logs/$name-$r.server.log" log="$RUN/logs/$name-$r.log"
   # QX_DS_RAM=95 for the server, not the forced bench's 100: at 100 the server's RSS is 111 GB on a 120 GiB box
   # (102.5 GB pinned tier, 1.9 GB anonymous, 6.7 GB file-backed), the wrong side of safe next to the agent; at 95
   # it is about 106 GB. 95 against 90 measured serve3 -5.4% and serve1 -5.0% (2026-11-06, outside the spreads):
