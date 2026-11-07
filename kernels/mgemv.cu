@@ -495,11 +495,16 @@ template <int XM, int NT, int RB> QX_DEV void mgemv_zt(const u64* info) {
         const u32 nr = min((u32)RBF, rows - r0);
         const u8* w = reinterpret_cast<const u8*>(d[0]) + (u64)r0 * stride;
         const u32 b0 = warp * 256 + 8 * wl, b1 = b0 + 8 * 256;
-        const bool two = b1 < cols;
+        // the reference's steps for this lane: st = warp while st * 256 < cols (so none at all for the warps past
+        // a row of fewer than 2,048 columns), then warp + 8 when that is still inside the row
+        const bool one = b0 < cols, two = b1 < cols;
         float w0[RBF][8], w1[RBF][8];
 #pragma unroll
         for (int r = 0; r < RBF; ++r) {
             const u8* row = w + (u64)(r < nr ? r : 0) * stride;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) w0[r][i] = w1[r][i] = 0.f;
+            if (!one) continue;
             switch (ty) {
 #define DQ(t) case t: dec<t>(row, cols, b0, w0[r]); if (two) dec<t>(row, cols, b1, w1[r]); break;
                 DQ(QX_F32) DQ(QX_BF16) DQ(QX_Q8_0) DQ(QX_Q6_K) DQ(QX_IQ4_NL) DQ(QX_IQ3_S) DQ(QX_IQ2_S) DQ(QX_Q6_K_P) DQ(QX_NVFP4)
@@ -520,13 +525,13 @@ template <int XM, int NT, int RB> QX_DEV void mgemv_zt(const u64* info) {
                 xi.arg = XM == 2 ? info[4] + 4ull * (z0 + n) * info[3] : info[4];
                 xi.xq = nullptr;
                 xi.xd = nullptr;
-                float4 xa, xb, xc, xd;
-                ldx8<XM>(xi, b0, xa, xb);
+                float4 xa = make_float4(0.f, 0.f, 0.f, 0.f), xb = xa, xc = xa, xd = xa;
+                if (one) ldx8<XM>(xi, b0, xa, xb);
                 if (two) ldx8<XM>(xi, b1, xc, xd);
 #pragma unroll
                 for (int r = 0; r < RBF; ++r) {
                     float a = 0.f;
-                    a += dot8x(w0[r], xa, xb);
+                    if (one) a += dot8x(w0[r], xa, xb);
                     if (two) a += dot8x(w1[r], xc, xd);
                     a0[r][n] = a;
                 }
