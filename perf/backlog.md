@@ -229,6 +229,8 @@ invented one. The aggregate score lives in `scoreboard.md`.
   262k against 34 at 1k, part of it the cold resumed tier) re-opens as a smaller family once the states carry
   the tier ranking: the per-token `qx_ds_topk` (8 x 0.3 ms) and the candidate path are next.
 
+- **Re-aimed 2026-11-07 (profile on 0ced38e, golden profile, decode256k 46 ms):** the indexer is 9% of the step (`idx_score2` 2.2 ms + `topk` 2.5); 57% is the two expert wait kernels (28 ms: ~93 host-served records of 9.5 MB per token, per-layer round trips), 13% `qx_mgemv` at width 1 (511 launches of 12.7 us). Measured dead ends: the staging share (3/8 is the optimum; all-DMA and all-pool both 46-47), previous-token prefetch (23% of host-served selections repeat). Live levers, each below the kernel bar alone, a bundle to clear it: (a) `qx_ds_topk` as one compaction pass (per-thread contiguous ranges, one block scan, warp-private histograms; order of `sel` must stay ascending-index with the equal keys at the tail, the reference's tie rule), 284 → ~100 us per call, ~1.6 ms per step; (b) family 8's GEMV fusions at width 1 (~2 ms); (c) structural: the latent rows of the compressed store to pinned host memory (read 512 rows per layer per token by gather), freeing ~8 GiB of VRAM for the expert tier; expected -7 ms of waits against +3 of gathers at 7 GB/s, measure the gather rate first.
+
 ### 10. The per-step uploads synchronize the whole context (new 2026-11-06)
 
 - **Parent result:** the tail's phases at 256k: uploads 7 ms in the first single steps after the prefill, 1.4 ms
