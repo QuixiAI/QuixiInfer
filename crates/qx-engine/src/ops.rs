@@ -335,8 +335,10 @@ impl MGemv {
             } else {
                 (0, 0)
             };
-            // the groups run inside the block (info[10]), so a block's rows stay in L1 across them
-            gpu.run(modules::MGEMV.kernel(ENTRIES[7][mode as usize], CubeDim::new_1d(256)), (self.blocks, 1, 1), &[x, self.table.ptr, self.n as u64, x_stride as u64, arg, 8 | (((t / 8) as u64) << 32), 0, xq, xd, self.tcols as u64]);
+            // the groups run inside the block (the high bits of info[5]), so a block's rows stay in L1 across them;
+            // the `_t8z` entries alone carry the group loop (it costs the width 1-8 entries 4-5% at decode)
+            const ZENTRIES: [&str; 3] = ["qx_mgemv_t8z", "qx_mgemv_silu_t8z", "qx_mgemv_silumul_t8z"];
+            gpu.run(modules::MGEMV.kernel(ZENTRIES[mode as usize], CubeDim::new_1d(256)), (self.blocks, 1, 1), &[x, self.table.ptr, self.n as u64, x_stride as u64, arg, 8 | (((t / 8) as u64) << 32), 0, xq, xd, self.tcols as u64]);
             return;
         }
         for c in (0..t).step_by(8) {
