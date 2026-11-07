@@ -142,9 +142,9 @@ fi
 # of 128; serve256k is the server at --ctx 262144. The states come from one full pass (perf/states/README.md).
 declare -A ARGS=( [decode]="" [prefill64]="QX_DS_WINDOW=64" [prefill32]="QX_DS_WINDOW=32" [prefill128]="QX_DS_WINDOW=128"
                   [prefill2]="QX_DS_WINDOW=2" [prefill4]="QX_DS_WINDOW=4" [prefill8]="QX_DS_WINDOW=8"
-                  [long16k]="QX_DS_WINDOW=128 QX_DS_TAIL=64 QX_DS_SKIP=1" [serve]="" [serve256k]=""
+                  [long16k]="QX_DS_WINDOW=128 QX_DS_TAIL=64 QX_DS_SKIP=1 QX_DS_CHUNK=4096" [serve]="" [serve256k]=""
                   [decode256k]="QX_DS_LOAD_STATE=$STATES/wiki256k-262144.state $PROF262144"
-                  [prefill256k]="QX_DS_WINDOW=128 QX_DS_SKIP=1 QX_DS_LOAD_STATE=$STATES/wiki256k-245760.state $PROF245760" )
+                  [prefill256k]="QX_DS_WINDOW=128 QX_DS_SKIP=1 QX_DS_CHUNK=4096 QX_DS_LOAD_STATE=$STATES/wiki256k-245760.state $PROF245760" )
 declare -A TOKF=( [long16k]="$TOKENS16K" [decode256k]="$TOKENS256K" [prefill256k]="$TOKENS256K" )
 declare -A COUNT=( [long16k]=16384 [decode256k]=262208 [prefill256k]=262144 )
 declare -A TMO=( [long16k]=2400 [decode256k]=900 [prefill256k]=1500 )

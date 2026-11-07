@@ -202,7 +202,11 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 let _ = eng.forward_window(&toks[..w], None);
             }
             eng.reset(0);
-            qx_gpu::kernel::seal();
+            // the chunk path's kernels too (every format's expert kernels, the waits and marks), before the set seals
+        if eng.chunk_rows() > 0 {
+            eng.chunk_warm();
+        }
+        qx_gpu::kernel::seal();
             let (free, total) = qx_gpu::mem::mem_info();
             eprintln!(
                 "quixiinfer: warm-up {:.1}s (graphs for windows of {widths:?}); device memory free after warm-up: {:.2} GiB of {:.2}",
@@ -216,6 +220,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         let skip_on = !std::env::var("QX_DS_SKIP").is_ok_and(|v| v == "0");
         let keep = eng.prompt_keep();
         let mut kv_only_windows = 0usize;
+        let mut chunk_steps = 0usize;
         let stats = std::env::var("QX_SCHED_STATS").is_ok();
         let group = eng.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
         let mut last_save: Option<std::time::Instant> = None;
@@ -281,10 +286,37 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             if running.is_empty() {
                 continue;
             }
-            // the window: decoders first (one token each), then prompt tokens up to the largest width of WIDTHS
-            // the prompts can fill (at most `window` per prompt)
             let mut segs: Vec<(usize, u32)> = Vec::new();
             let mut plan: Vec<(usize, usize, bool)> = Vec::new(); // (request index, tokens, completes the prompt or decodes)
+            let mut out: Vec<f32> = Vec::new();
+            // the chunk path (QX_DS_CHUNK=N at start): while nobody decodes, the longest remaining prompt goes
+            // through forward_chunk, up to N rows at once, KV-only when at least prompt_keep positions follow
+            // (exact; decoders would wait seconds behind a chunk, so only prompt-only steps take it)
+            let chunk_rows = eng.chunk_rows();
+            let chunked = if chunk_rows > 0 && running.iter().all(|r| r.next.is_none()) {
+                let pick = (0..running.len()).filter(|&i| running[i].job.prompt.len() - running[i].read >= window.max(256)).max_by_key(|&i| running[i].job.prompt.len() - running[i].read);
+                if let Some(ri) = pick {
+                    let r = &mut running[ri];
+                    let rem = r.job.prompt.len() - r.read;
+                    let n = rem.min(chunk_rows);
+                    let kv_only = skip_on && rem - n >= keep;
+                    let last = eng.forward_chunk_opt(r.slot, &r.job.prompt[r.read..r.read + n], kv_only);
+                    r.read += n;
+                    chunk_steps += 1;
+                    if r.read == r.job.prompt.len() {
+                        r.t_prompt = Some(r.t0.elapsed().as_secs_f64());
+                        r.logits = Some(last);
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !chunked {
+            // the window: decoders first (one token each), then prompt tokens up to the largest width of WIDTHS
+            // the prompts can fill (at most `window` per prompt)
             for (ri, r) in running.iter().enumerate() {
                 if let Some(id) = r.next {
                     segs.push((r.slot, id));
@@ -317,7 +349,8 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             if kv_only {
                 kv_only_windows += 1;
             }
-            let out = eng.forward_segments_opt(&segs, None, kv_only);
+            out = eng.forward_segments_opt(&segs, None, kv_only);
+            }
             steps += 1;
             if stats {
                 let now = std::time::Instant::now();
@@ -391,7 +424,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 }
             }
             if stats && (steps % 200 == 0 || running.is_empty()) {
-                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}", running.len(), waiting.len(), width_hist);
+                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}, chunk steps {chunk_steps}", running.len(), waiting.len(), width_hist);
                 if acc_steps > 0 {
                     let k = acc_steps as f64 / 1e3;
                     // the wall between forwards is everything outside the engine: host sampling, detokenizing,

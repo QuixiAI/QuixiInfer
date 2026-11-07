@@ -29,6 +29,17 @@ were 20-21 GiB VRAM and 88-100 GiB RAM. The settings before 2026-11-04 differ fr
 | Run-to-run noise | same commit: decode 31.2-33.1 ms, prefill64 11.7-12.4 ms (spread up to 6%) | 2026-11-05, this scaffolding |
 | **Narrow windows cost per position:** T = 1: 32.7 ms, T = 2: 23.6, T = 4: 19.4, T = 8: 15.7, T = 64: 12.3. A window of T positions costs T x w_T, so a draft-and-verify round breaks even at 41-46% acceptance before the drafter's cost and gains 6% at 75% acceptance (T = 4), 19% at 85%. | harness `narrow-windows`, 3 repeats, spreads 0.8-3.1% | 2026-11-06 |
 
+## The chunk path's shape (2026-11-07, measured)
+
+Per row at 4096-row chunks on the 16k prompt: the dense slab passes about 2.6 ms full stack / 1.2 KV-only, GPU-
+bound (the dense GEMV ~40% of the chunk's GPU time even with a slab's groups in one block; attention ~16%; the
+rest small); the expert phase about 1.7 / 0.85 ms, bound by dequantizing each expert once per (expert, 64-row
+pass) and so halving with the chunk size; the chunk buffers 0.9 / 1.8 / 3.5 GB of VRAM at 2048 / 4096 / 8192
+rows, taken from the expert tier (decode after a prompt +1% / +6%). Host launch count is not a bottleneck (the
+z-group change halved it with no gain). Batching expert launches is slower (L2 and in-kernel waits). Prefetching
+experts during the slab passes is neutral (the phase is not transfer-bound). A changed `mgemv.cu` costs ~9 min of
+driver JIT at first use.
+
 ## Wins
 
 | finding | effect | date / source |

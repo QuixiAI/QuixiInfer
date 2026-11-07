@@ -335,7 +335,8 @@ impl MGemv {
             } else {
                 (0, 0)
             };
-            gpu.run(modules::MGEMV.kernel(ENTRIES[7][mode as usize], CubeDim::new_1d(256)), (self.blocks, 1, (t / 8) as u32), &[x, self.table.ptr, self.n as u64, x_stride as u64, arg, 8, 0, xq, xd, self.tcols as u64]);
+            // the groups run inside the block (info[10]), so a block's rows stay in L1 across them
+            gpu.run(modules::MGEMV.kernel(ENTRIES[7][mode as usize], CubeDim::new_1d(256)), (self.blocks, 1, 1), &[x, self.table.ptr, self.n as u64, x_stride as u64, arg, 8 | (((t / 8) as u64) << 32), 0, xq, xd, self.tcols as u64]);
             return;
         }
         for c in (0..t).step_by(8) {

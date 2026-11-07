@@ -1518,7 +1518,7 @@ impl<'a> DsEngine<'a> {
     /// load while the GPU spins in a wait kernel and the driver's copies are in flight deadlocks (the window path's
     /// dry pass exists for the same reason; the chunk path's first use of a format's grouped kernel at layer 10 hung
     /// a run on 2026-11-06). Every launch sees "slot 0" and returns; the wait sees its generation at once.
-    fn chunk_warm(&mut self) {
+    pub fn chunk_warm(&mut self) {
         if self.chunk.as_ref().is_none_or(|cb| cb.warmed) {
             return;
         }
@@ -1593,17 +1593,25 @@ impl<'a> DsEngine<'a> {
             assert!((t as usize) < n_vocab, "token id {t} outside the vocabulary");
             self.st.tokens[slot].push(t);
         }
-        // the dry passes of the slab widths, on the ordinary scratch with the first slab's arrays (the previous
+        // the slabs: full ones of DS_TMAX, then the remainder in the widths every server warms (never 5 or 7:
+        // their kernels are not loaded behind a sealed kernel set, and width 5's multi-GEMV is not bit-identical)
+        let mut slabs: Vec<(usize, usize)> = Vec::new();
+        let mut r0 = 0;
+        while r0 < rows {
+            let left = rows - r0;
+            let t = [128usize, 96, 64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1].into_iter().find(|&w| w <= left.min(DS_TMAX)).unwrap();
+            slabs.push((r0, t));
+            r0 += t;
+        }
+        // the dry passes of the slab widths, on the ordinary scratch with the first rows' arrays (the previous
         // forward synced, so nothing is in flight)
-        let t_last = rows - (rows - 1) / DS_TMAX * DS_TMAX;
-        let t0 = rows.min(DS_TMAX);
+        let t0 = slabs[0].1;
         self.s.tok.upload(&toks[..t0]);
         self.s.pos.upload(&positions[..t0]);
         self.s.slot.upload(&slots_v[..t0]);
-        let mut widths = vec![t0];
-        if t_last != t0 {
-            widths.push(t_last);
-        }
+        let mut widths: Vec<usize> = slabs.iter().map(|&(_, t)| t).collect();
+        widths.sort_unstable();
+        widths.dedup();
         for &w in &widths {
             self.warm_width(w, pos0, pos0 + w - 1);
         }
@@ -1627,11 +1635,8 @@ impl<'a> DsEngine<'a> {
         // the chunk's Engram rows in place of the window's region while the slab parts run
         std::mem::swap(&mut self.s.erows_host, &mut self.chunk.as_mut().unwrap().erows_host);
         self.erows_stride = rows_max;
-        let n_slabs = rows.div_ceil(DS_TMAX);
-        let slab = |si: usize| -> (usize, usize) {
-            let r0 = si * DS_TMAX;
-            (r0, (rows - r0).min(DS_TMAX))
-        };
+        let n_slabs = slabs.len();
+        let slab = |si: usize| -> (usize, usize) { slabs[si] };
         let d = self.driver.as_ref().unwrap().shared.clone();
         let mut t_moe = 0f64;
         let (mut t_enq, mut t_sync, mut t_post) = (0f64, 0f64, 0f64);
@@ -1885,6 +1890,11 @@ impl<'a> DsEngine<'a> {
     /// The last layer whose compressed store and index keys are its own (the KV source of every layer above it).
     fn kv_last(&self) -> usize {
         (0..self.cfg.n_layer).filter(|&l| self.cfg.kv_src[l] == l as i32).max().unwrap_or(self.cfg.n_layer - 1)
+    }
+
+    /// Rows the chunk path can take at once (`QX_DS_CHUNK` at load), 0 without chunk buffers.
+    pub fn chunk_rows(&self) -> usize {
+        self.chunk.as_ref().map_or(0, |c| c.rows)
     }
 
     /// Prompt positions that must still follow a window for it to run KV-only (`forward_segments_opt`): the layers

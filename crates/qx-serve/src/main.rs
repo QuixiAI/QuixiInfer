@@ -66,7 +66,15 @@ fn load(args: &[String]) -> Result<(mpsc::Sender<Job>, &'static qx_tok::Tok, cha
             _ => profile,
         };
         let slots: usize = arg(args, "--slots").map(|s| s.parse()).transpose()?.unwrap_or(2);
-        eprintln!("quixiinfer: loading DeepSeek-V4.1-Flash (context {ctx}, {slots} slots, prompt windows of {window}, tiers ranked by {})", profile.as_deref().unwrap_or("layer order"));
+        // the chunk path for long prompts (worker_ds: prompt-only steps go through forward_chunk): 2048 rows by
+        // default on servers with 32k of context or more (its buffers come off the VRAM expert tier, about 0.9 GB
+        // at 2048); QX_DS_CHUNK overrides (0 or empty: off)
+        if std::env::var_os("QX_DS_CHUNK").is_none() && ctx >= 32768 {
+            // SAFETY: before the engine thread starts (single-threaded here); the engine reads it at load
+            unsafe { std::env::set_var("QX_DS_CHUNK", "2048") };
+        }
+        let chunk = std::env::var("QX_DS_CHUNK").ok().filter(|v| !v.is_empty() && v != "0");
+        eprintln!("quixiinfer: loading DeepSeek-V4.1-Flash (context {ctx}, {slots} slots, prompt windows of {window}{}, tiers ranked by {})", chunk.as_deref().map(|c| format!(", prompt chunks of {c}")).unwrap_or_default(), profile.as_deref().unwrap_or("layer order"));
         let opt = worker_ds::Options { max_ctx: ctx, window, slots, pack: pack.into(), vram_gib: gib("QX_DS_VRAM", "--vram-gib", 21.0)?, ram_gib: gib("QX_DS_RAM", "--ram-gib", 100.0)?, profile: profile.map(Into::into), profile_out: profile_out.map(Into::into) };
         let jobs = worker_ds::start(g, tok, opt)?;
         return Ok((jobs, tok, tpl, ctx));

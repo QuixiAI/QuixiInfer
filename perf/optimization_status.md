@@ -40,56 +40,60 @@ After appending, run `python3 perf/harness/perf_diff.py index perf/optimization_
 
 | date | entry | verdict | line |
 |---|---|---|--:|
-| 2026-11-05 | DeepSeek history before the harness | RECORDED | 95 |
-| 2026-11-05 | Performance scaffolding | LANDED | 114 |
-| 2026-11-05 | First harness baseline | RECORDED | 137 |
-| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 157 |
-| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 170 |
-| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 185 |
-| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 204 |
-| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 227 |
-| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 257 |
-| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 284 |
-| 2026-11-06 | First set B baseline | RECORDED | 316 |
-| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 345 |
-| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 365 |
-| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 387 |
-| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 423 |
-| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 447 |
-| 2026-11-06 | nsys kernel tables of a decode run and a 64-token window run | RECORDED | 470 |
-| 2026-11-06 | Full staged share with a 256-record area at windows of 128: prefill 10.8 ms per token | CANDIDATE | 502 |
-| 2026-11-06 | The 128-chunk bundle on long16k and on the serve case — MIXED, kept as an opt-in | UNLABELED | 529 |
-| 2026-11-06 | The 128-token prompt chunk with the full staged share becomes the default — LANDED (by decision) | UNLABELED | 553 |
-| 2026-11-06 | Adaptive-tier knobs on decode: half-life and eviction margin — REJECTED (defaults confirmed) | UNLABELED | 571 |
-| 2026-11-06 | Adaptive-tier half-life on long16k: the decay was per step, not per token — RECORDED, fix CANDIDATE | UNLABELED | 590 |
-| 2026-11-06 | The fused output projection stalled in the driver's PTX JIT — REVERTED, family 8 blocked | UNLABELED | 611 |
-| 2026-11-06 | 256k context on the committed tree: the servers start; VRAM is not the blocker | RECORDED | 627 |
-| 2026-11-06 | Forced 64k pass: the long-context cost is residency lag after topic shifts | RECORDED | 638 |
-| 2026-11-06 | Set C baseline (the 128-token chunk as default) | RECORDED | 665 |
-| 2026-11-06 | The tier's score decay per token (was per step) | LANDED | 685 |
-| 2026-11-06 | The first forced 256k pass (decay per token): decode at 256k is 56 ms per token, GPU-side growth | RECORDED | 713 |
-| 2026-11-06 | The state cache: save a slot after a pass, resume it later, bit for bit — LANDED (tooling) | UNLABELED | 742 |
-| 2026-11-06 | nsys of a resumed 256k decode step: the indexer scorer is the 256k penalty | RECORDED | 758 |
-| 2026-11-06 | Nsight Compute on `qx_ds_idx_score` at 262,144 — INCONCLUSIVE (tooling) | UNLABELED | 785 |
-| 2026-11-06 | `qx_ds_idx_score2` is bit-identical to `qx_ds_idx_score` — RECORDED (exactness half of family 9) | UNLABELED | 794 |
-| 2026-11-06 | A replay of n_swa tokens does not rebuild the rings exactly — RECORDED, fix CANDIDATE | UNLABELED | 801 |
-| 2026-11-06 | The set D cases resume into a cold tier — RECORDED (case definition) | UNLABELED | 816 |
-| 2026-11-06 | Global OOM from the scratchpad: `/tmp` is tmpfs — RECORDED (tooling) | UNLABELED | 824 |
-| 2026-11-06 | Why Strata reads prompts 1.5-7x faster, from its code — RECORDED (beliefs) | UNLABELED | 834 |
-| 2026-11-06 | The long-prompt layer skip (KV-only windows) — CANDIDATE, checks queued | UNLABELED | 848 |
-| 2026-11-06 | `qx_ds_idx_score2`, the indexer scorer with the queries in shared memory — LANDED (family 9) | UNLABELED | 860 |
-| 2026-11-06 | The long-prompt layer skip: exact, and half the prompt time at 16k — LANDED (family 11) | UNLABELED | 882 |
-| 2026-11-06 | Rings in the parked state, and the mid-stream rewind — checks, first half | UNLABELED | 905 |
-| 2026-11-06 | Stream-ordered per-step uploads (family 10) — FLAT, kept as the default | UNLABELED | 913 |
-| 2026-11-06 | Rings in the parked state, and the far rewind — LANDED (exactness), second half | UNLABELED | 930 |
-| 2026-11-06 | Chunked expert-major prefill, prototype M1 — CANDIDATE: bit-identical, timing pending | UNLABELED | 947 |
-| 2026-11-06 | The chunk prototype at 16k: bit-identical, 7.6-8.4 ms per token, and where its time goes | RECORDED | 964 |
-| 2026-11-06 | Night: the chunk path's next three levers measured at 16k — grouped kernels LANDED (in the chunk path), prefetch NEUTRAL, KV-only chunks LANDED | UNLABELED | 997 |
-| 2026-11-06 | Night, part two: batched expert launches REJECTED, NVMe-first prefetch NEUTRAL; the expert phase is the kernels | RECORDED | 1024 |
-| 2026-11-07 | Set D baseline (score 49.601), and the saved tier ranking is the wrong warm-up for the decode tail | RECORDED | 1049 |
-| 2026-11-07 | Strata on this box, same model files, same token ids — RECORDED (the head-to-head the user asked for) | UNLABELED | 1077 |
-| 2026-11-07 | One launch per dense GEMV group (token groups on blockIdx.z) — exact, NEUTRAL in time: the slab passes are GPU-bound | UNLABELED | 1111 |
-| 2026-11-07 | Exact int8 tensor-core expert kernels (chunk path) — LANDED; the chunk's kernel profile | RECORDED | 1131 |
+| 2026-11-05 | DeepSeek history before the harness | RECORDED | 99 |
+| 2026-11-05 | Performance scaffolding | LANDED | 118 |
+| 2026-11-05 | First harness baseline | RECORDED | 141 |
+| 2026-11-06 | Harness set B: long16k and serve cases, vendored token files | LANDED | 161 |
+| 2026-11-06 | The serve case found a capture race in the server's warm-up (bug fix) | LANDED | 174 |
+| 2026-11-06 | long16k's tail metric was capture-contaminated; decode at 16k is 35-37 ms, not 53 | RECORDED | 189 |
+| 2026-11-06 | The serve case found the server growing to an OOM: glibc arena fragmentation (bug fix) | LANDED | 208 |
+| 2026-11-06 | Narrow-window cost per position: the economics of DSpark-style drafting | RECORDED | 231 |
+| 2026-11-06 | Staged share 6/8 at windows of 2-4 (the decode share applied to all widths under 8) | CANDIDATE | 261 |
+| 2026-11-06 | The serving memory growth was a kernel that could not load: VRAM headroom, warm-up and a seal | LANDED | 288 |
+| 2026-11-06 | First set B baseline | RECORDED | 320 |
+| 2026-11-06 | Staged share 6/8 from width 2: the serve3 A/B | KEPT | 349 |
+| 2026-11-06 | Staging area 192 records with windows of 64 and 128 (family 5) — REJECTED as a default, RECORDED | UNLABELED | 369 |
+| 2026-11-06 | Where a serve3 step goes: pool-bound on residency, not host overhead | RECORDED | 391 |
+| 2026-11-06 | Serving residency knobs: PROMOS=64 and STAGE_SHARE=4 — REJECTED; RAM tier 95 GiB — KEPT (settings) | UNLABELED | 427 |
+| 2026-11-06 | Set B baseline re-taken at the 95 GiB serve tier | RECORDED | 451 |
+| 2026-11-06 | nsys kernel tables of a decode run and a 64-token window run | RECORDED | 474 |
+| 2026-11-06 | Full staged share with a 256-record area at windows of 128: prefill 10.8 ms per token | CANDIDATE | 506 |
+| 2026-11-06 | The 128-chunk bundle on long16k and on the serve case — MIXED, kept as an opt-in | UNLABELED | 533 |
+| 2026-11-06 | The 128-token prompt chunk with the full staged share becomes the default — LANDED (by decision) | UNLABELED | 557 |
+| 2026-11-06 | Adaptive-tier knobs on decode: half-life and eviction margin — REJECTED (defaults confirmed) | UNLABELED | 575 |
+| 2026-11-06 | Adaptive-tier half-life on long16k: the decay was per step, not per token — RECORDED, fix CANDIDATE | UNLABELED | 594 |
+| 2026-11-06 | The fused output projection stalled in the driver's PTX JIT — REVERTED, family 8 blocked | UNLABELED | 615 |
+| 2026-11-06 | 256k context on the committed tree: the servers start; VRAM is not the blocker | RECORDED | 631 |
+| 2026-11-06 | Forced 64k pass: the long-context cost is residency lag after topic shifts | RECORDED | 642 |
+| 2026-11-06 | Set C baseline (the 128-token chunk as default) | RECORDED | 669 |
+| 2026-11-06 | The tier's score decay per token (was per step) | LANDED | 689 |
+| 2026-11-06 | The first forced 256k pass (decay per token): decode at 256k is 56 ms per token, GPU-side growth | RECORDED | 717 |
+| 2026-11-06 | The state cache: save a slot after a pass, resume it later, bit for bit — LANDED (tooling) | UNLABELED | 746 |
+| 2026-11-06 | nsys of a resumed 256k decode step: the indexer scorer is the 256k penalty | RECORDED | 762 |
+| 2026-11-06 | Nsight Compute on `qx_ds_idx_score` at 262,144 — INCONCLUSIVE (tooling) | UNLABELED | 789 |
+| 2026-11-06 | `qx_ds_idx_score2` is bit-identical to `qx_ds_idx_score` — RECORDED (exactness half of family 9) | UNLABELED | 798 |
+| 2026-11-06 | A replay of n_swa tokens does not rebuild the rings exactly — RECORDED, fix CANDIDATE | UNLABELED | 805 |
+| 2026-11-06 | The set D cases resume into a cold tier — RECORDED (case definition) | UNLABELED | 820 |
+| 2026-11-06 | Global OOM from the scratchpad: `/tmp` is tmpfs — RECORDED (tooling) | UNLABELED | 828 |
+| 2026-11-06 | Why Strata reads prompts 1.5-7x faster, from its code — RECORDED (beliefs) | UNLABELED | 838 |
+| 2026-11-06 | The long-prompt layer skip (KV-only windows) — CANDIDATE, checks queued | UNLABELED | 852 |
+| 2026-11-06 | `qx_ds_idx_score2`, the indexer scorer with the queries in shared memory — LANDED (family 9) | UNLABELED | 864 |
+| 2026-11-06 | The long-prompt layer skip: exact, and half the prompt time at 16k — LANDED (family 11) | UNLABELED | 886 |
+| 2026-11-06 | Rings in the parked state, and the mid-stream rewind — checks, first half | UNLABELED | 909 |
+| 2026-11-06 | Stream-ordered per-step uploads (family 10) — FLAT, kept as the default | UNLABELED | 917 |
+| 2026-11-06 | Rings in the parked state, and the far rewind — LANDED (exactness), second half | UNLABELED | 934 |
+| 2026-11-06 | Chunked expert-major prefill, prototype M1 — CANDIDATE: bit-identical, timing pending | UNLABELED | 951 |
+| 2026-11-06 | The chunk prototype at 16k: bit-identical, 7.6-8.4 ms per token, and where its time goes | RECORDED | 968 |
+| 2026-11-06 | Night: the chunk path's next three levers measured at 16k — grouped kernels LANDED (in the chunk path), prefetch NEUTRAL, KV-only chunks LANDED | UNLABELED | 1001 |
+| 2026-11-06 | Night, part two: batched expert launches REJECTED, NVMe-first prefetch NEUTRAL; the expert phase is the kernels | RECORDED | 1028 |
+| 2026-11-07 | Set D baseline (score 49.601), and the saved tier ranking is the wrong warm-up for the decode tail | RECORDED | 1053 |
+| 2026-11-07 | Strata on this box, same model files, same token ids — RECORDED (the head-to-head the user asked for) | UNLABELED | 1081 |
+| 2026-11-07 | One launch per dense GEMV group (token groups on blockIdx.z) — exact, NEUTRAL in time: the slab passes are GPU-bound | UNLABELED | 1115 |
+| 2026-11-07 | Exact int8 tensor-core expert kernels (chunk path) — LANDED; the chunk's kernel profile | RECORDED | 1135 |
+| 2026-11-07 | Chunk size 2048 / 4096 / 8192 on the 16k prompt — 4096 is the card's sweet spot | RECORDED | 1173 |
+| 2026-11-07 | The chunk path in the harness's long-prompt cases and in the server — LANDED: prefill256k 21.5 → 7.6 ms per token | UNLABELED | 1193 |
+| 2026-11-07 | The dense GEMV's token groups inside one block (rows stay in L1) — LANDED pending ds-checks: -10 to -17% per chunk | UNLABELED | 1216 |
+| 2026-11-07 | The server's chunked prompt path: time to first token on a 13.5k-token prompt 191 → 47 s | LANDED | 1238 |
 <!-- qx:index:end -->
 
 ## 2026-11-05: DeepSeek history before the harness — RECORDED
@@ -1165,3 +1169,87 @@ window's keys per token.
 Decision: LANDED (mma default). Next levers in order: chunks of 4096-8192 (the per-selection `gu`/`hq`/`hd`
 become a per-pass scratch so the buffers fit), the tiled dense kernel, attention sharing the SWA keys across a
 slab's tokens.
+
+## 2026-11-07: Chunk size 2048 / 4096 / 8192 on the 16k prompt — 4096 is the card's sweet spot — RECORDED
+
+Status: the mma build (0dad410), route16k, `QX_DS_RAM=80`, one run per arm; every arm's tail byte-identical.
+
+| chunk rows | VRAM tier left (of 20 GiB asked) | 16k prompt, KV-only chunks (ms/token, tok/s) | 16k prompt, full stack | expert phase per row (full) | decode tail after the prompt |
+|--:|--:|--:|--:|--:|--:|
+| 2048 | 16.2 GiB | 4.6 / 219 | 7.2 / 139 | 2.8 ms | 51-55 ms |
+| 4096 | 15.5 | **4.0 / 249** | 6.1 / 164 | 1.9 | 60-66 |
+| 8192 | 13.9 | 4.0 / 249 | 5.3 / 187 | 1.0 | 60-62 |
+
+Reading: the expert phase amortizes with the chunk as designed (each expert decoded and streamed once per chunk);
+the dense slab passes cost the same per row at every size (about 3.5 ms full, 1.4 KV-only: the GPU work, split
+differently between "enqueue" and "sync" as the chunk grows); the chunk buffers come off the VRAM expert tier
+(0.9 / 1.8 / 3.5 GB), which the decode tail after the prompt pays. On a 16k prompt the KV-only part is one or two
+chunks either way, so 4096 and 8192 tie there; 8192 wins only the full-stack tail.
+Decision: 4096 for the harness's long-prompt cases (`prefill256k`, `long16k`: `QX_DS_CHUNK=4096` in their ARGS, a
+case change to note on the next scoreboard row); the server defaults to 2048 for servers at `--ctx` of 32k or
+more (the gentler VRAM cost; shorter servers keep windows) with `QX_DS_CHUNK` overriding. The buffers' VRAM
+(`gu`/`out` per selection are the bulk) is the item to shrink before 8192 makes sense on a 32 GB card.
+
+## 2026-11-07: The chunk path in the harness's long-prompt cases and in the server — LANDED: prefill256k 21.5 → 7.6 ms per token
+
+Status: `prefill256k` and `long16k` run with `QX_DS_CHUNK=4096` (a case change: the chunk path is the engine's
+prompt path now, in ds-check and in the server), the server takes prompt-only steps through `forward_chunk` with
+2048-row chunks by default at `--ctx` 32k or more (`QX_DS_CHUNK` overrides; decoders never wait behind a chunk,
+since a step with any decoder keeps the windows), and warms the chunk kernels before sealing its kernel set (the
+first server run died on exactly that seal). Re-take of the three affected cases, 3 repeats, final tree:
+
+| case | before (set D baseline) | now | spread |
+|---|--:|--:|--:|
+| prefill256k (16k from 245,760; KV-only chunks + the kept tail) | 21.50 | **7.60** (-65%, 132 tok/s) | 2.6% |
+| serve256k3 (short prompts; the 2048-row buffers off the tier) | 108.11 | 109.05 (+0.9%) | 1.7% |
+| long16k: decode tail at 16k (companion) | 38.8 | 41.0 (+5.7%) | 4.4% |
+| long16k-prefill (companion, ms per token of the 16k prompt) | 14.4 | **4.1** | |
+
+Reading: the chunk path's gain lands in the scored case; the cost is the chunk buffers' VRAM (1.8 GB at 4096
+rows, 0.9 at 2048), which the decode after a prompt pays through a smaller expert tier: +5.7% on long16k's tail
+at 4096, +0.9% on serve256k3 at 2048. Set D projected from the medians: (52.5 x 7.6 x 109.05)^(1/3) = 35.2
+against 49.6; the full `--check` run is queued for the row.
+Decision: LANDED. Follow-ups: shrink the buffers (`gu`/`hq`/`hd` per selection become a per-pass scratch; `out`
+could be accumulated per row in selection order), so 4096-8192 chunks cost the tier less; the server's chunk path
+beside decoders (today a decoder present means windows).
+
+## 2026-11-07: The dense GEMV's token groups inside one block (rows stay in L1) — LANDED pending ds-checks: -10 to -17% per chunk
+
+Status: `qx_mgemv_t8` runs its token groups of 8 one after the other in the same block (the count in the high
+bits of the token word), instead of a group per `blockIdx.z`: the same per-group code, so the same bits, and a
+block's rows stay in L1 across the 16 groups of a 128-row slab (one HBM read of the weights per slab instead of
+16). 16k prompt, chunks of 4096, one run each, tails byte-identical:
+
+| | groups on blockIdx.z | groups in the block | |
+|---|--:|--:|--:|
+| KV-only chunk (ms per row) | 2.48 | **2.24** | -10% |
+| full-stack chunk (ms per row) | 5.56 | **4.53** | -17% (dense passes 11.0 + 3.5 s → 8.7 + 2.7 s) |
+| 16k prompt, full stack (ms per token, tok/s) | 6.1 / 164 | **5.2 / 194** | |
+| 16k prompt, KV-only chunks | 4.0 / 249 | 4.0 / 249 (the 544 s first-use JIT of the new source polluted this run's mean; the chunks say 2.24 against 2.48) | |
+
+Operational note: a changed `mgemv.cu` costs about nine minutes of driver PTX JIT at the first launch on a box
+(the source compiles pathologically slowly; ptxas offline takes ten minutes too); the cache (`~/.nv/ComputeCache`)
+then holds it. The same hit lands on a server's first start after a build and would land on a user's first run:
+shipping cubins for sm_120 instead of JIT-ing PTX is the fix (build.rs already runs nvcc).
+Decision: LANDED once ds-checks on this build pass (queued); the window path takes the same code for widths that
+are multiples of 8. The dense slab passes remain the largest item (about 2.8 ms per row full stack); the next step
+there is the per-token kernels' share (attention 16%) and the GEMV's achieved bandwidth within L1.
+
+## 2026-11-07: The server's chunked prompt path: time to first token on a 13.5k-token prompt 191 → 47 s — LANDED
+
+Status: `quixiinfer serve --ctx 32768 --slots 2`, `QX_DS_RAM=95`, a 13,527-token prompt (46 KB of this repo's
+docs), `max_tokens 1`, one request each on a fresh server (cold tier both times).
+
+| prompt path | time to the first token | ms per prompt token |
+|---|--:|--:|
+| windows of 128 with the layer skip (the server before) | 191.0 s | 14.1 |
+| chunks of 2048 (prompt-only steps; the layer skip inside) | **47.0 s** | **3.5** |
+
+Same first token. Two seal fatals on the way, both from kernels the server had not warmed before sealing its
+kernel set: the chunk path's kernels (now warmed in the server's warm-up) and `qx_mgemv_t7` from an 87-row
+remainder slab (the chunk's remainder is now cut into the warmed widths: 64 + 16 + 6 + 1, never 5 or 7, as the
+window scheduler and the replay do). Two more false starts were environmental: a lingering server holding 20 GB
+of VRAM after its engine thread died, and a race with a queued ds-checks run.
+Decision: LANDED (default 2048-row chunks on servers with 32k of context or more; `QX_DS_CHUNK` overrides). Open:
+a decoder present keeps the windows (its tokens would wait seconds behind a chunk); a long prompt arriving while
+others decode still gets the window path.

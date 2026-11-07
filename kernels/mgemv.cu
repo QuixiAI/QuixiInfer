@@ -142,18 +142,10 @@ template <int XM, int NT> QX_DEV void partial(u32 ty, const u8* row, const XIn<X
 /// [5] tokens (1 to 8): token n reads x + n * stride (and x2 + n * stride) and writes y + (n0 + n) * rows, [6] n0
 /// (a later chunk of a window's tokens), [7] the int8 inputs (`qx_mgemv_q8x`: token n at + n * cols) or 0,
 /// [8] their scales (token n at + n * cols / 32), [9] cols of the int8 rows.
+/// The high 32 bits of [5] (0 means 1): groups of NT tokens the same block runs one after the other (token
+/// z * NT + n). Each group runs the one-group code, so the bits are those of a launch per group, and the block's
+/// rows stay in L1 across the groups: a 128-token slab reads its weights from HBM once instead of 16 times.
 template <int XM, int NT> QX_DEV void mgemv(const u64* info) {
-    // blockIdx.z: a further group of NT tokens of the same launch (token z * NT + n), the same code per token as
-    // a launch of its own, so the bits are those of the one-group launches
-    const u64 z0 = (u64)blockIdx.z * NT;
-    XIn<XM> x[NT];
-#pragma unroll
-    for (int n = 0; n < NT; ++n) {
-        x[n].x = reinterpret_cast<const float*>(info[0]) + (z0 + n) * info[3];
-        x[n].arg = XM == 2 ? info[4] + 4ull * (z0 + n) * info[3] : info[4];
-        x[n].xq = info[7] ? reinterpret_cast<const i8*>(info[7]) + (z0 + n) * info[9] : nullptr;
-        x[n].xd = info[7] ? reinterpret_cast<const float*>(info[8]) + (z0 + n) * (info[9] / 32) : nullptr;
-    }
     const u64* segs = reinterpret_cast<const u64*>(info[1]);
     const u32 nseg = (u32)info[2];
     u32 s = 0;
@@ -164,39 +156,52 @@ template <int XM, int NT> QX_DEV void mgemv(const u64* info) {
     const u32 blk = blockIdx.x - (u32)d[6];
     const u32 warp = threadIdx.x / 32, wl = threadIdx.x % 32;
     float* y = reinterpret_cast<float*>(d[1]);
-    float a[NT];
-    if (lanes == 0) {
-        // split-K: one row per block
-        __shared__ float part[8][NT];
-        const u32 r = blk;
-        partial<XM, NT>(ty, reinterpret_cast<const u8*>(d[0]) + (u64)r * stride, x, cols, wl, 32, warp, 8, a);
+    const u32 nz = (u32)(info[5] >> 32) ? (u32)(info[5] >> 32) : 1;
+    __shared__ float part[8][NT];
+    for (u32 z = 0; z < nz; ++z) {
+        const u64 z0 = (u64)z * NT;
+        XIn<XM> x[NT];
 #pragma unroll
         for (int n = 0; n < NT; ++n) {
-            const float v = warp_sum(a[n]);
-            if (wl == 0) part[warp][n] = v;
+            x[n].x = reinterpret_cast<const float*>(info[0]) + (z0 + n) * info[3];
+            x[n].arg = XM == 2 ? info[4] + 4ull * (z0 + n) * info[3] : info[4];
+            x[n].xq = info[7] ? reinterpret_cast<const i8*>(info[7]) + (z0 + n) * info[9] : nullptr;
+            x[n].xd = info[7] ? reinterpret_cast<const float*>(info[8]) + (z0 + n) * (info[9] / 32) : nullptr;
         }
-        __syncthreads();
-        if (threadIdx.x < NT) {
-            const u32 n = threadIdx.x;
-            float t = 0.f;
-            for (int i = 0; i < 8; ++i) t += part[i][n];
-            y[(info[6] + z0 + n) * rows + r] = t;
+        float a[NT];
+        if (lanes == 0) {
+            // split-K: one row per block
+            const u32 r = blk;
+            partial<XM, NT>(ty, reinterpret_cast<const u8*>(d[0]) + (u64)r * stride, x, cols, wl, 32, warp, 8, a);
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                const float v = warp_sum(a[n]);
+                if (wl == 0) part[warp][n] = v;
+            }
+            __syncthreads();
+            if (threadIdx.x < NT) {
+                const u32 n = threadIdx.x;
+                float t = 0.f;
+                for (int i = 0; i < 8; ++i) t += part[i][n];
+                y[(info[6] + z0 + n) * rows + r] = t;
+            }
+            __syncthreads();
+            continue;
         }
-        return;
-    }
-    const u32 rpw = 32 / lanes;  // rows per warp
-    const u32 r = (blk * 8 + warp) * rpw + wl / lanes;
-    const u32 lane = wl % lanes;
-    if (r < rows) partial<XM, NT>(ty, reinterpret_cast<const u8*>(d[0]) + (u64)r * stride, x, cols, lane, lanes, 0, 1, a);
-    else
+        const u32 rpw = 32 / lanes;  // rows per warp
+        const u32 r = (blk * 8 + warp) * rpw + wl / lanes;
+        const u32 lane = wl % lanes;
+        if (r < rows) partial<XM, NT>(ty, reinterpret_cast<const u8*>(d[0]) + (u64)r * stride, x, cols, lane, lanes, 0, 1, a);
+        else
 #pragma unroll
-        for (int n = 0; n < NT; ++n) a[n] = 0.f;
+            for (int n = 0; n < NT; ++n) a[n] = 0.f;
 #pragma unroll
-    for (int n = 0; n < NT; ++n) {
-        // reduce within each group of `lanes` lanes
-        float v = a[n];
-        for (u32 o = lanes / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-        if (r < rows && lane == 0) y[(info[6] + z0 + n) * rows + r] = v;
+        for (int n = 0; n < NT; ++n) {
+            // reduce within each group of `lanes` lanes
+            float v = a[n];
+            for (u32 o = lanes / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (r < rows && lane == 0) y[(info[6] + z0 + n) * rows + r] = v;
+        }
     }
 }
 

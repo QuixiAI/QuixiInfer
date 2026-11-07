@@ -7,6 +7,52 @@ UD-IQ2_XXS in QuixiInfer on this box, as fast as possible. The results must stay
 The box has an RTX 5090 (32 GB), a Ryzen 9950X (16 cores), 120 GiB of RAM and a 4 TB NVMe root. The experts live in
 three tiers: VRAM, pinned RAM and the NVMe pack.
 
+## Update 2026-11-07, 05:00: the chunk path landed in the server; the in-block GEMV; where it stands
+
+- **Server:** prompt-only steps go through `forward_chunk` (2048-row chunks by default at `--ctx` >= 32k,
+  `QX_DS_CHUNK` overrides, `0`/empty off). Time to first token on a 13.5k-token prompt: 191 s → **47 s**. Two
+  rules learned: everything the chunk path can launch must be warmed before `seal()` (`eng.chunk_warm()` in the
+  warm-up), and the chunk's remainder slab is cut into the warmed widths (never 5 or 7).
+- **Harness:** `prefill256k` and `long16k` run `QX_DS_CHUNK=4096`: prefill256k 21.5 → **7.6 ms per token**;
+  serve256k3 within spread; long16k's decode tail +5.7% (the 4096-row buffers off the VRAM tier). The set D run on
+  the final tree (`~/qx-bins/chunk11`, label `setd-chunk`) is queued; promote it and record the row with the note
+  (case change: chunks; projected score about 35 against 49.6).
+- **Kernels since 0dad410:** the dense GEMV's token groups run inside one block (`info[5]` high bits; rows stay
+  in L1; -10/-17% per chunk; a changed `mgemv.cu` costs ~9 minutes of driver JIT at first use on a box), the
+  exact int8 tensor-core expert kernels (default), the remainder slabs. All bit-identical, ds-checks exact.
+- **Measured truths for the chunk path (4096 rows, per row):** dense slab passes ~2.6 ms full / ~1.2 KV-only
+  (GPU-bound: `qx_mgemv_t8` ~40% of GPU time, attention ~16%), experts ~1.7 full / ~0.85 KV-only
+  (dequantization-bound; amortizes with the chunk), the chunk buffers 1.8 GB of VRAM. 16k prompt: 194 tok/s full
+  stack, 249 KV-only; Strata 935 on the same box (chunk 8192, FP16 tiles, not bit-exact).
+- **Next levers:** (1) the chunk buffers' VRAM (`gu`/`hq`/`hd` per pass; `out` per row) so 8192 fits; (2) the
+  dense passes: attention sharing the window's keys per slab, the GEMV's L1-resident throughput; (3) the decode-tail
+  tier ranking (decode256k 52.5 against 46.1 with the golden profile); (4) the chunk path beside decoders; (5) ship
+  sm_120 cubins to kill the first-use JIT.
+- Tooling notes: `QX_DS_BENCH=256` on a short file faults (unused); a server whose engine thread dies may linger
+  holding its VRAM (kill -9 it; `gpu_free` in the chains checks memory, not processes).
+
+## Update 2026-11-07, 03:00: the user said "make your own call"; the chunk path is the prompt path now
+
+- Decision taken (and measured): stay exact. The expert kernels went to **int8 tensor cores while staying
+  bit-identical** (`qx_moe_*_mma_*`: exact 32-wide integer dots, per-sub-block multipliers in int32, the float
+  chain in block order; two masked mmas for the formats that scale per 16 elements). A tensor-core prefill that
+  leaves the contract was not needed for the expert side; the dense side (`qx_mgemv_t8`, 40% of the chunk's GPU
+  time) still wants a tiled exact kernel (weights decoded once per tile for all 128 tokens); 16/32-token
+  instances of the current kernel do not compile in reasonable time (ptxas).
+- Landed in order (all exact, all in the notebook): one-launch dense GEMV token groups (`blockIdx.z`; neutral in
+  time, the slab passes are GPU-bound), the mma expert kernels, chunk size 4096 for the harness's long-prompt cases
+  and 2048 by default in the server at >= 32k context, the server's chunked prompt path (prompt-only steps),
+  the chunk kernels warmed before the server seals its kernel set. `prefill256k` 21.5 → **7.6 ms per token**;
+  long16k's prompt 14.4 → 4.1; costs: the chunk buffers' VRAM (decode after a prompt +0.9% at 2048, +5.7% at 4096).
+- In flight: the server TTFT test on a 13.5k-token prompt (windows: 191 s; the chunk arm reruns with the fixed
+  binary), then a full set D `--check` run for the scoreboard row (expected about 35 against 49.6).
+- Next levers, in order: (1) the per-selection chunk buffers (`gu`, `hq`, `hd`, `out`) as per-pass scratch so
+  8192-row chunks fit without starving the tier; (2) a tiled exact dense GEMV for the slab passes; (3) attention
+  sharing the window's keys across a slab's tokens (16% of the chunk's GPU time); (4) the decode-tail tier ranking
+  (decode256k 52.5 against 46.1 with the golden profile); (5) the server's chunk path beside decoders.
+- Strata head-to-head numbers stand (notebook 2026-11-07): their 16k prefill 935 tok/s at chunk 8192 against
+  our 249 now (exact; 217 before tonight); decode even.
+
 ## Update 2026-11-07, 01:00: Strata measured here; stopped for a contract decision
 
 - Strata ran on this box on our ids (notebook 2026-11-07 "Strata on this box"): decode 27.5 tok/s (ours 29.2

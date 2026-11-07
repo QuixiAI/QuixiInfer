@@ -274,6 +274,11 @@ invented one. The aggregate score lives in `scoreboard.md`.
   2048-row chunk: host enqueue of the slab passes 5.8 s (~80 us per launch), expert kernels 6.5 s (warp
   reductions), dense GPU remainder 0.8 s. Next: a looped multi-token GEMV launch and per-slab graphs; a
   lane-per-row expert kernel. Not yet in the server (ds-check `QX_DS_CHUNK=N` only).
+- **2026-11-07, morning:** exact int8 tensor-core expert kernels landed (expert phase 3.75 → 2.86 s per 2048 KV-only
+  rows); z-group GEMV launches landed (exact, neutral: the slab passes are GPU-bound, `qx_mgemv_t8` 40% of GPU
+  time, attention 16%); chunk 4096 in the harness cases (prefill256k 21.5 → 7.6), 2048 in the server (prompt-only
+  steps). Remaining per row at 4096 KV-only: dense 1.4 ms, experts 0.86. Next: per-pass `gu`/`hq`/`hd`/`out`
+  scratch (VRAM), a tiled exact dense GEMV, attention key sharing per slab, the chunk path beside decoders.
 
 ### 13. DSpark: see family 6 (re-opened 2026-11-06); measurement first, then the verify path.
 
