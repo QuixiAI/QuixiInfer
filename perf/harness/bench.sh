@@ -31,6 +31,9 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 ORIG_ARGS=("$@")
 
+# The driver JIT cache: the default 1 GiB cap evicts this engine's modules (ten PTX variants of mgemv/moe at ~100 MB each),
+# and a swapped binary then pays 10-20 minutes of ptxas before its first step (2026-11-07). 4 GiB is the maximum.
+export CUDA_CACHE_MAXSIZE=${CUDA_CACHE_MAXSIZE:-4294967296}
 LABEL=run
 REPEATS=3
 CASES=decode256k,prefill256k,serve256k,decode,prefill128,serve
