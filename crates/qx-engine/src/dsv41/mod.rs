@@ -2182,8 +2182,11 @@ impl<'a> DsEngine<'a> {
         // the attention in slices of ATTN_SLICE tokens (the partials buffer is sized for one slice); the
         // kernels index tokens from the pointers they get, so each slice passes offset pointers
         let hd = c.head_dim;
-        for s0 in (0..t).step_by(ATTN_SLICE) {
-            let ts = (t - s0).min(ATTN_SLICE);
+        // the slab kernel holds the partials buffer only as scratch (12 scores per (token, head, chunk)), so a call
+        // covers the whole window: 4x the blocks of a 32-token slice (256 -> 1,024 per call at 128 tokens)
+        let slice = if attn_tile() && self.attn_chunks <= 64 { t.max(1) } else { ATTN_SLICE };
+        for s0 in (0..t).step_by(slice) {
+            let ts = (t - s0).min(slice);
             let (q, o, ps, sl) = (self.s.q.ptr + (s0 * c.n_head * hd * 4) as u64, self.s.attn.ptr + (s0 * c.n_head * hd * 4) as u64, self.s.pos.ptr + (s0 * 4) as u64, self.s.slot.ptr + (s0 * 4) as u64);
             let (sps, cps) = if sp != 0 { (sp + (s0 * c.idx_top_k * 4) as u64, cp + (s0 * 4) as u64) } else { (0, 0) };
             if std::env::var("QX_DS_ATTN").is_ok_and(|v| v == "old") {
