@@ -7,6 +7,22 @@ UD-IQ2_XXS in QuixiInfer on this box, as fast as possible. The results must stay
 The box has an RTX 5090 (32 GB), a Ryzen 9950X (16 cores), 120 GiB of RAM and a 4 TB NVMe root. The experts live in
 three tiers: VRAM, pinned RAM and the NVMe pack.
 
+## Update 2026-11-07, 01:00: Strata measured here; stopped for a contract decision
+
+- Strata ran on this box on our ids (notebook 2026-11-07 "Strata on this box"): decode 27.5 tok/s (ours 29.2
+  warm), DSpark on 26.9 (no gain), prefill 1k 148 (ours 91), prefill 16k 250 / 696 / **935** tok/s at chunk
+  1024 / 4096 / 8192 (ours **217**, exact). Set D baseline promoted (49.601). The chunk path is committed
+  (04b3fda) with the records (93e2efe + this).
+- **Open decision for the user:** keep prefill bit-identical to single steps (then the 4x gap closes slowly:
+  f32 GEMM-class dense path, a much cheaper f32 expert kernel, graphs/fewer launches) or allow a tensor-core
+  prefill path like Strata's (bf16/int8 tiles; `qx_tmv` exists; prompt exactness would become a KLD tolerance
+  against the reference; decode stays exact). Both paths start with the same two items: the slab passes' launch
+  count and the expert kernel's efficiency.
+- Smaller items found tonight: the saved tier ranking is a worse decode-tail placement than the golden profile
+  (decode256k 52.5 against 46.1; a decode-tail ranking or profile is a free ~12%); `QX_DS_BENCH=256` on a short
+  file faults (status 700) — unused by the harness, check before use; the chunk path is ds-check only (the server
+  still prefills in windows with the skip).
+
 ## Update 2026-11-06, night: the chunk path at 217 tok/s on 16k, Strata built for a head-to-head
 
 - **Chunk path (family 12), measured at 16k, every arm bit-identical:** windows 17.9 → chunks of 2048 with the

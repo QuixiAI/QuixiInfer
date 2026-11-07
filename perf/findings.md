@@ -49,6 +49,13 @@ were 20-21 GiB VRAM and 88-100 GiB RAM. The settings before 2026-11-04 differ fr
   instead of re-reading 32 cache lines per key row: decode256k 56.6 → 43.6 ms per token (-23%), prefill256k
   34.5 → 23.2 (-33%), bit-identical. The position cost of 256k was one kernel's memory pattern, not the top-k.
 
+## Strata on this box (2026-11-07, same files and ids; details in the notebook)
+
+Decode even (27.5 against our 29.2 warm / 23.8 cold-ish); DSpark gains nothing here (26.9); prefill 1k 148 against
+our 91; prefill 16k 250 / 696 / 935 tok/s at their chunk 1024 / 4096 / 8192 against our 217 (exact chunks + skip).
+Their prefill is FP16 tensor-core and not bit-identical to their decode; ours is bit-identical. The 4x at long
+prompts is structural (chunk size, tensor cores, launch count), not tuning.
+
 ## Correctness rules learned the hard way
 
 - **Never upload with `DeviceBuf::upload` into memory a queued kernel reads.** It runs on the legacy stream,
