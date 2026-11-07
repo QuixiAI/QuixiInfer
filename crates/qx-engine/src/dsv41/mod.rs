@@ -2152,6 +2152,10 @@ impl<'a> DsEngine<'a> {
                 // QX_DS_IDX_KERNEL=1 keeps the original scorer; 2 (default) the shared-memory one, bit-identical
                 static IDX_KERNEL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
                 let idx_entry = *IDX_KERNEL.get_or_init(|| if std::env::var("QX_DS_IDX_KERNEL").is_ok_and(|v| v == "1") { "qx_ds_idx_score" } else { "qx_ds_idx_score2" });
+                // QX_DS_TOPK_KERNEL=1 keeps the original one-block top-k; 2 (default) the tiled one, the same k indices in
+                // the same order (ds-checks, the 16k tails, the 256k decode's tokens)
+                static TOPK_KERNEL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+                let topk_entry = *TOPK_KERNEL.get_or_init(|| if std::env::var("QX_DS_TOPK_KERNEL").is_ok_and(|v| v == "1") { "qx_ds_topk" } else { "qx_ds_topk2" });
                 self.k(idx_entry, 256, ((self.max_rows as u32).div_ceil(8), tt, 1), &[self.s.iq.ptr, self.s.iw.ptr, store_table, self.s.pos.ptr, self.s.slot.ptr, ratio as u64, c.idx_dim as u64, row as u64, c.head_dim as u64, self.s.scores.ptr, max_rows, bits(1.0 / ((c.idx_heads * c.idx_dim) as f32).sqrt())]);
                 self.dump(format!("idx_score-{l}"), &self.s.scores, n_visible, act);
                 let (sb, cb) = self.st.sels[l].as_ref().unwrap();
@@ -2163,13 +2167,13 @@ impl<'a> DsEngine<'a> {
                     self.k("qx_ds_block_max", 256, ((max_blocks as u32).div_ceil(256), tt, 1), &[self.s.scores.ptr, self.s.bmax.ptr, self.s.pos.ptr, ratio as u64, bs as u64, max_rows, max_blocks]);
                     self.dump(format!("cand_block_score-{l}"), &self.s.bmax, n_blk, act);
                     // top blocks: the scores are the block maxima, "rows" are blocks: positions / (ratio * bs)
-                    self.k("qx_ds_topk", 1024, (tt, 1, 1), &[self.s.bmax.ptr, c.cand_blocks as u64, self.s.cand_sel.ptr, self.s.cand_count.ptr, self.s.pos.ptr, (ratio * bs) as u64, max_blocks]);
+                    self.k(topk_entry, 1024, (tt, 1, 1), &[self.s.bmax.ptr, c.cand_blocks as u64, self.s.cand_sel.ptr, self.s.cand_count.ptr, self.s.pos.ptr, (ratio * bs) as u64, max_blocks]);
                 } else if c.cand_src >= 0 && (c.cand_src as usize) < l {
                     self.k("qx_ds_zero_u32", 256, (((words * t as u64) as u32).div_ceil(256), 1, 1), &[self.s.inside.ptr, words * t as u64]);
                     self.k("qx_ds_mark_blocks", 256, ((c.cand_blocks as u32).div_ceil(256), tt, 1), &[self.s.cand_sel.ptr, self.s.cand_count.ptr, self.s.inside.ptr, c.cand_blocks as u64, words]);
                     self.k("qx_ds_cand_mask", 256, ((self.max_rows as u32).div_ceil(256), tt, 1), &[self.s.scores.ptr, self.s.inside.ptr, self.s.pos.ptr, ratio as u64, bs as u64, max_rows, words]);
                 }
-                self.k("qx_ds_topk", 1024, (tt, 1, 1), &[self.s.scores.ptr, c.idx_top_k as u64, sb.ptr, cb.ptr, self.s.pos.ptr, ratio as u64, max_rows]);
+                self.k(topk_entry, 1024, (tt, 1, 1), &[self.s.scores.ptr, c.idx_top_k as u64, sb.ptr, cb.ptr, self.s.pos.ptr, ratio as u64, max_rows]);
             }
             let (sb, cb) = self.st.sels[tsrc].as_ref().expect("top-k source");
             sel = Some((sb.ptr, cb.ptr, store_table));

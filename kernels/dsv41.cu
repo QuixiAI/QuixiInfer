@@ -578,6 +578,123 @@ extern "C" __global__ void qx_ds_topk(const u64* info) {
     if (tid == 0) reinterpret_cast<u32*>(info[3])[t] = k;
 }
 
+/// `qx_ds_topk` with the same result (the same k indices in the same order: every key above the k-th in ascending
+/// index order, then the first `need` keys equal to it in ascending index order) and less of the one block's time
+/// (2026-11-07: 284 us per call at 262k rows, 2.5 ms of a 46 ms decode step). Two changes: the histograms are
+/// per warp (32 x 256 bins, reduced once per pass) so the dense first pass does not serialize 1,024 threads on
+/// 256 shared counters; and the selection pass walks tiles of 1,024 x 8 rows, each thread 8 consecutive rows (one
+/// 32-byte sector), with one block scan of the per-thread above/equal counts per tile: two barriers per 8,192
+/// rows instead of two per 1,024. Within a tile the thread order is the index order, and tiles follow each other,
+/// so the writes land exactly where the original kernel's per-row prefix counts put them. Same info words.
+extern "C" __global__ void __launch_bounds__(1024) qx_ds_topk2(const u64* info) {
+    __shared__ u32 whist[32][257];  // per-warp histograms (padded against bank conflicts)
+    __shared__ u32 hist[256];
+    __shared__ u32 s_prefix, s_need;
+    __shared__ u32 wsum_a[32], wsum_e[32];
+    const u32 k = U(1), tid = threadIdx.x, nt = blockDim.x, t = blockIdx.x;
+    const u32 pos = reinterpret_cast<const u32*>(info[4])[t];
+    const u32 n = min((pos + 1) / U(5), U(6));
+    const float* x = CF(0) + (u64)t * info[6];
+    i32* sel = reinterpret_cast<i32*>(info[2]) + (u64)t * k;
+    if (n <= k) {
+        for (u32 i = tid; i < n; i += nt) sel[i] = (i32)i;
+        if (tid == 0) reinterpret_cast<u32*>(info[3])[t] = n;
+        return;
+    }
+    const u32 lane = tid % 32, warp = tid / 32, nwarps = nt / 32;
+    auto key_of = [](float v) { const u32 u = __float_as_uint(v); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); };
+    u32 prefix = 0, need = k;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (u32 i = lane; i < 256; i += 32) whist[warp][i] = 0;
+        __syncthreads();
+        const u32 hmask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        // 8 consecutive rows per thread per tile: the same sectors the selection pass reads
+        for (u32 base = 0; base < n; base += nt * 8) {
+            const u32 i0 = base + tid * 8;
+            if (i0 < n) {
+                if (i0 + 8 <= n && ((u64)(x + i0) & 15) == 0) {
+                    const float4 a = *reinterpret_cast<const float4*>(x + i0), b = *reinterpret_cast<const float4*>(x + i0 + 4);
+                    const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const u32 kk = key_of(v[j]);
+                        if ((kk & hmask) == prefix) atomicAdd(&whist[warp][(kk >> shift) & 0xff], 1u);
+                    }
+                } else {
+                    for (u32 i = i0; i < min(i0 + 8, n); ++i) {
+                        const u32 kk = key_of(x[i]);
+                        if ((kk & hmask) == prefix) atomicAdd(&whist[warp][(kk >> shift) & 0xff], 1u);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        for (u32 b = tid; b < 256; b += nt) {
+            u32 c = 0;
+            for (u32 w = 0; w < nwarps; ++w) c += whist[w][b];
+            hist[b] = c;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            u32 acc = 0, b = 255;
+            for (;; --b) {
+                if (acc + hist[b] >= need) break;
+                acc += hist[b];
+                if (b == 0) break;
+            }
+            s_prefix = prefix | (b << shift);
+            s_need = need - acc;
+        }
+        __syncthreads();
+        prefix = s_prefix;
+        need = s_need;
+    }
+    // selection: tiles of nt x 8 rows; per thread the counts of its 8 rows, a block exclusive scan, then the writes
+    u32 cnt_a = 0, cnt_e = 0;  // running totals over the tiles so far (uniform over the block)
+    for (u32 base = 0; base < n; base += nt * 8) {
+        const u32 i0 = base + tid * 8;
+        const u32 i1 = min(i0 + 8, n);
+        u32 a = 0, e = 0;
+        if (i0 < n) {
+            for (u32 i = i0; i < i1; ++i) {
+                const u32 kk = key_of(x[i]);
+                a += kk > prefix;
+                e += kk == prefix;
+            }
+        }
+        // exclusive scan of a and e over the block: warp scans, then the warp totals
+        u32 pa = a, pe = e;
+#pragma unroll
+        for (u32 o = 1; o < 32; o <<= 1) {
+            const u32 ya = __shfl_up_sync(0xffffffffu, pa, o), ye = __shfl_up_sync(0xffffffffu, pe, o);
+            if (lane >= o) { pa += ya; pe += ye; }
+        }
+        if (lane == 31) { wsum_a[warp] = pa; wsum_e[warp] = pe; }
+        __syncthreads();
+        u32 wa = 0, we = 0;
+        for (u32 w = 0; w < warp; ++w) { wa += wsum_a[w]; we += wsum_e[w]; }
+        pa += wa - a;  // exclusive
+        pe += we - e;
+        u32 oa = cnt_a + pa, oe = cnt_e + pe;
+        if (i0 < n) {
+            for (u32 i = i0; i < i1; ++i) {
+                const u32 kk = key_of(x[i]);
+                if (kk > prefix) sel[oa++] = (i32)i;
+                else if (kk == prefix) {
+                    if (oe < need) sel[k - need + oe] = (i32)i;
+                    ++oe;
+                }
+            }
+        }
+        u32 ta = 0, te = 0;
+        for (u32 w = 0; w < nwarps; ++w) { ta += wsum_a[w]; te += wsum_e[w]; }
+        cnt_a += ta;
+        cnt_e += te;
+        __syncthreads();  // wsum is rewritten by the next tile
+    }
+    if (tid == 0) reinterpret_cast<u32*>(info[3])[t] = k;
+}
+
 // ---- attention over [window | selected compressed latents], K = V, per-head sinks ---------------------------
 
 /// One block per (head, token). Keys: the window cells max(0, pos + 1 - n_swa) .. pos from the slot's latent
