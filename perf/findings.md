@@ -68,6 +68,12 @@ our 91; prefill 16k 250 / 696 / 935 tok/s at their chunk 1024 / 4096 / 8192 agai
 Their prefill is FP16 tensor-core and not bit-identical to their decode; ours is bit-identical. The 4x at long
 prompts is structural (chunk size, tensor cores, launch count), not tuning.
 
+## Prefill exactness, priced (2026-11-07, notebook "What a non-exact (FP16 tile) prefill costs")
+
+- Teacher-forced on the same ids: Strata's FP16-tile prefix changes nothing against its own no-tile path (16k text, last 4,095 positions: KL 0.026-0.029 against our exact path in all three arms, perplexity 2.53-2.54 against our 2.49). Its distance from us is engine-wide numerics (FP16 K/V, activations), not the prefill.
+- Against the f32 reference on 1k: ours (int8 GEMV inputs and expert kernels) KL 0.011-0.020, top-1 96%, perplexity +0.1%; Strata 0.025-0.046, top-1 93-94%, perplexity within ±2%. The ds-checks' 0.13 is 59 positions of one prompt.
+- So a bf16-tile dense path for prompts would cost at most ~0.03 KL against the exact path, likely under 0.01 with f32 accumulation and the exact K/V and expert paths; what it spends is the bit-identity contract (windows/chunks identity checks, prefix reuse equal to single steps), which would become KL-bounded checks.
+
 ## Correctness rules learned the hard way
 
 - **Never upload with `DeviceBuf::upload` into memory a queued kernel reads.** It runs on the legacy stream,
