@@ -20,6 +20,27 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
 - Landed since noon: `qx_ds_topk2` (decode256k 45.4 -> 43.5-44.2, 8fae0e7), the server's 4096 chunk default
   (42c23e7), README on today's facts (53a86c8). Set D row 31.470 (d6cfb45).
 
+## Update 2026-11-07, night: the chunk path is launch-bound, not kernel-bound
+
+- Every exact kernel form of the evening was bit-identical and read +5% in the engine's chunk timing while the
+  standalone bench (`kernels/bench/mgemv_bench.cu`, `~/qx-bins/mgemv_bench`) said 2.3x per launch for the 4-rows
+  GEMV. The chunk log explains it: of an 18.6 s chunk, "slab enqueue" (host) is 8.7 s and "expert enqueue" 6.9 s;
+  the GPU is only 2.7 s ahead at the end of the slab passes. The chunk19 nsys trace: per slab-layer 55 dense
+  launches and **93 host-to-device copies of 28 us** (CubeCL stages each launch's info words; its 4,096-entry
+  cache of identical words, `cubecl-cuda/src/compute/stream.rs`, misses because the slab views change the
+  pointers every slab, and every expert launch's words differ by expert). 2.6 of 11.5 GPU-ms per slab-layer and
+  ~120 us of host time per launch. A faster kernel cannot shorten the chunk until the launch path does.
+- Levers, by expected value: (1) identical info words across slabs (fixed per-slab staging buffers with a
+  copy in/out, so a layer's 55 launches hit the cache from the second slab on; 2,200 distinct sets fit the 4,096
+  cache); (2) the same for the expert jobs (per-layer fixed slot words); (3) fewer launches per slab-layer
+  (fuse rms/rope/hc, the 8 output-A groups into one); (4) a patched cubecl-cuda with a larger metadata cache;
+  (5) a raw driver-API launcher for the chunk path (kernel params by value, no staging). A host-side perf
+  profile (chain-perf, `perf-chunk.txt`) is queued to see where the 120 us go.
+- Kernel forms behind knobs, all exact, all measured in the bench and the engine: `QX_MGEMV_ZT=1` (4 rows per
+  block on Q8 segments, 2 rows with decode-once on the f32 ones; bench 2.3x / 1.36x per launch), `QX_DS_ATTN=tile`
+  (slab attention, merge in-block, 5% slower at a 32-token slice; the whole-window slice is in the tree, untested).
+  Once the launch path is fixed, re-measure both; they should then show.
+
 ## Update 2026-11-07, noon: set D promoted at 34.447; the GEMV's register story; the 256k cases re-based
 
 - **Scoreboard:** the chunk-path tree (6d8ce02) is the baseline, score 49.601 → **34.447** (prefill256k 21.5 →
