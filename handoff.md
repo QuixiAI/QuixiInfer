@@ -1,4 +1,4 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-06, evening)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-07, noon)
 
 ## Goal
 
@@ -6,6 +6,41 @@ Run [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepS
 UD-IQ2_XXS in QuixiInfer on this box, as fast as possible. The results must stay exact against the CPU reference.
 The box has an RTX 5090 (32 GB), a Ryzen 9950X (16 cores), 120 GiB of RAM and a 4 TB NVMe root. The experts live in
 three tiers: VRAM, pinned RAM and the NVMe pack.
+
+## Update 2026-11-07, noon: set D promoted at 34.447; the GEMV's register story; the 256k cases re-based
+
+- **Scoreboard:** the chunk-path tree (6d8ce02) is the baseline, score 49.601 → **34.447** (prefill256k 21.5 →
+  6.8 in 4096-row chunks, exact). Promoted; `perf/baselines/` committed. A set D `--check` run on the final tree
+  of the day (`~/qx-bins/chunk17`, label `setd-split4`, started 11:50) is in flight: record it as the next row
+  with the note that the cases changed (below).
+- **The decode-side drift explained and mostly undone:** every decode case was +1 to +4.7% on the promoted tree.
+  Cause: the in-block group loop in the shared `mgemv` template took the width 1-3 entries from 80 to 128
+  registers (ptxas `--resource-usage` across four versions of `mgemv.cu`: notebook). Landed (0ced38e): two kernel
+  bodies verbatim, `mgemv` (04b3fda's one-group code) for the width 1-8 entries, `mgemv_z` (6d8ce02's loop) for
+  three new `_t8z` entries the one-launch path uses (`ZENTRIES` in `ops.rs`). Decode 34.2 → 33.4-33.7 (chunk9
+  was 32.7; the rest is inside the case's 2-4% spread), the chunk's slab passes equal to before (alternating pairs),
+  prefill128 11.1 against 10.9. Three intermediate rewrites of the loop (hoisted segment words, conditional
+  barrier) were 3% slower on the chunk with identical register counts: when a kernel is "the same", measure it
+  anyway, and prefer the measured body verbatim.
+- **Case settings changed (bench.sh, 5869f86):** the 256k resume cases rank the tiers by the golden profile (the
+  server's default), not the ranking qx-ds-check saves beside a state: decode256k 52.1 → **46.5**, prefill256k
+  unchanged (6.80 = 6.80), same binary, 3 repeats each. prefill256k runs **8192-row chunks** (6.80 → 6.20; VRAM
+  budget 13.1 GiB at 256k context); long16k keeps 4096 (8192 was 6% slower there). The server's chunk size at
+  ctx ≥ 32k is still 2048: its own serve256k A/B (time to first token on a long prompt against serve256k3 decode)
+  is the next settings question.
+- **Also today:** the per-pass gate/up and hidden scratch landed (b14363b: bit-identical, time-neutral, 0.4-0.8
+  GiB back to the tiers); a q8-only 16-token GEMV instance was rejected (exact, +4 to +7% per chunk, reverted);
+  `bench.sh` exports `CUDA_CACHE_MAXSIZE=4294967296` because the driver's 1 GiB JIT cache evicted the engine's
+  modules and a binary swap paid 20 minutes of ptxas (memory note `cuda-jit-cache`); the mechanics (CubeCL loads
+  the whole module's PTX per kernel) and the per-entry PTX split idea are in the backlog.
+- **Next levers, in order:** (1) the server's chunk size (2048 → 4096/8192) by serve256k A/B; (2) a decode-side
+  A/B of chunk9 against chunk17 to see whether the last 2% of decode is real and where; (3) the dense slab passes
+  (attention sharing a slab's keys; `qx_mgemv_t8z` at 40% of the chunk's GPU time wants a tiled exact kernel);
+  (4) the chunk path beside decoders in the server; (5) first-use JIT (per-entry PTX or shipped cubins).
+- Operational: every chain script in the scratchpad installs binaries into `target/release` atomically and runs
+  `bench.sh --no-build`; `~/qx-bins/chunk17` is the landed tree (0ced38e). Killing a chain by PID leaves its
+  bench/engine child running: kill the child too. A chain renamed with `sed` kept bare binary numbers in a loop
+  (`for arm in 16 12`), so one pair re-measured the old binary: check a copied chain's arms, not just its paths.
 
 ## Update 2026-11-07, 05:00: the chunk path landed in the server; the in-block GEMV; where it stands
 
