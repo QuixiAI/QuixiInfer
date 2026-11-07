@@ -305,13 +305,27 @@ pub struct ChunkBufs {
     pos: DeviceBuf,
     slot: DeviceBuf,
     sel: DeviceBuf,
-    slots_tbl: DeviceBuf,
+    /// Two slot-word tables (u64 per expert), used by alternate layers: layer l + 1's prefetch job writes its words
+    /// while the GPU may still be waiting on layer l's, and layer l + 2's job is posted only after layer l + 1's
+    /// slab passes synced, which drains layer l.
+    slots_tbl: [DeviceBuf; 2],
     erows_host: qx_gpu::mem::HostMapped,
     /// Per indexer layer: the selected rows and their count per row of the chunk (read by the layers above it,
     /// so they must outlive the slab pass), and the candidate blocks of the candidate source layer likewise.
     sels: Vec<Option<(DeviceBuf, DeviceBuf)>>,
     cand_sel: DeviceBuf,
     cand_count: DeviceBuf,
+    /// The grouped kernels' quantized hidden rows per selection (`qx_moe_quant_h_sel`): ff int8 and ff/256 scales.
+    hq: DeviceBuf,
+    hd: DeviceBuf,
+    /// A slot word that reads as "slot 0, generation 1" (the chunk kernels return at slot 0): the warm-up's target,
+    /// and a batch descriptor pointing at it.
+    warm_word: DeviceBuf,
+    warm_desc: DeviceBuf,
+    /// The batched kernels' per-expert descriptors (word address, selection list address, M, 0), n_expert of them.
+    bdesc: DeviceBuf,
+    /// Whether every chunk kernel variant was compiled and loaded (`chunk_warm`).
+    warmed: bool,
 }
 
 /// The device side of the tiers in the asynchronous mode (the host side lives in the driver thread).
@@ -359,8 +373,9 @@ pub struct DsEngine<'a> {
     /// window reads (DS_TMAX and 0 for windows; the chunk's rows and the slab's first row in chunk mode).
     erows_stride: usize,
     erows_row0: usize,
-    /// The chunk jobs' generation counter (see `ChunkJob::gen`).
+    /// The chunk jobs' generation counter (see `ChunkJob::gen`) and the global expert ordinal (`ChunkJob::ord0`).
     chunk_gen: u64,
+    chunk_ord: u64,
     /// Set while `replay_to` rebuilds the rings: the windows skip the compressed-store and index-key writes (the
     /// stores already hold the exact rows; the replay's early positions are not exact and must not overwrite or
     /// be read back from them) and launch eagerly (no graph has that kernel set).
@@ -718,11 +733,17 @@ impl<'a> DsEngine<'a> {
                 pos: buf(rows),
                 slot: buf(rows),
                 sel: buf(rows * k),
-                slots_tbl: buf(2 * cfg.n_expert),
+                slots_tbl: [buf(2 * cfg.n_expert), buf(2 * cfg.n_expert)],
                 erows_host: qx_gpu::mem::HostMapped::new(cfg.engram_layers.len() * rows * cfg.engram_cols() * cfg.engram_dim * 4),
                 sels: (0..cfg.n_layer).map(|l| (cfg.topk_src[l] == l as i32).then(|| (buf(cfg.idx_top_k * rows), buf(rows)))).collect(),
                 cand_sel: buf(cfg.cand_blocks.max(1) * rows),
                 cand_count: buf(rows),
+                hq: DeviceBuf::new(rows * k * cfg.ff_exp),
+                hd: buf(rows * k * (cfg.ff_exp / 256)),
+                warm_word: DeviceBuf::from_slice(&[1u64 << 48]),
+                warm_desc: DeviceBuf::new(32),
+                bdesc: DeviceBuf::new(rows * k * 32),
+                warmed: false,
             }
         });
         let output = mat("output.weight")?;
@@ -919,6 +940,7 @@ impl<'a> DsEngine<'a> {
             erows_stride: DS_TMAX,
             erows_row0: 0,
             chunk_gen: 0,
+            chunk_ord: 0,
             replaying: false,
             slots,
             pool: if driver.is_some() { None } else { Some(Pool::new(&cpus)) },
@@ -1492,6 +1514,50 @@ impl<'a> DsEngine<'a> {
         self.erows_row0 = r0;
     }
 
+    /// Compiles and loads every kernel the chunk path launches, once, while no expert job is in flight: a module
+    /// load while the GPU spins in a wait kernel and the driver's copies are in flight deadlocks (the window path's
+    /// dry pass exists for the same reason; the chunk path's first use of a format's grouped kernel at layer 10 hung
+    /// a run on 2026-11-06). Every launch sees "slot 0" and returns; the wait sees its generation at once.
+    fn chunk_warm(&mut self) {
+        if self.chunk.as_ref().is_none_or(|cb| cb.warmed) {
+            return;
+        }
+        let d = self.driver.as_ref().unwrap().shared.clone();
+        let cb = self.chunk.as_ref().unwrap();
+        let (k, ff) = (self.cfg.n_expert_used, self.cfg.ff_exp);
+        let word = cb.warm_word.ptr;
+        cb.warm_desc.upload(&[word, cb.sel.ptr, 0u64, 0u64]);
+        let mut seen: Vec<(GgmlType, GgmlType)> = Vec::new();
+        for l in 0..self.cfg.n_layer {
+            let ex = &self.layers[l].experts;
+            if seen.contains(&(ex.gate_ty, ex.down_ty)) {
+                continue;
+            }
+            seen.push((ex.gate_ty, ex.down_ty));
+            let (gsuf, dsuf) = (ops::suffix_of(ex.gate_ty), ops::suffix_of(ex.down_ty));
+            for (name, info) in [
+                (format!("qx_moe_gateup_grp_{gsuf}"), vec![word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 1, cb.sel.ptr]),
+                (format!("qx_moe_down_grp_{dsuf}"), vec![word, cb.hq.ptr, cb.hd.ptr, 0, cb.out.ptr, ff as u64, E as u64, 0, ex.down_row_bytes as u64, cb.sel.ptr, 1]),
+                (format!("qx_moe_gateup_grpb_{gsuf}"), vec![0, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 0, cb.warm_desc.ptr, 1]),
+                (format!("qx_moe_down_grpb_{dsuf}"), vec![0, cb.hq.ptr, cb.hd.ptr, 0, cb.out.ptr, ff as u64, E as u64, 0, ex.down_row_bytes as u64, cb.warm_desc.ptr, 1]),
+                (format!("qx_moe_gateup_q8k_{gsuf}_w20_sel"), vec![word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 0, cb.sel.ptr]),
+                (format!("qx_moe_down_q8k_{dsuf}_sel"), vec![word, cb.gu.ptr, 0, 0, cb.out.ptr, ff as u64, E as u64, 0, ex.down_row_bytes as u64, cb.sel.ptr]),
+            ] {
+                self.gpu.run(MOE.kernel(static_name(name), CubeDim::new_1d(256)), (1, 1, 1), &info);
+            }
+        }
+        self.gpu.run(MOE.kernel("qx_moe_wait_word", CubeDim::new_1d(1)), (1, 1, 1), &[word, 1]);
+        self.gpu.run(MOE.kernel("qx_moe_quant_h_sel", CubeDim::new_1d(256)), (1, 1, 1), &[cb.gu.ptr, 0, cb.hq.ptr, cb.hd.ptr, ff as u64, cb.sel.ptr, 1]);
+        self.gpu.run(MOE.kernel("qx_moe_q8k_rows", CubeDim::new_1d(256)), (1, 1, 1), &[cb.x.ptr, cb.xq.ptr, cb.xd.ptr, E as u64]);
+        let done_now = d.chunk_done.atomic_u64(0).load(std::sync::atomic::Ordering::Acquire);
+        self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, done_now]);
+        self.gpu.sync();
+        self.chunk.as_mut().unwrap().warmed = true;
+        if std::env::var("QX_DS_VERBOSE").is_ok() {
+            eprintln!("chunk kernels warmed: {} expert format pairs", seen.len());
+        }
+    }
+
     /// A prompt chunk of `toks` (1 to the chunk buffers' rows) for slot `slot`, layer-major: every layer runs its
     /// attention and FFN-pre parts over the chunk in slabs of DS_TMAX rows, then the layer's routed experts over
     /// every row of the chunk at once, each distinct expert streamed into VRAM once (the driver's chunk job: VRAM
@@ -1500,6 +1566,13 @@ impl<'a> DsEngine<'a> {
     /// compute, bit for bit; the expert kernels are the window kernels indexed by selection lists. Launches are
     /// eager (no graph). Returns the last row's logits. Needs the asynchronous driver and `QX_DS_CHUNK`.
     pub fn forward_chunk(&mut self, slot: usize, toks: &[u32]) -> Vec<f32> {
+        self.forward_chunk_opt(slot, toks, false)
+    }
+
+    /// `forward_chunk`, KV-only when `kv_only` (the layer skip of `forward_segments_opt`, for a chunk at least
+    /// `prompt_keep` positions before its prompt's end): layers up to the last KV source, whose slab passes stop
+    /// after the ring, store and index-key writes, and no experts there; returns no logits.
+    pub fn forward_chunk_opt(&mut self, slot: usize, toks: &[u32], kv_only: bool) -> Vec<f32> {
         let tf = std::time::Instant::now();
         self.t_experts = 0.0;
         let rows = toks.len();
@@ -1531,6 +1604,7 @@ impl<'a> DsEngine<'a> {
         for &w in &widths {
             self.warm_width(w, pos0, pos0 + w - 1);
         }
+        self.chunk_warm();
         // the chunk arrays and the Engram rows of every row
         {
             let cb = self.chunk.as_ref().unwrap();
@@ -1561,16 +1635,36 @@ impl<'a> DsEngine<'a> {
         let mut n_distinct = 0usize;
         let verbose = std::env::var("QX_DS_VERBOSE").is_ok();
         let trace = std::env::var("QX_DS_CHUNK_TRACE").is_ok();
-        for l in 0..n_layer {
+        let kv_last = self.kv_last();
+        let n_layers_run = if kv_only { kv_last + 1 } else { n_layer };
+        // QX_DS_CHUNK_PREFETCH=0 disables the prefetch job (the experts stream only after the routing is known)
+        let prefetch_on = !std::env::var("QX_DS_CHUNK_PREFETCH").is_ok_and(|v| v == "0");
+        let n_ring = self.abufs.as_ref().map(|ab| ab.stage_cap as usize).unwrap_or(0);
+        for l in 0..n_layers_run {
             let te = std::time::Instant::now();
+            let mut went_on = true;
+            // the layer's hottest non-resident experts stream into the ring while the slab passes run (the layer
+            // above the last KV source of a KV-only chunk has no experts to prefetch)
+            let generation = self.chunk_gen % 65535 + 1;
+            self.chunk_gen = generation;
+            let ord0_pre = self.chunk_ord;
+            let prefetch = if prefetch_on && n_ring > 0 && !(kv_only && l == kv_last) { n_ring } else { 0 };
+            if prefetch > 0 {
+                let cb = self.chunk.as_ref().unwrap();
+                *d.chunk_pick.lock().unwrap() = None;
+                d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: Vec::new(), prefetch, counts: Vec::new(), extra_scores: Vec::new(), slots_dev: cb.slots_tbl[l % 2].ptr, generation, ord0: ord0_pre });
+                self.chunk_ord += prefetch as u64;
+            }
             for si in 0..n_slabs {
                 let (r0, t) = slab(si);
                 self.chunk_views(r0, t);
                 if l == 0 {
                     self.layer_init(t, &mut None);
                 }
-                let went_on = self.layer_attn(l, t, pos0 + r0, pos0 + r0 + t - 1, &mut None, false);
-                debug_assert!(went_on);
+                went_on = self.layer_attn(l, t, pos0 + r0, pos0 + r0 + t - 1, &mut None, kv_only);
+                if !went_on {
+                    continue;
+                }
                 self.layer_ffn_pre(l, t, &mut None);
                 if trace && l < 8 {
                     self.gpu.sync();
@@ -1583,6 +1677,10 @@ impl<'a> DsEngine<'a> {
                 // the shared expert's rows out of the bound scratch into the chunk buffer
                 let shy_c = self.chunk.as_ref().unwrap().shy.ptr + (r0 * E * 4) as u64;
                 self.k("qx_ds_copy_f32", 256, (((t * E) as u32).div_ceil(256), 1, 1), &[self.s.shy.ptr, shy_c, (t * E) as u64]);
+            }
+            if !went_on {
+                // KV-only: the last KV source's ring, store and keys are written; nothing above runs
+                break;
             }
             // the experts of the whole chunk
             let cb = self.chunk.as_ref().unwrap();
@@ -1597,43 +1695,119 @@ impl<'a> DsEngine<'a> {
             for (a, &e) in ids.iter().enumerate() {
                 lists[e as usize].push(a as u32);
             }
-            let mut order: Vec<usize> = (0..ne).filter(|&e| !lists[e].is_empty()).collect();
-            order.sort_by_key(|&e| (d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed), e));
+            // the prefetched experts (the driver's pick, in its copy order), then the used ones it did not cover
+            let picked: Vec<u32> = if prefetch > 0 {
+                let t0 = std::time::Instant::now();
+                loop {
+                    if let Some(p) = d.chunk_pick.lock().unwrap().take() {
+                        break p;
+                    }
+                    assert!(t0.elapsed().as_secs() < 60, "the driver did not pick the prefetch");
+                    std::thread::yield_now();
+                }
+            } else {
+                Vec::new()
+            };
+            let mut in_pick = vec![false; ne];
+            for &e in &picked {
+                in_pick[e as usize] = true;
+            }
+            let mut rest: Vec<usize> = (0..ne).filter(|&e| !lists[e].is_empty() && !in_pick[e]).collect();
+            rest.sort_by_key(|&e| (d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed), e));
+            // the launch order: the pick (used or not: an unused one only marks its ordinal, freeing its slot), then the rest
+            let launch: Vec<(usize, u64)> = picked.iter().enumerate().map(|(i, &e)| (e as usize, ord0_pre + i as u64 + 1)).chain(rest.iter().enumerate().map(|(j, &e)| (e, self.chunk_ord + j as u64 + 1))).collect();
+            let ord0_rest = self.chunk_ord;
+            self.chunk_ord += rest.len() as u64;
             let mut sel: Vec<u32> = Vec::with_capacity(rows * k);
-            let mut offs: Vec<usize> = Vec::with_capacity(order.len());
-            for &e in &order {
-                offs.push(sel.len());
+            let mut offs: Vec<usize> = vec![0; ne];
+            for &(e, _) in &launch {
+                offs[e] = sel.len();
                 sel.extend_from_slice(&lists[e]);
             }
             cb.sel.upload(&sel);
-            // the words carry a generation instead of being zeroed: a memset would race the driver's copy streams
-            self.chunk_gen = self.chunk_gen % 65535 + 1;
-            let generation = self.chunk_gen;
-            d.chunk_done.atomic_u64(0).store(0, std::sync::atomic::Ordering::Release);
-            d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: order.iter().map(|&e| e as u32).collect(), counts: order.iter().map(|&e| lists[e].len() as u32).collect(), slots_dev: cb.slots_tbl.ptr, generation });
+            let extra_scores: Vec<(u32, u32)> = picked.iter().filter(|&&e| !lists[e as usize].is_empty()).map(|&e| (e, lists[e as usize].len() as u32)).collect();
+            let n_pick_used = extra_scores.len();
+            d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: rest.iter().map(|&e| e as u32).collect(), prefetch: 0, counts: rest.iter().map(|&e| lists[e].len() as u32).collect(), extra_scores, slots_dev: cb.slots_tbl[l % 2].ptr, generation, ord0: ord0_rest });
             let ex = &self.layers[l].experts;
             let gb = ff * ex.gate_row_bytes;
             // the expert formats differ per layer (the UD quant mixes them): the kernel variants per layer
             let (gsuf, dsuf) = (ops::suffix_of(ex.gate_ty), ops::suffix_of(ex.down_ty));
-            let kg = static_name(format!("qx_moe_gateup_q8k_{gsuf}_w20_sel"));
-            let kd = static_name(format!("qx_moe_down_q8k_{dsuf}_sel"));
-            for (i, &e) in order.iter().enumerate() {
+            // QX_DS_CHUNK_GROUPED=0: the per-selection kernels (each selection re-reads its expert) instead of the
+            // grouped ones (a weight block decoded once per warp for up to 8 rows; bit-identical)
+            let grouped = !std::env::var("QX_DS_CHUNK_GROUPED").is_ok_and(|v| v == "0");
+            let kg = static_name(if grouped { format!("qx_moe_gateup_grp_{gsuf}") } else { format!("qx_moe_gateup_q8k_{gsuf}_w20_sel") });
+            let kd = static_name(if grouped { format!("qx_moe_down_grp_{dsuf}") } else { format!("qx_moe_down_q8k_{dsuf}_sel") });
+            let mut n_used = 0usize;
+            // QX_DS_CHUNK_BATCH=B (default 0 = one launch set per expert): the batched grouped kernels take B
+            // experts per launch, each block waiting on its own expert's word. Measured slower at 16 (2026-11-06:
+            // 8.4 against 7.0 ms per token at 2048 rows), kept for the record.
+            static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let batch = *BATCH.get_or_init(|| std::env::var("QX_DS_CHUNK_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+            if grouped && batch > 0 {
+                let kgb = static_name(format!("qx_moe_gateup_grpb_{gsuf}"));
+                let kdb = static_name(format!("qx_moe_down_grpb_{dsuf}"));
+                let used: Vec<(usize, u64)> = launch.iter().copied().filter(|&(e, _)| !lists[e].is_empty()).collect();
+                n_used = used.len();
+                // one descriptor per (expert, group of 8 rows): every block of a batched launch has work
+                let mut desc: Vec<u64> = Vec::new();
+                let mut first_entry: Vec<usize> = Vec::with_capacity(used.len() + 1);
+                for &(e, _) in &used {
+                    first_entry.push(desc.len() / 4);
+                    let m = lists[e].len();
+                    for g in (0..m).step_by(8) {
+                        desc.extend_from_slice(&[cb.slots_tbl[l % 2].ptr + 8 * e as u64, cb.sel.ptr + ((offs[e] + g) * 4) as u64, (m - g).min(8) as u64, 0]);
+                    }
+                }
+                first_entry.push(desc.len() / 4);
+                cb.bdesc.upload(&desc);
+                for (bi, group) in used.chunks(batch).enumerate() {
+                    let (i0, i1) = (bi * batch, bi * batch + group.len());
+                    let entries = (first_entry[i1] - first_entry[i0]) as u32;
+                    let (e0, el) = (group[0].0, group[group.len() - 1].0);
+                    let total_sel = (offs[el] + lists[el].len() - offs[e0]) as u32;
+                    let dptr = cb.bdesc.ptr + (first_entry[i0] * 32) as u64;
+                    let sel0 = cb.sel.ptr + (offs[e0] * 4) as u64;
+                    self.gpu.run(MOE.kernel(kgb, CubeDim::new_1d(256)), (((2 * ff) as u32).div_ceil(8), entries, 1), &[0, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 0, dptr, generation]);
+                    self.gpu.run(MOE.kernel("qx_moe_quant_h_sel", CubeDim::new_1d(256)), (total_sel, 1, 1), &[cb.gu.ptr, bits(clamp_exp[l]), cb.hq.ptr, cb.hd.ptr, ff as u64, sel0, total_sel as u64]);
+                    self.gpu.run(MOE.kernel(kdb, CubeDim::new_1d(256)), ((E as u32).div_ceil(8), entries, 1), &[0, cb.hq.ptr, cb.hd.ptr, 0, cb.out.ptr, ff as u64, E as u64, (2 * gb) as u64, ex.down_row_bytes as u64, dptr, generation]);
+                    // the mark covers every launch entry up to this group's last expert (the unused picks between them too)
+                    let last_ord = group[group.len() - 1].1;
+                    self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, last_ord]);
+                }
+                // and the entries after the last used one (unused picks at the tail)
+                if let Some(&(_, ord)) = launch.last() {
+                    self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, ord]);
+                }
+            } else {
+            for &(e, ord) in &launch {
                 let m = lists[e].len() as u32;
-                let word = cb.slots_tbl.ptr + 8 * e as u64;
-                let sl = cb.sel.ptr + (offs[i] * 4) as u64;
-                self.gpu.run(MOE.kernel("qx_moe_wait_word", CubeDim::new_1d(1)), (1, 1, 1), &[word, generation]);
-                self.gpu.run(MOE.kernel(kg, CubeDim::new_1d(256)), (((2 * ff) as u32).div_ceil(8), m, 1), &[word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 0, sl]);
-                self.gpu.run(MOE.kernel(kd, CubeDim::new_1d(256)), ((E as u32).div_ceil(16), m, 1), &[word, cb.gu.ptr, bits(clamp_exp[l]), 0, cb.out.ptr, ff as u64, E as u64, (2 * gb) as u64, ex.down_row_bytes as u64, sl]);
-                self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, (i + 1) as u64]);
+                if m > 0 {
+                    n_used += 1;
+                    let word = cb.slots_tbl[l % 2].ptr + 8 * e as u64;
+                    let sl = cb.sel.ptr + (offs[e] * 4) as u64;
+                    self.gpu.run(MOE.kernel("qx_moe_wait_word", CubeDim::new_1d(1)), (1, 1, 1), &[word, generation]);
+                    if grouped {
+                        let groups = m.div_ceil(8);
+                        self.gpu.run(MOE.kernel(kg, CubeDim::new_1d(256)), (((2 * ff) as u32).div_ceil(8), groups, 1), &[word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, m as u64, sl]);
+                        self.gpu.run(MOE.kernel("qx_moe_quant_h_sel", CubeDim::new_1d(256)), (m, 1, 1), &[cb.gu.ptr, bits(clamp_exp[l]), cb.hq.ptr, cb.hd.ptr, ff as u64, sl, m as u64]);
+                        self.gpu.run(MOE.kernel(kd, CubeDim::new_1d(256)), ((E as u32).div_ceil(8), groups, 1), &[word, cb.hq.ptr, cb.hd.ptr, 0, cb.out.ptr, ff as u64, E as u64, (2 * gb) as u64, ex.down_row_bytes as u64, sl, m as u64]);
+                    } else {
+                        self.gpu.run(MOE.kernel(kg, CubeDim::new_1d(256)), (((2 * ff) as u32).div_ceil(8), m, 1), &[word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 0, sl]);
+                        self.gpu.run(MOE.kernel(kd, CubeDim::new_1d(256)), ((E as u32).div_ceil(16), m, 1), &[word, cb.gu.ptr, bits(clamp_exp[l]), 0, cb.out.ptr, ff as u64, E as u64, (2 * gb) as u64, ex.down_row_bytes as u64, sl]);
+                    }
+                }
+                self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, ord]);
             }
-            n_distinct += order.len();
+            }
+            let order_len = n_used;
+            n_distinct += order_len;
+            if verbose && pos0 == 0 {
+                eprintln!("  chunk layer {l}: {} used experts, {} prefetched ({} of them used), {} streamed after the routing", n_used, picked.len(), n_pick_used, rest.len());
+            }
             t_moe += tm.elapsed().as_secs_f64();
             let tp = std::time::Instant::now();
             let (out_ptr, shy_ptr) = (cb.out.ptr, cb.shy.ptr);
             let ones = self.s.ones_slots.ptr;
-            if verbose && pos0 == 0 {
-                eprintln!("  chunk layer {l}: {} distinct experts ({} VRAM, {} RAM, {} NVMe)", order.len(), order.iter().filter(|&&e| d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed) == 0).count(), order.iter().filter(|&&e| d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed) == 1).count(), order.iter().filter(|&&e| d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed) == 2).count());
-            }
             for si in 0..n_slabs {
                 let (r0, t) = slab(si);
                 self.chunk_views(r0, t);
@@ -1652,9 +1826,11 @@ impl<'a> DsEngine<'a> {
         }
         let (r0, t) = slab(n_slabs - 1);
         self.chunk_views(r0, t);
-        self.layer_head(t, &mut None);
+        if !kv_only {
+            self.layer_head(t, &mut None);
+        }
         self.gpu.sync();
-        let logits = self.s.logits.download_at::<f32>((t - 1) * n_vocab * 4, n_vocab);
+        let logits = if kv_only { Vec::new() } else { self.s.logits.download_at::<f32>((t - 1) * n_vocab * 4, n_vocab) };
         // the window scratch back
         let [r, pre_prev, pre_f, post, comb, x, ids_b, wts, tok, pos, slot_b] = saved;
         self.s.r = r; self.s.pre_prev = pre_prev; self.s.pre_f = pre_f; self.s.post = post; self.s.comb = comb; self.s.x = x;
@@ -1671,7 +1847,7 @@ impl<'a> DsEngine<'a> {
         self.t_phase = [0.0, t_moe, 0.0, 0.0, 0.0];
         self.t_forward = tf.elapsed().as_secs_f64();
         if std::env::var("QX_DS_VERBOSE").is_ok() {
-            eprintln!("chunk of {rows} rows at {pos0}: {:.0} ms ({:.2} ms per row; host: slab enqueue {:.0} ms, sync on the slab passes {:.0}, expert enqueue {:.0}, post enqueue {:.0}; {} distinct experts per layer, engram {:.0} ms)", self.t_forward * 1e3, self.t_forward * 1e3 / rows as f64, t_enq * 1e3, t_sync * 1e3, t_moe * 1e3, t_post * 1e3, n_distinct / n_layer, self.t_engram * 1e3);
+            eprintln!("chunk of {rows} rows at {pos0}{}: {:.0} ms ({:.2} ms per row; host: slab enqueue {:.0} ms, sync on the slab passes {:.0}, expert enqueue {:.0}, post enqueue {:.0}; {} distinct experts per layer, engram {:.0} ms)", if kv_only { " KV-only" } else { "" }, self.t_forward * 1e3, self.t_forward * 1e3 / rows as f64, t_enq * 1e3, t_sync * 1e3, t_moe * 1e3, t_post * 1e3, n_distinct / n_layers_run.max(1), self.t_engram * 1e3);
         }
         logits
     }

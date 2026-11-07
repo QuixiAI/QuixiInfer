@@ -47,6 +47,8 @@ pub struct Shared {
     /// with the ordinal of the last expert it finished (release), which gates the staging slots' reuse.
     pub chunk_jobs: std::sync::Mutex<std::collections::VecDeque<ChunkJob>>,
     pub chunk_done: HostMapped,
+    /// The experts a prefetch job picked (see `ChunkJob::prefetch`), in copy order.
+    pub chunk_pick: std::sync::Mutex<Option<Vec<u32>>>,
     /// Per global expert: 0 in VRAM, 1 in RAM, 2 on NVMe (kept by the driver; the engine orders a chunk's experts
     /// by it so the GPU meets the fast ones first).
     pub tier_of: Vec<std::sync::atomic::AtomicU8>,
@@ -56,12 +58,23 @@ pub struct Shared {
 /// selection count (for the scores), and the device table (u64 per expert of the layer) of slot words to fill.
 pub struct ChunkJob {
     pub layer: usize,
+    /// The experts in the order the GPU's launches wait for them. Empty with `prefetch` > 0: the driver picks up
+    /// to that many of the layer's hottest non-resident experts itself (the engine does not know the scores) and
+    /// reports the list in `Shared::chunk_pick`; the engine launches them in that order, skipping (but still
+    /// marking) the ones the routing did not select.
     pub experts: Vec<u32>,
+    pub prefetch: usize,
+    /// Per expert of `experts`: its selection count, for the scores (empty: no scoring).
     pub counts: Vec<u32>,
+    /// Further (expert, count) pairs to score without copying (the prefetched experts the routing used).
+    pub extra_scores: Vec<(u32, u32)>,
     pub slots_dev: u64,
     /// The job's generation (1..65535, in the words' top 16 bits): the GPU waits for it, so the table is never
     /// zeroed between jobs.
     pub generation: u64,
+    /// The ordinal of the job's first expert (global, monotonic across jobs): the GPU marks `ord0 + i + 1` in
+    /// `chunk_done` after expert i, and the staging ring frees a slot once the mark passed its last user.
+    pub ord0: u64,
 }
 
 /// Per layer: the expert formats and record geometry.
@@ -134,6 +147,7 @@ impl Driver {
             capture: std::sync::Mutex::new(()),
             chunk_jobs: std::sync::Mutex::new(Default::default()),
             chunk_done: HostMapped::new(64),
+            chunk_pick: std::sync::Mutex::new(None),
             tier_of: (0..host.table.len()).map(|g| std::sync::atomic::AtomicU8::new(if host.table[g] != 0 { 0 } else if host.rtable[g] != 0 { 1 } else { 2 })).collect(),
         });
         let sh = shared.clone();
@@ -161,6 +175,10 @@ struct Loop {
     pool: Pool,
     /// For the tier mirror (`note_tier`); set once the loop runs.
     shared: Option<Arc<Shared>>,
+    /// The chunk path's staging ring: the next slot to fill and, per slot, the ordinal of its last user (the GPU's
+    /// mark in `chunk_done` must pass it before the slot is refilled). Persists across jobs.
+    ring_next: usize,
+    ring_user: Vec<u64>,
     stream: cudarc::driver::sys::CUstream,
     /// Pinned words the table writes copy from (a ring, never reused in flight).
     words: HostMapped,
@@ -237,15 +255,36 @@ impl Loop {
     /// slot reused only once the GPU's progress mark passed its last user); NVMe records read into the store's
     /// landing places in batches of the queue, then copied the same way. The engine ordered the experts VRAM, RAM,
     /// NVMe, so the GPU meets each tier's records as they land.
-    fn serve_chunk(&mut self, sh: &Shared, job: ChunkJob) {
+    fn serve_chunk(&mut self, sh: &Shared, mut job: ChunkJob) {
         let (l, ne) = (job.layer, self.host.n_expert);
         for (&e, &c) in job.experts.iter().zip(&job.counts) {
             self.host.score[l * ne + e as usize] += c as f64;
         }
+        for &(e, c) in &job.extra_scores {
+            self.host.score[l * ne + e as usize] += c as f64;
+            if self.host.table[l * ne + e as usize] == 0 {
+                self.missed.push(l * ne + e as usize);
+            }
+        }
         let n_slots = self.host.stage_cap.max(1);
+        if self.ring_user.len() != n_slots {
+            self.ring_user = vec![0; n_slots];
+            self.ring_next = 0;
+        }
+        if job.experts.is_empty() && job.prefetch > 0 {
+            // the layer's non-resident experts, NVMe ones first (the slow reads must start while the slab passes
+            // run; the RAM copies stream after the routing at the link's speed), hottest first within a tier,
+            // up to the ring's size
+            let mut cand: Vec<usize> = (0..ne).filter(|&e| self.host.table[l * ne + e] == 0).collect();
+            let tier = |h: &Host, g: usize| if h.store.in_ram(g) { 1 } else { 0 };
+            cand.sort_by(|&a, &b| tier(&self.host, l * ne + a).cmp(&tier(&self.host, l * ne + b)).then(self.host.score[l * ne + b].partial_cmp(&self.host.score[l * ne + a]).unwrap_or(std::cmp::Ordering::Equal)).then(a.cmp(&b)));
+            cand.truncate(job.prefetch.min(n_slots));
+            job.experts = cand.iter().map(|&e| e as u32).collect();
+            *sh.chunk_pick.lock().unwrap() = Some(job.experts.clone());
+        }
         let rec_max = self.host.classes.iter().map(|c| c.0).max().unwrap_or(0) as u64;
-        let mut slot_user: Vec<u64> = vec![0; n_slots];
-        let mut next_slot = 0usize;
+        let mut slot_user = std::mem::take(&mut self.ring_user);
+        let mut next_slot = self.ring_next;
         let mut next_stream = 0usize;
         let done = sh.chunk_done.atomic_u64(0);
         let t0 = std::time::Instant::now();
@@ -274,7 +313,7 @@ impl Loop {
         while i < job.experts.len() {
             let e = job.experts[i];
             let g = l * ne + e as usize;
-            let ord = i as u64 + 1;
+            let ord = job.ord0 + i as u64 + 1;
             if self.host.table[g] != 0 {
                 let v = self.host.table[g] | (job.generation << 48);
                 self.write_word(job.slots_dev + 8 * e as u64, v);
@@ -302,7 +341,7 @@ impl Loop {
                 sh.fetch_ns.fetch_add(tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 for (bi, &gj) in batch.iter().enumerate() {
                     let ej = job.experts[i + bi];
-                    stage(self, gj, ej, ptrs[bi], (i + bi) as u64 + 1, &mut slot_user, &mut next_slot, &mut next_stream);
+                    stage(self, gj, ej, ptrs[bi], job.ord0 + (i + bi) as u64 + 1, &mut slot_user, &mut next_slot, &mut next_stream);
                 }
                 // the landing places are reused by the next batch: its reads must not start before these copies read them
                 for si in 0..self.stage_streams.len() {
@@ -315,11 +354,15 @@ impl Loop {
                 i = j;
             }
         }
+        self.ring_user = slot_user;
+        self.ring_next = next_slot;
         sh.vram_hits.fetch_add(n_vram, Ordering::Relaxed);
         sh.staged_hits.fetch_add(n_ram, Ordering::Relaxed);
         sh.nvme_misses.fetch_add(n_nvme, Ordering::Relaxed);
         sh.stage_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        self.missed.extend(job.experts.iter().map(|&e| l * ne + e as usize).filter(|&g| self.host.table[g] == 0));
+        if !job.counts.is_empty() {
+            self.missed.extend(job.experts.iter().map(|&e| l * ne + e as usize).filter(|&g| self.host.table[g] == 0));
+        }
     }
 
     /// Answers one MoE job.
@@ -621,7 +664,7 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     let n_stage_streams: usize = std::env::var("QX_DS_STAGE_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 8);
     let stage_streams: Vec<cudarc::driver::sys::CUstream> = (0..n_stage_streams).map(|_| unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("stage stream")).collect();
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
-    let mut lp = Loop { host, pool, shared: Some(sh.clone()), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events };
+    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events };
     // exercise every copy path once before a window can wait on this thread: whatever the CUDA driver
     // loads or allocates on a stream's first copy then happens while the device is idle
     let scratch = qx_gpu::mem::DeviceBuf::new(64);

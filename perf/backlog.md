@@ -268,6 +268,12 @@ invented one. The aggregate score lives in `scoreboard.md`.
   cuts the per-window HBM traffic), then the per-layer slab graphs and the chunk-wide MoE phase, then the whole-
   layer NVMe streaming (the 64 landing places and QUEUE=64 are per window today).
 - **Kill criteria:** the grouped kernel not bit-identical to the per-selection one, or under 1.5x on a 4K prompt.
+- **2026-11-06, night:** the prototype is bit-identical at 1k and 16k in every arm; 16k prompt 17.9 → 7.0 (chunks
+  of 2048, grouped kernels, prefetch) → **4.6 ms per token** with the layer skip inside chunks (217 tok/s). Grouped
+  kernels -10% (landed in the path), prefetch neutral, batched launches slower (rejected). Measured remainder per
+  2048-row chunk: host enqueue of the slab passes 5.8 s (~80 us per launch), expert kernels 6.5 s (warp
+  reductions), dense GPU remainder 0.8 s. Next: a looped multi-token GEMV launch and per-slab graphs; a
+  lane-per-row expert kernel. Not yet in the server (ds-check `QX_DS_CHUNK=N` only).
 
 ### 13. DSpark: see family 6 (re-opened 2026-11-06); measurement first, then the verify path.
 

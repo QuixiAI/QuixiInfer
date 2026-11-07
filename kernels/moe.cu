@@ -381,6 +381,122 @@ template <int T> QX_DEV void iq_terms(const u8* blk, int lane, int2 a, float& d,
     sum += mult * __dp4a(pack4(m[4], m[5], m[6], m[7]), (int)lo, __dp4a(pack4(m[0], m[1], m[2], m[3]), (int)hi, 0));
 }
 
+// ---- the decode split from the dot, for the grouped kernels (one decode per weight block, a dot per row) ----
+
+/// A lane's decoded share of one weight block: the packed signed magnitudes (`p0` for activations 0-3, `p1` for
+/// 4-7), the multiplier(s) and the scales. `iq_dot` reproduces `iq_terms`'s integer terms from it exactly.
+struct IqDec {
+    int p0, p1, mult, mult2;
+    float d, dmin;
+};
+
+template <int T> QX_DEV IqDec iq_decode(const u8* blk, int lane) {
+    IqDec dc;
+    dc.dmin = 0.f;
+    dc.mult2 = 0;
+    int m[8];
+    int mult = 0;
+    if constexpr (T == QX_IQ2_S) {
+        dc.d = ld_f16(blk);
+        const u8 *qs = blk + 2, *signs = blk + 34, *qh = blk + 66, *scales = blk + 74;
+        const int g = lane, sub = g / 2;
+        mult = 2 * ((scales[sub / 2] >> (4 * (sub % 2))) & 0xf) + 1;
+        const u64 grid = __ldg(&IQ2S_GRID[qs[g] | (((qh[g / 4] >> (2 * (g % 4))) & 3) << 8)]);
+        const u8 sg = signs[g];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) { const int v = (int)((grid >> (8 * e)) & 0xff); m[e] = (sg >> e) & 1 ? -v : v; }
+    } else if constexpr (T == QX_IQ3_S) {
+        dc.d = ld_f16(blk);
+        const u8 *qs = blk + 2, *qh = blk + 66, *signs = blk + 74, *scales = blk + 106;
+        const int g = lane, sub = g / 4;
+        mult = 2 * ((scales[sub / 2] >> (4 * (sub % 2))) & 0xf) + 1;
+        const u8 sg = signs[g];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int kq = 2 * g + h;
+            const u32 grid = __ldg(&IQ3S_GRID[qs[kq] | (((qh[kq / 8] >> (kq % 8)) & 1) << 8)]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { const int e = 4 * h + j; const int v = (int)((grid >> (8 * j)) & 0xff); m[e] = (sg >> e) & 1 ? -v : v; }
+        }
+    } else if constexpr (T == QX_IQ2_XXS) {
+        dc.d = ld_f16(blk);
+        const int i = lane / 4, g = lane % 4;
+        const u32 aw = ld_u32(blk + 2 + 8 * i), s = ld_u32(blk + 6 + 8 * i);
+        mult = 2 * (int)(s >> 28) + 1;
+        const u64 grid = __ldg(&IQ2XXS_GRID[(aw >> (8 * g)) & 0xff]);
+        const u8 sg = __ldg(&KSIGNS[(s >> (7 * g)) & 0x7f]);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) { const int v = (int)((grid >> (8 * e)) & 0xff); m[e] = (sg >> e) & 1 ? -v : v; }
+    } else if constexpr (T == QX_IQ2_XS) {
+        dc.d = ld_f16(blk);
+        const int g = lane, sub = g / 2;
+        mult = 2 * ((blk[66 + sub / 2] >> (4 * (sub % 2))) & 0xf) + 1;
+        const u32 q = ld_u16(blk + 2 + 2 * g);
+        const u64 grid = __ldg(&IQ2XS_GRID[q & 511]);
+        const u8 sg = __ldg(&KSIGNS[q >> 9]);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) { const int v = (int)((grid >> (8 * e)) & 0xff); m[e] = (sg >> e) & 1 ? -v : v; }
+    } else if constexpr (T == QX_IQ3_XXS) {
+        dc.d = ld_f16(blk);
+        const int i = lane / 4, g = lane % 4;
+        const u32 s = ld_u32(blk + 66 + 4 * i);
+        mult = 2 * (int)(s >> 28) + 1;
+        const u8 sg = __ldg(&KSIGNS[(s >> (7 * g)) & 0x7f]);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const u32 grid = __ldg(&IQ3XXS_GRID[blk[2 + 8 * i + 2 * g + h]]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { const int e = 4 * h + j; const int v = (int)((grid >> (8 * j)) & 0xff); m[e] = (sg >> e) & 1 ? -v : v; }
+        }
+    } else if constexpr (T == QX_IQ1_S) {
+        dc.d = ld_f16(blk);
+        const int i = lane / 4, g = lane % 4;
+        const u32 qh = ld_u16(blk + 34 + 2 * i);
+        mult = 2 * (int)((qh >> 12) & 7) + 1;
+        const u64 grid = __ldg(&IQ1S_GRID[blk[2 + 4 * i + g] | (((qh >> (3 * g)) & 7) << 8)]);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) m[e] = (int)((grid >> (8 * e)) & 0xff);  // 0, 1, 2 for -1, 0, 1
+        dc.p0 = pack4(m[0], m[1], m[2], m[3]);
+        dc.p1 = pack4(m[4], m[5], m[6], m[7]);
+        dc.mult = mult;
+        dc.mult2 = (qh & 0x8000) ? -1 : 1;
+        return dc;
+    } else if constexpr (T == QX_Q2_K) {
+        dc.d = ld_f16(blk + 80);
+        dc.dmin = ld_f16(blk + 82);
+        const int j = lane / 2;
+        const u8* q = blk + 16 + 32 * (lane / 16) + 8 * (lane % 4);
+        const int sh = 2 * ((lane % 16) / 4);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) m[e] = (q[e] >> sh) & 3;
+        dc.p0 = pack4(m[0], m[1], m[2], m[3]);
+        dc.p1 = pack4(m[4], m[5], m[6], m[7]);
+        dc.mult = blk[j] & 0xf;
+        dc.mult2 = blk[j] >> 4;
+        return dc;
+    }
+    dc.p0 = pack4(m[0], m[1], m[2], m[3]);
+    dc.p1 = pack4(m[4], m[5], m[6], m[7]);
+    dc.mult = mult;
+    return dc;
+}
+
+/// The lane's integer terms for activations `a` from a decoded block: identical to `iq_terms`'s.
+template <int T> QX_DEV void iq_dot(const IqDec& dc, int2 a, int& sum, int& msum) {
+    const u32 hi = a.x, lo = a.y;
+    const int dot = __dp4a(dc.p1, (int)lo, __dp4a(dc.p0, (int)hi, 0));
+    if constexpr (T == QX_IQ1_S) {
+        const int qsum = __dp4a(0x01010101, (int)lo, __dp4a(0x01010101, (int)hi, 0));
+        sum += dc.mult * (8 * (dot - qsum) + (dc.mult2 < 0 ? -qsum : qsum));
+    } else if constexpr (T == QX_Q2_K) {
+        const int qsum = __dp4a(0x01010101, (int)lo, __dp4a(0x01010101, (int)hi, 0));
+        sum += dc.mult * dot;
+        msum += dc.mult2 * qsum;
+    } else {
+        sum += dc.mult * dot;
+    }
+}
+
 /// The block value from the warp-summed integer terms, in the CPU pool's operation order.
 template <int T> QX_DEV float iq_block_value(float d, float dmin, float dq, int sum, int msum) {
     if constexpr (T == QX_Q2_K) return __fmul_rn(dq, __fsub_rn(__fmul_rn(d, (float)sum), __fmul_rn(dmin, (float)msum)));
@@ -961,3 +1077,207 @@ extern "C" __global__ void qx_moe_q8k_rows(const u64* info) {
         }
     }
 }
+
+// ---- the grouped expert kernels (chunk path): each warp decodes a weight block once and applies it to up to
+// MB rows of the expert's selection list; per (row, selection) the integer block sums and the float chain are
+// those of the per-selection kernels, so the outputs are bit-identical ----
+
+/// Gate and up rows of one expert for the rows of a selection list. info: [0] slot word, [1] xq (rows x E i8),
+/// [2] xd (rows x E/256), [3] k, [4] gu out (per selection, 2ff), [5] ff, [6] E, [7] gate row bytes, [8] M
+/// (selections in the list), [9] the list (u32 selection ids). Grid (ceil(2ff / 8), ceil(M / MB)), 256 threads.
+/// BATCH: blockIdx.y picks one (expert, group of up to MB rows) entry of a batch described at [9] (per entry:
+/// word address, the group's selection list address, rows in the group, 0), [10] is the generation; every block
+/// waits for its expert's word itself (the copies land in order; a waiting block holds nothing the copy engine
+/// needs), so one launch covers a batch of experts with no empty blocks.
+template <int T, int NB, int MB, bool BATCH = false> QX_DEV void gateup_grp_t(const u64* info) {
+    u64 slot_word, sel_addr;
+    u32 M, m0;
+    if constexpr (BATCH) {
+        const u64* desc = reinterpret_cast<const u64*>(info[9]) + 4 * blockIdx.y;
+        slot_word = desc[0];
+        sel_addr = desc[1];
+        M = (u32)desc[2];
+        m0 = 0;
+        const u64 gen = info[10];
+        while ((ld_acquire_sys(reinterpret_cast<const u64*>(slot_word)) >> 48) != gen) {
+        }
+    } else {
+        slot_word = info[0];
+        sel_addr = info[9];
+        M = U(8);
+        m0 = blockIdx.y * MB;
+    }
+    const u64 slot = *reinterpret_cast<const volatile u64*>(slot_word) & QX_SLOT_MASK;
+    if (slot == 0) return;
+    const u32 warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+    const u32 ff = U(5), E = U(6), nb = E / 256, k = U(3);
+    const u32* sel = reinterpret_cast<const u32*>(sel_addr);
+    const u32 r = warp;
+    if (r >= 2 * ff) return;
+    if (m0 >= M) return;
+    const u32 mn = min((u32)MB, M - m0);
+    const i8* xq = reinterpret_cast<const i8*>(info[1]);
+    const float* xd = CF(2);
+    const u8* row = reinterpret_cast<const u8*>(slot) + (u64)r * info[7];
+    u32 tok[MB];
+#pragma unroll
+    for (u32 mi = 0; mi < MB; ++mi) tok[mi] = mi < mn ? sel[m0 + mi] / k : 0;
+    float acc[MB];
+#pragma unroll
+    for (u32 mi = 0; mi < MB; ++mi) acc[mi] = 0.f;
+#pragma unroll
+    for (u32 b = 0; b < NB; ++b) {
+        if (b >= nb) break;
+        const IqDec dc = iq_decode<T>(row + (u64)b * Fmt<T>::BB, lane);
+#pragma unroll
+        for (u32 mi = 0; mi < MB; ++mi) {
+            if (mi < mn) {
+                const int2 a = *reinterpret_cast<const int2*>(xq + (u64)tok[mi] * E + b * 256 + 8 * lane);
+                int sum = 0, msum = 0;
+                iq_dot<T>(dc, a, sum, msum);
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xffffffffu, sum, o); msum += __shfl_xor_sync(0xffffffffu, msum, o); }
+                acc[mi] = __fadd_rn(acc[mi], iq_block_value<T>(dc.d, dc.dmin, xd[(u64)tok[mi] * nb + b], sum, msum));
+            }
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (u32 mi = 0; mi < MB; ++mi) {
+            if (mi < mn) F(4)[(u64)sel[m0 + mi] * 2 * ff + r] = acc[mi];
+        }
+    }
+}
+extern "C" __global__ void qx_moe_gateup_grp_iq2_s(const u64* info) { gateup_grp_t<QX_IQ2_S, 20, 8>(info); }
+extern "C" __global__ void qx_moe_gateup_grp_iq2_xxs(const u64* info) { gateup_grp_t<QX_IQ2_XXS, 20, 8>(info); }
+extern "C" __global__ void qx_moe_gateup_grp_iq2_xs(const u64* info) { gateup_grp_t<QX_IQ2_XS, 20, 8>(info); }
+extern "C" __global__ void qx_moe_gateup_grp_iq3_xxs(const u64* info) { gateup_grp_t<QX_IQ3_XXS, 20, 8>(info); }
+extern "C" __global__ void qx_moe_gateup_grp_iq1_s(const u64* info) { gateup_grp_t<QX_IQ1_S, 20, 8>(info); }
+extern "C" __global__ void qx_moe_gateup_grp_q2_k(const u64* info) { gateup_grp_t<QX_Q2_K, 20, 8>(info); }
+extern "C" __global__ void qx_moe_gateup_grp_iq3_s(const u64* info) { gateup_grp_t<QX_IQ3_S, 20, 8>(info); }
+extern "C" __global__ void qx_moe_gateup_grpb_iq2_s(const u64* info) { gateup_grp_t<QX_IQ2_S, 20, 8, true>(info); }
+extern "C" __global__ void qx_moe_gateup_grpb_iq2_xxs(const u64* info) { gateup_grp_t<QX_IQ2_XXS, 20, 8, true>(info); }
+extern "C" __global__ void qx_moe_gateup_grpb_iq2_xs(const u64* info) { gateup_grp_t<QX_IQ2_XS, 20, 8, true>(info); }
+extern "C" __global__ void qx_moe_gateup_grpb_iq3_xxs(const u64* info) { gateup_grp_t<QX_IQ3_XXS, 20, 8, true>(info); }
+extern "C" __global__ void qx_moe_gateup_grpb_iq1_s(const u64* info) { gateup_grp_t<QX_IQ1_S, 20, 8, true>(info); }
+extern "C" __global__ void qx_moe_gateup_grpb_q2_k(const u64* info) { gateup_grp_t<QX_Q2_K, 20, 8, true>(info); }
+extern "C" __global__ void qx_moe_gateup_grpb_iq3_s(const u64* info) { gateup_grp_t<QX_IQ3_S, 20, 8, true>(info); }
+
+/// The expert's hidden activations of one selection, quantized to Q8_K exactly as `down_q8k_t` does, into
+/// per-selection rows. info: [0] gu (per selection, 2ff), [1] clamp bits, [2] hq out (per selection, ff i8),
+/// [3] hd out (per selection, ff/256), [4] ff, [5] the selection list, [6] M. Grid (M), 256 threads.
+extern "C" __global__ void qx_moe_quant_h_sel(const u64* info) {
+    __shared__ float av[256];
+    __shared__ u32 ai[256];
+    const u32 ff = U(4), nb = ff / 256;
+    const u32 kk = reinterpret_cast<const u32*>(info[5])[blockIdx.x];
+    const float* gu = CF(0) + (u64)kk * 2 * ff;
+    const float c = __uint_as_float((u32)info[1]);
+    i8* hq = reinterpret_cast<i8*>(info[2]) + (u64)kk * ff;
+    float* hd = F(3) + (u64)kk * nb;
+    const u32 t = threadIdx.x;
+    for (u32 b = 0; b < nb; ++b) {
+        const u32 i = b * 256 + t;
+        const float g = gu[i], u = gu[ff + i];
+        const float h = c > 0.f ? qx_silu_mul(fminf(g, c), fminf(fmaxf(u, -c), c)) : qx_silu_mul(g, u);
+        av[t] = fabsf(h);
+        ai[t] = t;
+        __syncthreads();
+        for (u32 s = 128; s > 0; s >>= 1) {
+            if (t < s) {
+                const float o = av[t + s];
+                const u32 oi = ai[t + s];
+                if (o > av[t] || (o == av[t] && oi < ai[t])) { av[t] = o; ai[t] = oi; }
+            }
+            __syncthreads();
+        }
+        if (av[0] == 0.f) {
+            hq[i] = 0;
+            if (t == 0) hd[b] = 0.f;
+        } else {
+            const u32 mi = b * 256 + ai[0];
+            const float gm = gu[mi], um = gu[ff + mi];
+            const float hm = c > 0.f ? qx_silu_mul(fminf(gm, c), fminf(fmaxf(um, -c), c)) : qx_silu_mul(gm, um);
+            const float iscale = __fdiv_rn(-127.f, hm);
+            hq[i] = (i8)min(127, __float2int_rn(__fmul_rn(iscale, h)));
+            if (t == 0) hd[b] = __fdiv_rn(1.f, iscale);
+        }
+        __syncthreads();
+    }
+}
+
+/// Down rows of one expert for the rows of a selection list, from the quantized hidden rows of `qx_moe_quant_h_sel`.
+/// info: [0] slot word, [1] hq (per selection, ff i8), [2] hd (per selection, ff/256), [3] unused, [4] v out (per
+/// selection, E), [5] ff, [6] E, [7] offset of the down rows in the slot, [8] down row bytes, [9] the list, [10] M.
+/// Grid (ceil(E / 8), ceil(M / MB)), 256 threads.
+template <int T, int MB, bool BATCH = false> QX_DEV void down_grp_t(const u64* info) {
+    u64 slot_word, sel_addr;
+    u32 M, m0;
+    if constexpr (BATCH) {
+        const u64* desc = reinterpret_cast<const u64*>(info[9]) + 4 * blockIdx.y;
+        slot_word = desc[0];
+        sel_addr = desc[1];
+        M = (u32)desc[2];
+        m0 = 0;
+        const u64 gen = info[10];
+        while ((ld_acquire_sys(reinterpret_cast<const u64*>(slot_word)) >> 48) != gen) {
+        }
+    } else {
+        slot_word = info[0];
+        sel_addr = info[9];
+        M = U(10);
+        m0 = blockIdx.y * MB;
+    }
+    const u64 slot = *reinterpret_cast<const volatile u64*>(slot_word) & QX_SLOT_MASK;
+    if (slot == 0) return;
+    const u32 warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+    const u32 ff = U(5), n = U(6), nb = ff / 256;
+    const u32* sel = reinterpret_cast<const u32*>(sel_addr);
+    const u32 r = warp;
+    if (r >= n) return;
+    if (m0 >= M) return;
+    const u32 mn = min((u32)MB, M - m0);
+    const i8* hq = reinterpret_cast<const i8*>(info[1]);
+    const float* hd = CF(2);
+    const u8* row = reinterpret_cast<const u8*>(slot) + info[7] + (u64)r * info[8];
+    u32 kk[MB];
+#pragma unroll
+    for (u32 mi = 0; mi < MB; ++mi) kk[mi] = mi < mn ? sel[m0 + mi] : 0;
+    float acc[MB];
+#pragma unroll
+    for (u32 mi = 0; mi < MB; ++mi) acc[mi] = 0.f;
+    for (u32 b = 0; b < nb; ++b) {
+        const IqDec dc = iq_decode<T>(row + (u64)b * Fmt<T>::BB, lane);
+#pragma unroll
+        for (u32 mi = 0; mi < MB; ++mi) {
+            if (mi < mn) {
+                const int2 a = *reinterpret_cast<const int2*>(hq + (u64)kk[mi] * ff + b * 256 + 8 * lane);
+                int sum = 0, msum = 0;
+                iq_dot<T>(dc, a, sum, msum);
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xffffffffu, sum, o); msum += __shfl_xor_sync(0xffffffffu, msum, o); }
+                acc[mi] = __fadd_rn(acc[mi], iq_block_value<T>(dc.d, dc.dmin, hd[(u64)kk[mi] * nb + b], sum, msum));
+            }
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (u32 mi = 0; mi < MB; ++mi) {
+            if (mi < mn) F(4)[(u64)kk[mi] * n + r] = acc[mi];
+        }
+    }
+}
+extern "C" __global__ void qx_moe_down_grp_iq2_s(const u64* info) { down_grp_t<QX_IQ2_S, 8>(info); }
+extern "C" __global__ void qx_moe_down_grp_iq3_s(const u64* info) { down_grp_t<QX_IQ3_S, 8>(info); }
+extern "C" __global__ void qx_moe_down_grp_iq2_xxs(const u64* info) { down_grp_t<QX_IQ2_XXS, 8>(info); }
+extern "C" __global__ void qx_moe_down_grp_iq2_xs(const u64* info) { down_grp_t<QX_IQ2_XS, 8>(info); }
+extern "C" __global__ void qx_moe_down_grp_iq3_xxs(const u64* info) { down_grp_t<QX_IQ3_XXS, 8>(info); }
+extern "C" __global__ void qx_moe_down_grp_iq1_s(const u64* info) { down_grp_t<QX_IQ1_S, 8>(info); }
+extern "C" __global__ void qx_moe_down_grp_q2_k(const u64* info) { down_grp_t<QX_Q2_K, 8>(info); }
+extern "C" __global__ void qx_moe_down_grpb_iq2_s(const u64* info) { down_grp_t<QX_IQ2_S, 8, true>(info); }
+extern "C" __global__ void qx_moe_down_grpb_iq3_s(const u64* info) { down_grp_t<QX_IQ3_S, 8, true>(info); }
+extern "C" __global__ void qx_moe_down_grpb_iq2_xxs(const u64* info) { down_grp_t<QX_IQ2_XXS, 8, true>(info); }
+extern "C" __global__ void qx_moe_down_grpb_iq2_xs(const u64* info) { down_grp_t<QX_IQ2_XS, 8, true>(info); }
+extern "C" __global__ void qx_moe_down_grpb_iq3_xxs(const u64* info) { down_grp_t<QX_IQ3_XXS, 8, true>(info); }
+extern "C" __global__ void qx_moe_down_grpb_iq1_s(const u64* info) { down_grp_t<QX_IQ1_S, 8, true>(info); }
+extern "C" __global__ void qx_moe_down_grpb_q2_k(const u64* info) { down_grp_t<QX_Q2_K, 8, true>(info); }

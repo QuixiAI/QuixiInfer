@@ -7,6 +7,32 @@ UD-IQ2_XXS in QuixiInfer on this box, as fast as possible. The results must stay
 The box has an RTX 5090 (32 GB), a Ryzen 9950X (16 cores), 120 GiB of RAM and a 4 TB NVMe root. The experts live in
 three tiers: VRAM, pinned RAM and the NVMe pack.
 
+## Update 2026-11-06, night: the chunk path at 217 tok/s on 16k, Strata built for a head-to-head
+
+- **Chunk path (family 12), measured at 16k, every arm bit-identical:** windows 17.9 → chunks of 2048 with the
+  grouped expert kernels 7.0 ms per token → with the layer skip inside chunks (`QX_DS_SKIP=1` with `QX_DS_CHUNK`)
+  **4.6 ms per token (217 tok/s)**. Rejected tonight: batched expert launches (slower on the GPU); neutral: the
+  prefetch job (either tier first). What remains per 2048-row chunk: 5.8 s of host launch overhead for the slab
+  passes (~70k CubeCL launches at ~80 us) and 6.5 s of grouped-kernel time (warp reductions). Next: a looped
+  multi-token GEMV launch (16 → 1 per GEMV group per slab), per-slab graphs, a lane-per-row expert kernel; then
+  the server. Knobs: `QX_DS_CHUNK=N`, `QX_DS_CHUNK_GROUPED=0`, `QX_DS_CHUNK_PREFETCH=0`, `QX_DS_CHUNK_BATCH=B`,
+  `QX_DS_CHUNK_TRACE=1`. The working tree holds all of it, uncommitted until the queued ds-checks pass
+  (`chain-dscheck2.sh` after the baseline; binaries `~/qx-bins/chunk5`). Three deadlocks were fixed on the way
+  (notebook): never zero a word table the copy streams write (generation tags), warm every chunk kernel before
+  the first job, and double-buffer the slot tables by layer parity.
+- **Set D baseline:** running (`chain-baseline.sh`, label `baseline-setd`, committed binaries `~/qx-bins/chunk`
+  = 642433a, the regenerated states with rings and tier ranking). Promote and record it (`perf_diff.py promote`,
+  `score --record`), note the case-set change in the scoreboard.
+- **Strata head-to-head (the user asked):** `~/git/Strata/build-dsv41/strata-dsv41` is built (sm_120). Its
+  Engram reader rejects Unsloth's Q5_K table, so the supported recipe is Unsloth shards 1-5 + ISTA's IQ4_NL
+  Engram (110 GB, downloading to `~/models/DeepSeek-V4.1-Flash-1017-GGUF/ista-engram/`). `chain-strata.sh` packs
+  (`tools/dsv41/pack_gguf.py`, a map not a copy) and runs: decode 256 tokens after 64 prompt tokens (DSpark none
+  and on), prefill 1k, prefill 16k at chunks 1024/4096/8192; `--ssd-cache 95` under `MemoryMax=110G`; the
+  `prompt:` and `decode:` stderr lines carry tok/s. Our comparable numbers: decode 29 tok/s (1k), prefill 1k 91
+  tok/s (windows; the chunk path at 1k not yet measured warm), 16k 217 tok/s (chunks + skip, cold tier).
+  Caveats to state with the result: Strata's prefill is not bit-exact against its decode; Strata reads a 111 GB
+  IQ4_NL Engram where we read the 135 GB Q5_K one; both engines on a cold start.
+
 ## Update 2026-11-06, evening: "bridge the gap" to Strata (prefill), and what the day found
 
 Read `perf/backlog.md` families 9, 11, 12 and 6, `perf/findings.md` "The neighbours' mechanics", and the notebook's
@@ -55,8 +81,15 @@ Read `perf/backlog.md` families 9, 11, 12 and 6, `perf/findings.md` "The neighbo
 - **Chains in flight (scratchpad `$S`, markers in `$S/chain-ab.out`):** `chain-ab2.sh` (idx A/B → skip checks →
   f10 A/B → `CHAIN-AB2-DONE`), `build-chunk.sh` (after `IDX-AB-DONE`), `chain-chunk.sh` (after both; `CHUNK-DONE`,
   then `touch states-go`), `chain-states2.sh` (states pass, `STATES2-DONE`; then waits for `baseline-go`).
-  Uncommitted: everything above (mod.rs, driver.rs, moe.cu, qx-ds-check.rs, worker_ds.rs, bench.sh, records).
-  Commit the rings/replay fix, the skip and the chunk path only with their checks passed and recorded.
+  **Committed as 642433a (late evening)** after every check passed: the far rewind exact (256/256; the first
+  fix, saving and restoring store rows, was not enough: the replay must not write the stores at all, so it runs
+  in a rings-only, eager `replaying` mode), the skip identical at 16k (17.9 → 8.9 ms per token), the chunk path
+  identical at 1k and 16k (8.4 / 7.6 ms per token at chunks of 1024 / 2048; three bugs on the way, see the
+  notebook), ds-checks exact. In the working tree after that commit, untested: the prefetch job (the driver
+  picks the layer's hottest non-resident experts and streams them during the slab passes; global ordinals and a
+  persistent staging ring; `QX_DS_CHUNK_PREFETCH=0` disables) and KV-only chunks (`forward_chunk_opt(.., kv_only)`,
+  ds-check `QX_DS_SKIP=1` with `QX_DS_CHUNK`). `chain-prefetch.sh` builds and tests them after the states pass and
+  then releases the set D baseline (`baseline-go`), which runs on the committed binaries (`~/qx-bins/chunk`).
 
 ## Update 2026-11-06, late afternoon: the priority is now performance at 256k context
 

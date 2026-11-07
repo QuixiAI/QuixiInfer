@@ -135,7 +135,10 @@ fn main() -> anyhow::Result<()> {
                 let w = &toks[p..(p + cap).min(toks.len())];
                 let kv_only = skip && w.len() > 1 && toks.len() - (p + w.len()) >= keep;
                 let logits = if chunk > 0 && w.len() > 1 {
-                    let last = eng.forward_chunk(0, w);
+                    if kv_only {
+                        kv_only_windows += 1;
+                    }
+                    let last = eng.forward_chunk_opt(0, w, kv_only);
                     // the chunk's rows but the last carry no logits: pad so the row index stays the position
                     let mut v = vec![0f32; last.len() * (w.len() - 1)];
                     v.extend_from_slice(&last);
