@@ -268,6 +268,7 @@ template <int XM, int NT> QX_DEV void mgemv_z(const u64* info) {
     }
 }
 
+#ifndef QX_MGEMV_BENCH  // kernels/bench/mgemv_bench.cu instantiates the entries it times
 // One entry per token count: a shared entry would give the one-token case the registers of the eight-token one.
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv(const u64* info) { mgemv<0, 1>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu(const u64* info) { mgemv<1, 1>(info); }
@@ -293,6 +294,7 @@ extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t7(const u64*
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_t8(const u64* info) { mgemv<0, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu_t8(const u64* info) { mgemv<1, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t8(const u64* info) { mgemv<2, 8>(info); }
+#endif
 /// `mgemv_z` with one barrier per block instead of two per group: on the split-K path each warp's partial for every
 /// (group, token) goes to shared memory as it is computed (the warp_sum needs no barrier), and one pass at the end
 /// sums the 8 warps per token in the same order (t = 0, then warps 0..7). The row-blocked attempt (`mgemv_zr`)
@@ -510,6 +512,7 @@ template <int XM, int NT, int RB> QX_DEV void mgemv_zt(const u64* info) {
     }
 }
 
+#ifndef QX_MGEMV_BENCH
 // the one-launch entries: groups of 8 tokens inside the block (the chunk path's slabs, windows of 16 and up)
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_t8z(const u64* info) { mgemv_z<0, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu_t8z(const u64* info) { mgemv_z<1, 8>(info); }
@@ -522,6 +525,7 @@ extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t8zt(const u6
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_t8zb(const u64* info) { mgemv_zb<0, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu_t8zb(const u64* info) { mgemv_zb<1, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t8zb(const u64* info) { mgemv_zb<2, 8>(info); }
+#endif
 
 /// The int8 inputs of a launch: token n's x (transformed as the launch's mode says) in blocks of 32, d = amax / 127,
 /// q = round(x / d). info: [0] x, [1] x row stride (floats), [2] mode (0 plain, 1 silu(x * s), 2 silu(x) * x2),
