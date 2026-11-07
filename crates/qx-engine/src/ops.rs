@@ -160,6 +160,12 @@ fn zgroups() -> bool {
     *U.get_or_init(|| !std::env::var("QX_MGEMV_ZGROUPS").is_ok_and(|v| v == "0"))
 }
 
+/// Whether the one-launch path uses the one-barrier-per-block entries (`QX_MGEMV_ZB=1`).
+fn zb() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| std::env::var("QX_MGEMV_ZB").is_ok_and(|v| v == "1"))
+}
+
 /// Whether `qx_tmv` gives planar Q8_0 rows int8 inputs and integer products (`QX_TMV_INT8=0`: bf16).
 fn tmv_int8() -> bool {
     static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -338,7 +344,13 @@ impl MGemv {
             // the groups run inside the block (the high bits of info[5]), so a block's rows stay in L1 across them;
             // the `_t8z` entries alone carry the group loop (it costs the width 1-8 entries 4-5% at decode)
             const ZENTRIES: [&str; 3] = ["qx_mgemv_t8z", "qx_mgemv_silu_t8z", "qx_mgemv_silumul_t8z"];
-            gpu.run(modules::MGEMV.kernel(ZENTRIES[mode as usize], CubeDim::new_1d(256)), (self.blocks, 1, 1), &[x, self.table.ptr, self.n as u64, x_stride as u64, arg, 8 | (((t / 8) as u64) << 32), 0, xq, xd, self.tcols as u64]);
+            // QX_MGEMV_ZB=1: one barrier per block (the warps' partials for every group summed at the end, same order).
+            // Rows per block on the Q8 segments (4 and 8, sharing the activation fragments) measured 12% slower at
+            // either count, bit-identical: removed (notebook 2026-11-07)
+            const ZB: [&str; 3] = ["qx_mgemv_t8zb", "qx_mgemv_silu_t8zb", "qx_mgemv_silumul_t8zb"];
+            let entry = if zb() { ZB[mode as usize] } else { ZENTRIES[mode as usize] };
+            let (tab, blocks) = (self.table.ptr, self.blocks);
+            gpu.run(modules::MGEMV.kernel(entry, CubeDim::new_1d(256)), (blocks, 1, 1), &[x, tab, self.n as u64, x_stride as u64, arg, 8 | (((t / 8) as u64) << 32), 0, xq, xd, self.tcols as u64]);
             return;
         }
         for c in (0..t).step_by(8) {

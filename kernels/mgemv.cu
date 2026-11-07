@@ -293,10 +293,78 @@ extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t7(const u64*
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_t8(const u64* info) { mgemv<0, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu_t8(const u64* info) { mgemv<1, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t8(const u64* info) { mgemv<2, 8>(info); }
+/// `mgemv_z` with one barrier per block instead of two per group: on the split-K path each warp's partial for every
+/// (group, token) goes to shared memory as it is computed (the warp_sum needs no barrier), and one pass at the end
+/// sums the 8 warps per token in the same order (t = 0, then warps 0..7). The row-blocked attempt (`mgemv_zr`)
+/// was 12% slower at 4 and at 8 rows alike, which says the per-group barriers and shared round trips, about 3 us a
+/// group, were the time, not the activation traffic (2026-11-07). The row-per-warp path is as in `mgemv_z`.
+template <int XM, int NT> QX_DEV void mgemv_zb(const u64* info) {
+    const u64* segs = reinterpret_cast<const u64*>(info[1]);
+    const u32 nseg = (u32)info[2];
+    u32 s = 0;
+    while (s + 1 < nseg && blockIdx.x >= (u32)segs[(s + 1) * 8 + 6]) ++s;
+    const u64* d = segs + s * 8;
+    const u32 rows = (u32)d[2], cols = (u32)d[3], ty = (u32)d[4], lanes = (u32)d[5];
+    const u64 stride = d[7] ? d[7] : type_row_bytes(ty, cols);
+    const u32 blk = blockIdx.x - (u32)d[6];
+    const u32 warp = threadIdx.x / 32, wl = threadIdx.x % 32;
+    float* y = reinterpret_cast<float*>(d[1]);
+    const u32 nz = (u32)(info[5] >> 32) ? (u32)(info[5] >> 32) : 1;
+    __shared__ float part[8][128];  // (warp, token) over all the groups: NT * nz <= 128 tokens a launch
+    for (u32 z = 0; z < nz; ++z) {
+        const u64 z0 = (u64)z * NT;
+        XIn<XM> x[NT];
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+            x[n].x = reinterpret_cast<const float*>(info[0]) + (z0 + n) * info[3];
+            x[n].arg = XM == 2 ? info[4] + 4ull * (z0 + n) * info[3] : info[4];
+            x[n].xq = info[7] ? reinterpret_cast<const i8*>(info[7]) + (z0 + n) * info[9] : nullptr;
+            x[n].xd = info[7] ? reinterpret_cast<const float*>(info[8]) + (z0 + n) * (info[9] / 32) : nullptr;
+        }
+        float a[NT];
+        if (lanes == 0) {
+            const u32 r = blk;
+            partial<XM, NT>(ty, reinterpret_cast<const u8*>(d[0]) + (u64)r * stride, x, cols, wl, 32, warp, 8, a);
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                const float v = warp_sum(a[n]);
+                if (wl == 0) part[warp][z0 + n] = v;
+            }
+            continue;
+        }
+        const u32 rpw = 32 / lanes;  // rows per warp
+        const u32 r = (blk * 8 + warp) * rpw + wl / lanes;
+        const u32 lane = wl % lanes;
+        if (r < rows) partial<XM, NT>(ty, reinterpret_cast<const u8*>(d[0]) + (u64)r * stride, x, cols, lane, lanes, 0, 1, a);
+        else
+#pragma unroll
+            for (int n = 0; n < NT; ++n) a[n] = 0.f;
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+            float v = a[n];
+            for (u32 o = lanes / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (r < rows && lane == 0) y[(info[6] + z0 + n) * rows + r] = v;
+        }
+    }
+    if (lanes == 0) {
+        __syncthreads();
+        const u32 nt = nz * NT;
+        for (u32 n = threadIdx.x; n < nt; n += blockDim.x) {
+            float t = 0.f;
+            for (int i = 0; i < 8; ++i) t += part[i][n];
+            y[(info[6] + n) * rows + blk] = t;
+        }
+    }
+}
+
 // the one-launch entries: groups of 8 tokens inside the block (the chunk path's slabs, windows of 16 and up)
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_t8z(const u64* info) { mgemv_z<0, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu_t8z(const u64* info) { mgemv_z<1, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t8z(const u64* info) { mgemv_z<2, 8>(info); }
+// the same with one barrier per block (`QX_MGEMV_ZB=1`)
+extern "C" __global__ void __launch_bounds__(256) qx_mgemv_t8zb(const u64* info) { mgemv_zb<0, 8>(info); }
+extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu_t8zb(const u64* info) { mgemv_zb<1, 8>(info); }
+extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t8zb(const u64* info) { mgemv_zb<2, 8>(info); }
 
 /// The int8 inputs of a launch: token n's x (transformed as the launch's mode says) in blocks of 32, d = amax / 127,
 /// q = round(x / d). info: [0] x, [1] x row stride (floats), [2] mode (0 plain, 1 silu(x * s), 2 silu(x) * x2),
