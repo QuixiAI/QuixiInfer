@@ -144,6 +144,22 @@ fn q8x_scratch(k: usize) -> (u64, u64) {
     (b.0.ptr, b.1.ptr)
 }
 
+/// `qx_mgemv_q8x`'s int8 inputs for a whole window (up to 128 tokens of up to 16384 columns) for the one-launch
+/// path of `run_t_with`.
+fn q8x_scratch_t(k: usize, t: usize) -> (u64, u64) {
+    static B: std::sync::OnceLock<(qx_gpu::mem::DeviceBuf, qx_gpu::mem::DeviceBuf)> = std::sync::OnceLock::new();
+    let b = B.get_or_init(|| (qx_gpu::mem::DeviceBuf::new(128 * 16384), qx_gpu::mem::DeviceBuf::new(128 * 16384 / 32 * 4)));
+    assert!(t * k <= b.0.bytes, "int8 matvec input of {t} x {k}");
+    (b.0.ptr, b.1.ptr)
+}
+
+/// Whether windows whose token count is a multiple of 8 run as one launch with a token group per blockIdx.z
+/// (`QX_MGEMV_ZGROUPS=0`: eight tokens a launch, as before). Same kernel instance per token: identical bits.
+fn zgroups() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| !std::env::var("QX_MGEMV_ZGROUPS").is_ok_and(|v| v == "0"))
+}
+
 /// Whether `qx_tmv` gives planar Q8_0 rows int8 inputs and integer products (`QX_TMV_INT8=0`: bf16).
 fn tmv_int8() -> bool {
     static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -308,6 +324,18 @@ impl MGemv {
                 gpu.run(modules::GEMM.kernel("qx_tmv_prep", CubeDim::new_1d(256)), (((32 * k / 2) as u32).div_ceil(256), 1, 1), &[x, x_stride as u64, arg, mode, t as u64, k as u64, xb]);
                 launch("qx_tmv", &self.ttable[0], 0, 0);
             }
+            return;
+        }
+        if t > 8 && t % 8 == 0 && zgroups() {
+            // one launch: t / 8 groups of 8 tokens along blockIdx.z (and one quantization launch for all t)
+            let (xq, xd) = if self.q8 && mgemv_int8() {
+                let (xq, xd) = q8x_scratch_t(self.tcols, t);
+                gpu.run(modules::MGEMV.kernel("qx_mgemv_q8x", CubeDim::new_1d(256)), ((self.tcols as u32).div_ceil(256), t as u32, 1), &[x, x_stride as u64, mode, arg, self.tcols as u64, xq, xd, 0]);
+                (xq, xd)
+            } else {
+                (0, 0)
+            };
+            gpu.run(modules::MGEMV.kernel(ENTRIES[7][mode as usize], CubeDim::new_1d(256)), (self.blocks, 1, (t / 8) as u32), &[x, self.table.ptr, self.n as u64, x_stride as u64, arg, 8, 0, xq, xd, self.tcols as u64]);
             return;
         }
         for c in (0..t).step_by(8) {

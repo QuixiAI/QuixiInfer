@@ -143,13 +143,16 @@ template <int XM, int NT> QX_DEV void partial(u32 ty, const u8* row, const XIn<X
 /// (a later chunk of a window's tokens), [7] the int8 inputs (`qx_mgemv_q8x`: token n at + n * cols) or 0,
 /// [8] their scales (token n at + n * cols / 32), [9] cols of the int8 rows.
 template <int XM, int NT> QX_DEV void mgemv(const u64* info) {
+    // blockIdx.z: a further group of NT tokens of the same launch (token z * NT + n), the same code per token as
+    // a launch of its own, so the bits are those of the one-group launches
+    const u64 z0 = (u64)blockIdx.z * NT;
     XIn<XM> x[NT];
 #pragma unroll
     for (int n = 0; n < NT; ++n) {
-        x[n].x = reinterpret_cast<const float*>(info[0]) + (u64)n * info[3];
-        x[n].arg = XM == 2 ? info[4] + 4ull * n * info[3] : info[4];
-        x[n].xq = info[7] ? reinterpret_cast<const i8*>(info[7]) + (u64)n * info[9] : nullptr;
-        x[n].xd = info[7] ? reinterpret_cast<const float*>(info[8]) + (u64)n * (info[9] / 32) : nullptr;
+        x[n].x = reinterpret_cast<const float*>(info[0]) + (z0 + n) * info[3];
+        x[n].arg = XM == 2 ? info[4] + 4ull * (z0 + n) * info[3] : info[4];
+        x[n].xq = info[7] ? reinterpret_cast<const i8*>(info[7]) + (z0 + n) * info[9] : nullptr;
+        x[n].xd = info[7] ? reinterpret_cast<const float*>(info[8]) + (z0 + n) * (info[9] / 32) : nullptr;
     }
     const u64* segs = reinterpret_cast<const u64*>(info[1]);
     const u32 nseg = (u32)info[2];
@@ -177,7 +180,7 @@ template <int XM, int NT> QX_DEV void mgemv(const u64* info) {
             const u32 n = threadIdx.x;
             float t = 0.f;
             for (int i = 0; i < 8; ++i) t += part[i][n];
-            y[(info[6] + n) * rows + r] = t;
+            y[(info[6] + z0 + n) * rows + r] = t;
         }
         return;
     }
@@ -193,7 +196,7 @@ template <int XM, int NT> QX_DEV void mgemv(const u64* info) {
         // reduce within each group of `lanes` lanes
         float v = a[n];
         for (u32 o = lanes / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-        if (r < rows && lane == 0) y[(info[6] + n) * rows + r] = v;
+        if (r < rows && lane == 0) y[(info[6] + z0 + n) * rows + r] = v;
     }
 }
 

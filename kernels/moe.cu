@@ -1281,3 +1281,156 @@ extern "C" __global__ void qx_moe_down_grpb_iq2_xs(const u64* info) { down_grp_t
 extern "C" __global__ void qx_moe_down_grpb_iq3_xxs(const u64* info) { down_grp_t<QX_IQ3_XXS, 8, true>(info); }
 extern "C" __global__ void qx_moe_down_grpb_iq1_s(const u64* info) { down_grp_t<QX_IQ1_S, 8, true>(info); }
 extern "C" __global__ void qx_moe_down_grpb_q2_k(const u64* info) { down_grp_t<QX_Q2_K, 8, true>(info); }
+
+// ---- the int8 tensor-core expert kernels (chunk path): exact by construction ----
+//
+// mma.m16n8k32 s8.s8.s32 over one 32-element sub-block of a 256-block: lane (g = lane / 4, q = lane % 4) holds
+// bytes 8q .. 8q + 7 of the sub-block for rows g and g + 8 (the A operand) and for tokens g (the B operand);
+// the same permutation of k on both sides leaves the integer dot product exact, so S = sum over the 8 sub-blocks
+// of mult(row, sub) * dot(row, token, sub) is the integer block sum `iq_terms` would have summed lane by lane, and
+// the float chain acc = fadd(acc, block_value(d, dmin, dq, S, Msum)) in block order gives the per-selection
+// kernels' bits. `iq_decode` already yields a lane's 8 packed magnitudes of one row at one 8-element position
+// (lane_eq = 4 sub + q), which is the A fragment. Per warp 16 rows; the token groups of 8 (up to 8 of them: 64
+// selections a pass) share each decoded fragment.
+
+QX_DEV void mma_s8_moe(int* c, const int* a, const int* b) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+/// DOWN = false: gate and up rows (K = E, rows = 2ff, activations xq per token, scales xd); DOWN = true: down rows
+/// (K = ff, rows = E, activations hq per selection, scales hd). info as the grouped kernels: [0] slot word,
+/// [1] activations (i8), [2] scales, [3] k (gate/up), [4] out, [5] ff, [6] E, [7] gate row bytes | down offset,
+/// [8] M (gate/up) | down row bytes, [9] selection list, [10] M (down). Grid (ceil(rows / 64), ceil(M / 64)),
+/// 128 threads (4 warps of 16 rows).
+template <int T, bool DOWN> QX_DEV void moe_mma_t(const u64* info) {
+    const u64 slot = *reinterpret_cast<const volatile u64*>(info[0]) & QX_SLOT_MASK;
+    if (slot == 0) return;
+    const u32 ff = U(5), E = U(6);
+    const u32 K = DOWN ? ff : E, rows = DOWN ? E : 2 * ff, nb = K / 256, k = U(3);
+    const u32 M = DOWN ? U(10) : U(8);
+    const u32* sel = reinterpret_cast<const u32*>(info[9]);
+    const u32 warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, q = lane % 4;
+    const u32 ra = blockIdx.x * 64 + warp * 16 + g, rb = ra + 8;
+    if (ra >= rows) return;
+    const bool has_b = rb < rows;
+    const u32 m0 = blockIdx.y * 64;
+    const u32 ngr = min(8u, (M - m0 + 7) / 8);
+    const u8* rowa = reinterpret_cast<const u8*>(slot) + (DOWN ? info[7] : 0) + (u64)ra * (DOWN ? info[8] : info[7]);
+    const u8* rowb = reinterpret_cast<const u8*>(slot) + (DOWN ? info[7] : 0) + (u64)(has_b ? rb : ra) * (DOWN ? info[8] : info[7]);
+    const i8* act = reinterpret_cast<const i8*>(info[1]);
+    const float* sc = CF(2);
+    // this thread's two tokens per group (columns 2q, 2q + 1 of the C fragment) and the token whose bytes it loads (g)
+    u32 tokl[8], tok0[8], tok1[8];
+    u64 abase[8];
+#pragma unroll
+    for (u32 t = 0; t < 8; ++t) {
+        const u32 mi = m0 + 8 * t;
+        const u32 kl = mi + g < M ? sel[mi + g] : sel[M - 1];
+        tokl[t] = DOWN ? kl : kl / k;
+        const u32 k0 = mi + 2 * q < M ? sel[mi + 2 * q] : 0, k1 = mi + 2 * q + 1 < M ? sel[mi + 2 * q + 1] : 0;
+        tok0[t] = DOWN ? k0 : k0 / k;
+        tok1[t] = DOWN ? k1 : k1 / k;
+        abase[t] = (u64)tokl[t] * K;
+    }
+    float acc[8][4];
+#pragma unroll
+    for (u32 t = 0; t < 8; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+    const int ones[4] = {0x01010101, 0x01010101, 0x01010101, 0x01010101};
+    for (u32 b = 0; b < nb; ++b) {
+        int S[8][4], Ms[8][4];
+#pragma unroll
+        for (u32 t = 0; t < 8; ++t) { S[t][0] = S[t][1] = S[t][2] = S[t][3] = 0; Ms[t][0] = Ms[t][1] = Ms[t][2] = Ms[t][3] = 0; }
+        float da = 0.f, dmina = 0.f, db = 0.f, dminb = 0.f;
+#pragma unroll
+        // IQ2_S, IQ2_XS and Q2_K scale per 16 elements (two scales inside one k = 32 sub-block): those take two
+        // mmas per sub-block, the A fragment masked to each half, each half's multiplier from its own lanes
+        constexpr bool H16 = T == QX_IQ2_S || T == QX_IQ2_XS || T == QX_Q2_K;
+        const bool hi_half = q >= 2;
+        for (u32 sub = 0; sub < 8; ++sub) {
+            const IqDec xa = iq_decode<T>(rowa + (u64)b * Fmt<T>::BB, (int)(4 * sub + q));
+            const IqDec xb = iq_decode<T>(rowb + (u64)b * Fmt<T>::BB, (int)(4 * sub + q));
+            if (sub == 0) { da = xa.d; dmina = xa.dmin; db = xb.d; dminb = xb.dmin; }
+            // the fragment's register order: (row g, k-lo), (row g + 8, k-lo), (row g, k-hi), (row g + 8, k-hi)
+            const int a[4] = {xa.p0, xb.p0, xa.p1, xb.p1};
+            int alo[4], ahi[4], olo[4], ohi[4];
+            int ma_lo = xa.mult, ma_hi = xa.mult, mb_lo = xb.mult, mb_hi = xb.mult, na_lo = xa.mult2, na_hi = xa.mult2, nb_lo = xb.mult2, nb_hi = xb.mult2;
+            if constexpr (H16) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) { alo[i] = hi_half ? 0 : a[i]; ahi[i] = hi_half ? a[i] : 0; olo[i] = hi_half ? 0 : 0x01010101; ohi[i] = hi_half ? 0x01010101 : 0; }
+                ma_lo = __shfl_sync(0xffffffffu, xa.mult, 4 * g); ma_hi = __shfl_sync(0xffffffffu, xa.mult, 4 * g + 2);
+                mb_lo = __shfl_sync(0xffffffffu, xb.mult, 4 * g); mb_hi = __shfl_sync(0xffffffffu, xb.mult, 4 * g + 2);
+                na_lo = __shfl_sync(0xffffffffu, xa.mult2, 4 * g); na_hi = __shfl_sync(0xffffffffu, xa.mult2, 4 * g + 2);
+                nb_lo = __shfl_sync(0xffffffffu, xb.mult2, 4 * g); nb_hi = __shfl_sync(0xffffffffu, xb.mult2, 4 * g + 2);
+            }
+            for (u32 t = 0; t < ngr; ++t) {
+                const int2 bv = *reinterpret_cast<const int2*>(act + abase[t] + b * 256 + sub * 32 + 8 * q);
+                const int bfrag[2] = {bv.x, bv.y};
+                if constexpr (H16) {
+                    int cl[4] = {0, 0, 0, 0}, ch[4] = {0, 0, 0, 0};
+                    mma_s8_moe(cl, alo, bfrag);
+                    mma_s8_moe(ch, ahi, bfrag);
+                    S[t][0] += ma_lo * cl[0] + ma_hi * ch[0]; S[t][1] += ma_lo * cl[1] + ma_hi * ch[1];
+                    S[t][2] += mb_lo * cl[2] + mb_hi * ch[2]; S[t][3] += mb_lo * cl[3] + mb_hi * ch[3];
+                    if constexpr (T == QX_Q2_K) {
+                        int ql[4] = {0, 0, 0, 0}, qh[4] = {0, 0, 0, 0};
+                        mma_s8_moe(ql, olo, bfrag);
+                        mma_s8_moe(qh, ohi, bfrag);
+                        Ms[t][0] += na_lo * ql[0] + na_hi * qh[0]; Ms[t][1] += na_lo * ql[1] + na_hi * qh[1];
+                        Ms[t][2] += nb_lo * ql[0] + nb_hi * qh[0]; Ms[t][3] += nb_lo * ql[1] + nb_hi * qh[1];
+                    }
+                } else {
+                    int c[4] = {0, 0, 0, 0};
+                    mma_s8_moe(c, a, bfrag);
+                    if constexpr (T == QX_IQ1_S) {
+                        int cq[4] = {0, 0, 0, 0};
+                        mma_s8_moe(cq, ones, bfrag);  // the activations' sums per token (rows alike)
+                        S[t][0] += xa.mult * (8 * (c[0] - cq[0]) + (xa.mult2 < 0 ? -cq[0] : cq[0]));
+                        S[t][1] += xa.mult * (8 * (c[1] - cq[1]) + (xa.mult2 < 0 ? -cq[1] : cq[1]));
+                        S[t][2] += xb.mult * (8 * (c[2] - cq[0]) + (xb.mult2 < 0 ? -cq[0] : cq[0]));
+                        S[t][3] += xb.mult * (8 * (c[3] - cq[1]) + (xb.mult2 < 0 ? -cq[1] : cq[1]));
+                    } else {
+                        S[t][0] += xa.mult * c[0]; S[t][1] += xa.mult * c[1]; S[t][2] += xb.mult * c[2]; S[t][3] += xb.mult * c[3];
+                    }
+                }
+            }
+        }
+        for (u32 t = 0; t < ngr; ++t) {
+            const float dq0 = sc[(u64)tok0[t] * nb + b], dq1 = sc[(u64)tok1[t] * nb + b];
+            acc[t][0] = __fadd_rn(acc[t][0], iq_block_value<T>(da, dmina, dq0, S[t][0], Ms[t][0]));
+            acc[t][1] = __fadd_rn(acc[t][1], iq_block_value<T>(da, dmina, dq1, S[t][1], Ms[t][1]));
+            acc[t][2] = __fadd_rn(acc[t][2], iq_block_value<T>(db, dminb, dq0, S[t][2], Ms[t][2]));
+            acc[t][3] = __fadd_rn(acc[t][3], iq_block_value<T>(db, dminb, dq1, S[t][3], Ms[t][3]));
+        }
+    }
+    float* out = F(4);
+    const u64 ostride = DOWN ? E : 2 * ff;
+    for (u32 t = 0; t < ngr; ++t) {
+        const u32 mi = m0 + 8 * t;
+        if (mi + 2 * q < M) {
+            const u32 kk = sel[mi + 2 * q];
+            out[(u64)kk * ostride + ra] = acc[t][0];
+            if (has_b) out[(u64)kk * ostride + rb] = acc[t][2];
+        }
+        if (mi + 2 * q + 1 < M) {
+            const u32 kk = sel[mi + 2 * q + 1];
+            out[(u64)kk * ostride + ra] = acc[t][1];
+            if (has_b) out[(u64)kk * ostride + rb] = acc[t][3];
+        }
+    }
+}
+extern "C" __global__ void __launch_bounds__(128) qx_moe_gateup_mma_iq2_s(const u64* info) { moe_mma_t<QX_IQ2_S, false>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_gateup_mma_iq2_xxs(const u64* info) { moe_mma_t<QX_IQ2_XXS, false>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_gateup_mma_iq2_xs(const u64* info) { moe_mma_t<QX_IQ2_XS, false>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_gateup_mma_iq3_xxs(const u64* info) { moe_mma_t<QX_IQ3_XXS, false>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_gateup_mma_iq1_s(const u64* info) { moe_mma_t<QX_IQ1_S, false>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_gateup_mma_q2_k(const u64* info) { moe_mma_t<QX_Q2_K, false>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_gateup_mma_iq3_s(const u64* info) { moe_mma_t<QX_IQ3_S, false>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_down_mma_iq2_s(const u64* info) { moe_mma_t<QX_IQ2_S, true>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_down_mma_iq3_s(const u64* info) { moe_mma_t<QX_IQ3_S, true>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_down_mma_iq2_xxs(const u64* info) { moe_mma_t<QX_IQ2_XXS, true>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_down_mma_iq2_xs(const u64* info) { moe_mma_t<QX_IQ2_XS, true>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_down_mma_iq3_xxs(const u64* info) { moe_mma_t<QX_IQ3_XXS, true>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_down_mma_iq1_s(const u64* info) { moe_mma_t<QX_IQ1_S, true>(info); }
+extern "C" __global__ void __launch_bounds__(128) qx_moe_down_mma_q2_k(const u64* info) { moe_mma_t<QX_Q2_K, true>(info); }

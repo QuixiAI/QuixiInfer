@@ -1538,12 +1538,15 @@ impl<'a> DsEngine<'a> {
             for (name, info) in [
                 (format!("qx_moe_gateup_grp_{gsuf}"), vec![word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 1, cb.sel.ptr]),
                 (format!("qx_moe_down_grp_{dsuf}"), vec![word, cb.hq.ptr, cb.hd.ptr, 0, cb.out.ptr, ff as u64, E as u64, 0, ex.down_row_bytes as u64, cb.sel.ptr, 1]),
+                (format!("qx_moe_gateup_mma_{gsuf}"), vec![word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 1, cb.sel.ptr]),
+                (format!("qx_moe_down_mma_{dsuf}"), vec![word, cb.hq.ptr, cb.hd.ptr, 0, cb.out.ptr, ff as u64, E as u64, 0, ex.down_row_bytes as u64, cb.sel.ptr, 1]),
                 (format!("qx_moe_gateup_grpb_{gsuf}"), vec![0, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 0, cb.warm_desc.ptr, 1]),
                 (format!("qx_moe_down_grpb_{dsuf}"), vec![0, cb.hq.ptr, cb.hd.ptr, 0, cb.out.ptr, ff as u64, E as u64, 0, ex.down_row_bytes as u64, cb.warm_desc.ptr, 1]),
                 (format!("qx_moe_gateup_q8k_{gsuf}_w20_sel"), vec![word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, 0, cb.sel.ptr]),
                 (format!("qx_moe_down_q8k_{dsuf}_sel"), vec![word, cb.gu.ptr, 0, 0, cb.out.ptr, ff as u64, E as u64, 0, ex.down_row_bytes as u64, cb.sel.ptr]),
             ] {
-                self.gpu.run(MOE.kernel(static_name(name), CubeDim::new_1d(256)), (1, 1, 1), &info);
+                let threads = if name.contains("_mma_") { 128 } else { 256 };
+                self.gpu.run(MOE.kernel(static_name(name), CubeDim::new_1d(threads)), (1, 1, 1), &info);
             }
         }
         self.gpu.run(MOE.kernel("qx_moe_wait_word", CubeDim::new_1d(1)), (1, 1, 1), &[word, 1]);
@@ -1735,8 +1738,11 @@ impl<'a> DsEngine<'a> {
             // QX_DS_CHUNK_GROUPED=0: the per-selection kernels (each selection re-reads its expert) instead of the
             // grouped ones (a weight block decoded once per warp for up to 8 rows; bit-identical)
             let grouped = !std::env::var("QX_DS_CHUNK_GROUPED").is_ok_and(|v| v == "0");
-            let kg = static_name(if grouped { format!("qx_moe_gateup_grp_{gsuf}") } else { format!("qx_moe_gateup_q8k_{gsuf}_w20_sel") });
-            let kd = static_name(if grouped { format!("qx_moe_down_grp_{dsuf}") } else { format!("qx_moe_down_q8k_{dsuf}_sel") });
+            // QX_DS_CHUNK_MMA=0: the grouped CUDA-core kernels instead of the int8 tensor-core ones (both exact)
+            static MMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let mma = grouped && *MMA.get_or_init(|| !std::env::var("QX_DS_CHUNK_MMA").is_ok_and(|v| v == "0"));
+            let kg = static_name(if mma { format!("qx_moe_gateup_mma_{gsuf}") } else if grouped { format!("qx_moe_gateup_grp_{gsuf}") } else { format!("qx_moe_gateup_q8k_{gsuf}_w20_sel") });
+            let kd = static_name(if mma { format!("qx_moe_down_mma_{dsuf}") } else if grouped { format!("qx_moe_down_grp_{dsuf}") } else { format!("qx_moe_down_q8k_{dsuf}_sel") });
             let mut n_used = 0usize;
             // QX_DS_CHUNK_BATCH=B (default 0 = one launch set per expert): the batched grouped kernels take B
             // experts per launch, each block waiting on its own expert's word. Measured slower at 16 (2026-11-06:
@@ -1786,7 +1792,12 @@ impl<'a> DsEngine<'a> {
                     let word = cb.slots_tbl[l % 2].ptr + 8 * e as u64;
                     let sl = cb.sel.ptr + (offs[e] * 4) as u64;
                     self.gpu.run(MOE.kernel("qx_moe_wait_word", CubeDim::new_1d(1)), (1, 1, 1), &[word, generation]);
-                    if grouped {
+                    if mma {
+                        let passes = m.div_ceil(64);
+                        self.gpu.run(MOE.kernel(kg, CubeDim::new_1d(128)), (((2 * ff) as u32).div_ceil(64), passes, 1), &[word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, m as u64, sl]);
+                        self.gpu.run(MOE.kernel("qx_moe_quant_h_sel", CubeDim::new_1d(256)), (m, 1, 1), &[cb.gu.ptr, bits(clamp_exp[l]), cb.hq.ptr, cb.hd.ptr, ff as u64, sl, m as u64]);
+                        self.gpu.run(MOE.kernel(kd, CubeDim::new_1d(128)), ((E as u32).div_ceil(64), passes, 1), &[word, cb.hq.ptr, cb.hd.ptr, 0, cb.out.ptr, ff as u64, E as u64, (2 * gb) as u64, ex.down_row_bytes as u64, sl, m as u64]);
+                    } else if grouped {
                         let groups = m.div_ceil(8);
                         self.gpu.run(MOE.kernel(kg, CubeDim::new_1d(256)), (((2 * ff) as u32).div_ceil(8), groups, 1), &[word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, m as u64, sl]);
                         self.gpu.run(MOE.kernel("qx_moe_quant_h_sel", CubeDim::new_1d(256)), (m, 1, 1), &[cb.gu.ptr, bits(clamp_exp[l]), cb.hq.ptr, cb.hd.ptr, ff as u64, sl, m as u64]);
