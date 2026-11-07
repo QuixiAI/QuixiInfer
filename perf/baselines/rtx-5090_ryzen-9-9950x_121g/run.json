@@ -1,23 +1,12 @@
 {
   "schema": 1,
-  "label": "setd-chunk",
-  "date": "2026-11-07T04:38:54",
+  "label": "setd-split4",
+  "date": "2026-11-07T12:28:22",
   "git": {
-    "commit": "0dad410",
-    "dirty": true,
-    "modified": [
-      "M crates/qx-engine/src/dsv41/mod.rs",
-      " M crates/qx-engine/src/ops.rs",
-      " M crates/qx-serve/src/main.rs",
-      " M crates/qx-serve/src/worker_ds.rs",
-      " M handoff.md",
-      " M kernels/mgemv.cu",
-      " M perf/backlog.md",
-      " M perf/findings.md",
-      " M perf/harness/bench.sh",
-      " M perf/optimization_status.md"
-    ],
-    "diff_sha": "580ba849bffb"
+    "commit": "0ced38e",
+    "dirty": false,
+    "modified": [],
+    "diff_sha": null
   },
   "host": {
     "gpu": "NVIDIA GeForce RTX 5090",
@@ -42,10 +31,10 @@
   "repeats": 3,
   "correctness": "pass",
   "commands": [
-    "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_LOAD_STATE=perf/states/wiki256k-262144.state QX_DS_PROFILE=perf/states/wiki256k-262144.profile target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/wiki256k.tokens 262208",
+    "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_LOAD_STATE=perf/states/wiki256k-262144.state target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/wiki256k.tokens 262208",
     "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_RAM=95 QX_SCHED_STATS=1 target/release/quixiinfer serve --model /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf --pack /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp --ctx 262144 --slots 3 --window 128 --host 127.0.0.1 --port 8089 ; python3 tools/loadgen.py --url http://127.0.0.1:8089/v1 --levels 1,3 --rounds 2 --max-tokens 256 --temperature 0 --warmup 6",
     "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_RAM=95 QX_SCHED_STATS=1 target/release/quixiinfer serve --model /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf --pack /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp --ctx 8192 --slots 3 --window 128 --host 127.0.0.1 --port 8089 ; python3 tools/loadgen.py --url http://127.0.0.1:8089/v1 --levels 1,3 --rounds 2 --max-tokens 256 --temperature 0 --warmup 6",
-    "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_WINDOW=128 QX_DS_SKIP=1 QX_DS_CHUNK=4096 QX_DS_LOAD_STATE=perf/states/wiki256k-245760.state QX_DS_PROFILE=perf/states/wiki256k-245760.profile target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/wiki256k.tokens 262144",
+    "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_WINDOW=128 QX_DS_SKIP=1 QX_DS_CHUNK=8192 QX_DS_LOAD_STATE=perf/states/wiki256k-245760.state target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/wiki256k.tokens 262144",
     "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_WINDOW=128 target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/route1k.tokens 1024",
     "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/route1k.tokens 1024"
   ]
