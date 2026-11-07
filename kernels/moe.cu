@@ -1091,13 +1091,14 @@ extern "C" __global__ void qx_moe_q8k_rows(const u64* info) {
 /// needs), so one launch covers a batch of experts with no empty blocks.
 template <int T, int NB, int MB, bool BATCH = false> QX_DEV void gateup_grp_t(const u64* info) {
     u64 slot_word, sel_addr;
-    u32 M, m0;
+    u32 M, m0, lbase;  // lbase: the group's place in the expert's list (the scratch index of its first row)
     if constexpr (BATCH) {
         const u64* desc = reinterpret_cast<const u64*>(info[9]) + 4 * blockIdx.y;
         slot_word = desc[0];
         sel_addr = desc[1];
         M = (u32)desc[2];
         m0 = 0;
+        lbase = (u32)desc[3];
         const u64 gen = info[10];
         while ((ld_acquire_sys(reinterpret_cast<const u64*>(slot_word)) >> 48) != gen) {
         }
@@ -1106,6 +1107,7 @@ template <int T, int NB, int MB, bool BATCH = false> QX_DEV void gateup_grp_t(co
         sel_addr = info[9];
         M = U(8);
         m0 = blockIdx.y * MB;
+        lbase = m0;
     }
     const u64 slot = *reinterpret_cast<const volatile u64*>(slot_word) & QX_SLOT_MASK;
     if (slot == 0) return;
@@ -1144,7 +1146,7 @@ template <int T, int NB, int MB, bool BATCH = false> QX_DEV void gateup_grp_t(co
     if (lane == 0) {
 #pragma unroll
         for (u32 mi = 0; mi < MB; ++mi) {
-            if (mi < mn) F(4)[(u64)sel[m0 + mi] * 2 * ff + r] = acc[mi];
+            if (mi < mn) F(4)[(u64)(lbase + mi) * 2 * ff + r] = acc[mi];
         }
     }
 }
@@ -1170,7 +1172,8 @@ extern "C" __global__ void qx_moe_quant_h_sel(const u64* info) {
     __shared__ float av[256];
     __shared__ u32 ai[256];
     const u32 ff = U(4), nb = ff / 256;
-    const u32 kk = reinterpret_cast<const u32*>(info[5])[blockIdx.x];
+    // by the selection's place in the expert's list ([5], the list, is kept for the per-selection fallback's layout)
+    const u32 kk = blockIdx.x;
     const float* gu = CF(0) + (u64)kk * 2 * ff;
     const float c = __uint_as_float((u32)info[1]);
     i8* hq = reinterpret_cast<i8*>(info[2]) + (u64)kk * ff;
@@ -1212,13 +1215,14 @@ extern "C" __global__ void qx_moe_quant_h_sel(const u64* info) {
 /// Grid (ceil(E / 8), ceil(M / MB)), 256 threads.
 template <int T, int MB, bool BATCH = false> QX_DEV void down_grp_t(const u64* info) {
     u64 slot_word, sel_addr;
-    u32 M, m0;
+    u32 M, m0, lbase;
     if constexpr (BATCH) {
         const u64* desc = reinterpret_cast<const u64*>(info[9]) + 4 * blockIdx.y;
         slot_word = desc[0];
         sel_addr = desc[1];
         M = (u32)desc[2];
         m0 = 0;
+        lbase = (u32)desc[3];
         const u64 gen = info[10];
         while ((ld_acquire_sys(reinterpret_cast<const u64*>(slot_word)) >> 48) != gen) {
         }
@@ -1227,6 +1231,7 @@ template <int T, int MB, bool BATCH = false> QX_DEV void down_grp_t(const u64* i
         sel_addr = info[9];
         M = U(10);
         m0 = blockIdx.y * MB;
+        lbase = m0;
     }
     const u64 slot = *reinterpret_cast<const volatile u64*>(slot_word) & QX_SLOT_MASK;
     if (slot == 0) return;
@@ -1240,9 +1245,9 @@ template <int T, int MB, bool BATCH = false> QX_DEV void down_grp_t(const u64* i
     const i8* hq = reinterpret_cast<const i8*>(info[1]);
     const float* hd = CF(2);
     const u8* row = reinterpret_cast<const u8*>(slot) + info[7] + (u64)r * info[8];
-    u32 kk[MB];
+    u32 kk[MB], li[MB];
 #pragma unroll
-    for (u32 mi = 0; mi < MB; ++mi) kk[mi] = mi < mn ? sel[m0 + mi] : 0;
+    for (u32 mi = 0; mi < MB; ++mi) { kk[mi] = mi < mn ? sel[m0 + mi] : 0; li[mi] = lbase + (mi < mn ? mi : 0); }
     float acc[MB];
 #pragma unroll
     for (u32 mi = 0; mi < MB; ++mi) acc[mi] = 0.f;
@@ -1251,12 +1256,12 @@ template <int T, int MB, bool BATCH = false> QX_DEV void down_grp_t(const u64* i
 #pragma unroll
         for (u32 mi = 0; mi < MB; ++mi) {
             if (mi < mn) {
-                const int2 a = *reinterpret_cast<const int2*>(hq + (u64)kk[mi] * ff + b * 256 + 8 * lane);
+                const int2 a = *reinterpret_cast<const int2*>(hq + (u64)li[mi] * ff + b * 256 + 8 * lane);
                 int sum = 0, msum = 0;
                 iq_dot<T>(dc, a, sum, msum);
 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xffffffffu, sum, o); msum += __shfl_xor_sync(0xffffffffu, msum, o); }
-                acc[mi] = __fadd_rn(acc[mi], iq_block_value<T>(dc.d, dc.dmin, hd[(u64)kk[mi] * nb + b], sum, msum));
+                acc[mi] = __fadd_rn(acc[mi], iq_block_value<T>(dc.d, dc.dmin, hd[(u64)li[mi] * nb + b], sum, msum));
             }
         }
     }
@@ -1328,11 +1333,13 @@ template <int T, bool DOWN> QX_DEV void moe_mma_t(const u64* info) {
     for (u32 t = 0; t < 8; ++t) {
         const u32 mi = m0 + 8 * t;
         const u32 kl = mi + g < M ? sel[mi + g] : sel[M - 1];
-        tokl[t] = DOWN ? kl : kl / k;
+        tokl[t] = kl / k;
+        // gate/up: activations and scales per token; down: the quantized hidden rows per list position (the
+        // scratch `qx_moe_quant_h_sel` fills, indexed by the selection's place in the expert's list, not by kk)
         const u32 k0 = mi + 2 * q < M ? sel[mi + 2 * q] : 0, k1 = mi + 2 * q + 1 < M ? sel[mi + 2 * q + 1] : 0;
-        tok0[t] = DOWN ? k0 : k0 / k;
-        tok1[t] = DOWN ? k1 : k1 / k;
-        abase[t] = (u64)tokl[t] * K;
+        tok0[t] = DOWN ? min(mi + 2 * q, M - 1) : k0 / k;
+        tok1[t] = DOWN ? min(mi + 2 * q + 1, M - 1) : k1 / k;
+        abase[t] = (u64)(DOWN ? min(mi + g, M - 1) : tokl[t]) * K;
     }
     float acc[8][4];
 #pragma unroll
@@ -1404,19 +1411,20 @@ template <int T, bool DOWN> QX_DEV void moe_mma_t(const u64* info) {
             acc[t][3] = __fadd_rn(acc[t][3], iq_block_value<T>(db, dminb, dq1, S[t][3], Ms[t][3]));
         }
     }
+    // gate/up land in the per-pass scratch by list position; down lands in the per-selection output by kk
     float* out = F(4);
     const u64 ostride = DOWN ? E : 2 * ff;
     for (u32 t = 0; t < ngr; ++t) {
         const u32 mi = m0 + 8 * t;
         if (mi + 2 * q < M) {
-            const u32 kk = sel[mi + 2 * q];
-            out[(u64)kk * ostride + ra] = acc[t][0];
-            if (has_b) out[(u64)kk * ostride + rb] = acc[t][2];
+            const u64 o = DOWN ? sel[mi + 2 * q] : mi + 2 * q;
+            out[o * ostride + ra] = acc[t][0];
+            if (has_b) out[o * ostride + rb] = acc[t][2];
         }
         if (mi + 2 * q + 1 < M) {
-            const u32 kk = sel[mi + 2 * q + 1];
-            out[(u64)kk * ostride + ra] = acc[t][1];
-            if (has_b) out[(u64)kk * ostride + rb] = acc[t][3];
+            const u64 o = DOWN ? sel[mi + 2 * q + 1] : mi + 2 * q + 1;
+            out[o * ostride + ra] = acc[t][1];
+            if (has_b) out[o * ostride + rb] = acc[t][3];
         }
     }
 }

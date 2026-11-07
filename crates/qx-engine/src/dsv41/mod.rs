@@ -715,6 +715,7 @@ impl<'a> DsEngine<'a> {
         // QX_DS_CHUNK=N: the chunk path's buffers for N rows (before the tiers take the rest of the VRAM)
         let chunk = std::env::var("QX_DS_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).map(|rows| {
             let k = cfg.n_expert_used;
+            let sel_fallback = std::env::var("QX_DS_CHUNK_GROUPED").is_ok_and(|v| v == "0");
             ChunkBufs {
                 rows,
                 r: buf(rows * hcd),
@@ -727,7 +728,10 @@ impl<'a> DsEngine<'a> {
                 wts: buf(rows * k),
                 xq: DeviceBuf::new(rows * E),
                 xd: buf(rows * (E / 256)),
-                gu: buf(rows * k * 2 * cfg.ff_exp),
+                // gate/up and the quantized hidden rows are a per-pass scratch indexed by a selection's place in
+                // its expert's list (at most `rows` of them in one pass); only the per-selection fallback
+                // (QX_DS_CHUNK_GROUPED=0) indexes them by selection id and needs k times as much
+                gu: buf(rows * if sel_fallback { k } else { 1 } * 2 * cfg.ff_exp),
                 out: buf(rows * k * E),
                 tok: buf(rows),
                 pos: buf(rows),
@@ -738,8 +742,8 @@ impl<'a> DsEngine<'a> {
                 sels: (0..cfg.n_layer).map(|l| (cfg.topk_src[l] == l as i32).then(|| (buf(cfg.idx_top_k * rows), buf(rows)))).collect(),
                 cand_sel: buf(cfg.cand_blocks.max(1) * rows),
                 cand_count: buf(rows),
-                hq: DeviceBuf::new(rows * k * cfg.ff_exp),
-                hd: buf(rows * k * (cfg.ff_exp / 256)),
+                hq: DeviceBuf::new(rows * if sel_fallback { k } else { 1 } * cfg.ff_exp),
+                hd: buf(rows * if sel_fallback { k } else { 1 } * (cfg.ff_exp / 256)),
                 warm_word: DeviceBuf::from_slice(&[1u64 << 48]),
                 warm_desc: DeviceBuf::new(32),
                 bdesc: DeviceBuf::new(rows * k * 32),
@@ -1754,6 +1758,9 @@ impl<'a> DsEngine<'a> {
             // 8.4 against 7.0 ms per token at 2048 rows), kept for the record.
             static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
             let batch = *BATCH.get_or_init(|| std::env::var("QX_DS_CHUNK_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+            // (the batched path's h quantizer runs over a batch's contiguous list range, which the per-pass scratch
+            // layout does not hold: the path is off unless the per-selection buffers were allocated)
+            let batch = if std::env::var("QX_DS_CHUNK_GROUPED").is_ok_and(|v| v == "0") { batch } else { 0 };
             if grouped && batch > 0 {
                 let kgb = static_name(format!("qx_moe_gateup_grpb_{gsuf}"));
                 let kdb = static_name(format!("qx_moe_down_grpb_{dsuf}"));
@@ -1766,7 +1773,7 @@ impl<'a> DsEngine<'a> {
                     first_entry.push(desc.len() / 4);
                     let m = lists[e].len();
                     for g in (0..m).step_by(8) {
-                        desc.extend_from_slice(&[cb.slots_tbl[l % 2].ptr + 8 * e as u64, cb.sel.ptr + ((offs[e] + g) * 4) as u64, (m - g).min(8) as u64, 0]);
+                        desc.extend_from_slice(&[cb.slots_tbl[l % 2].ptr + 8 * e as u64, cb.sel.ptr + ((offs[e] + g) * 4) as u64, (m - g).min(8) as u64, g as u64]);
                     }
                 }
                 first_entry.push(desc.len() / 4);
