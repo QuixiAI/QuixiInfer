@@ -66,12 +66,15 @@ fn load(args: &[String]) -> Result<(mpsc::Sender<Job>, &'static qx_tok::Tok, cha
             _ => profile,
         };
         let slots: usize = arg(args, "--slots").map(|s| s.parse()).transpose()?.unwrap_or(2);
-        // the chunk path for long prompts (worker_ds: prompt-only steps go through forward_chunk): 2048 rows by
-        // default on servers with 32k of context or more (its buffers come off the VRAM expert tier, about 0.9 GB
-        // at 2048); QX_DS_CHUNK overrides (0 or empty: off)
+        // the chunk path for long prompts (worker_ds: prompt-only steps go through forward_chunk): 4096 rows by
+        // default on servers with 32k of context or more; its buffers come off the VRAM expert tier. Measured at
+        // ctx 262144 with 3 slots (2026-11-07, chunk17): time to first token on a 13.5k-token prompt 47.7 s at
+        // 2048, 43.8 at 4096, 37.3 at 8192; decode under 3 streams 108.3 / 109.5 / 112.6 ms per token (VRAM left
+        // to the tiers 11.7 / 11.1 / 10.0 GiB). 4096 takes the prompt win with decode inside its spread; 8192 costs
+        // decode 3.9% and is a QX_DS_CHUNK choice for prompt-heavy use (0 or empty: off)
         if std::env::var_os("QX_DS_CHUNK").is_none() && ctx >= 32768 {
             // SAFETY: before the engine thread starts (single-threaded here); the engine reads it at load
-            unsafe { std::env::set_var("QX_DS_CHUNK", "2048") };
+            unsafe { std::env::set_var("QX_DS_CHUNK", "4096") };
         }
         let chunk = std::env::var("QX_DS_CHUNK").ok().filter(|v| !v.is_empty() && v != "0");
         eprintln!("quixiinfer: loading DeepSeek-V4.1-Flash (context {ctx}, {slots} slots, prompt windows of {window}{}, tiers ranked by {})", chunk.as_deref().map(|c| format!(", prompt chunks of {c}")).unwrap_or_default(), profile.as_deref().unwrap_or("layer order"));
