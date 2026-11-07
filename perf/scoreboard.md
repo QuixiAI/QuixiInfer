@@ -49,7 +49,8 @@ Harness-recorded scores:
 | 2026-11-06 | 34.321 | decode 33.00 prefill64 12.40 long16k 37.30 serve3 90.91 | rtx-5090_ryzen-9-9950x_121g | 4e782fb+wt | pass | set B at the serve tier 95 GiB (settings change: serve3 90.9 against 95.2 at 90; decode, prefill64 and long16k within noise of the first set B row) |
 | 2026-11-06 | 34.621 | decode 34.00 prefill128 11.00 long16k 38.80 serve3 99.01 | rtx-5090_ryzen-9-9950x_121g | b543bce+wt | pass | set C (first row): the 128-token chunk with share 8/8 and cap 256 as defaults (the user's decision); prefill128 11.0 against prefill64 12.4 at set B; serve3 99.0 against 90.9 at set B (the staging area's VRAM); decode and long16k (now windows of 128) within noise |
 
-- 2026-11-06, set D: no baseline row yet. The states the set D cases resume from are being regenerated (rings in
-  the state file, the tier ranking beside it; see the notebook's "The set D cases resume into a cold tier"). The
-  first 256k win is recorded from its A/B instead: `qx_ds_idx_score2`, decode256k 56.6 → 43.6, prefill256k
-  34.5 → 23.2 ms per token (notebook, "the indexer scorer with the queries in shared memory").
+- 2026-11-07, set D first row (49.601): taken after the states were regenerated with rings (exact resume) and the
+  tier ranking beside them. `qx_ds_idx_score2` (decode256k 56.6 → 43.6, prefill256k 34.5 → 23.2 in its A/B) and
+  the layer skip landed before this row, so the row already includes them; the saved ranking is a worse placement
+  for the decode tail than the golden profile (52.5 against 46.1; notebook 2026-11-07).
+| 2026-11-07 | 49.601 | decode256k 52.50 prefill256k 21.50 serve256k3 108.11 | rtx-5090_ryzen-9-9950x_121g | 642433a+wt | pass | set D (first row): decode256k, prefill256k, serve256k3 scored; decode, prefill128, serve3 kept as guards. The cases resume from the regenerated states (rings, exact) with the saved tier ranking (QX_DS_PROFILE); prefill256k and long16k opt into the layer skip. Not comparable with sets A-C. decode256k 52.5 here against 43.6 in the idx2 A/B: the saved ranking is a worse placement for the decode tail than the golden profile (46.1 without it; notebook) |
