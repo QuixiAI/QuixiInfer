@@ -72,11 +72,9 @@ TOKENS=perf/data/route1k.tokens
 TOKENS16K=perf/data/route16k.tokens
 TOKENS256K=perf/data/wiki256k.tokens
 STATES=perf/states   # the saved 256k states the set D cases resume from (perf/states/README.md)
-# the tier ranking the pass had reached at each state (written beside it since 2026-11-06): a resume that loads it
-# measures the warm placement, not 16k tokens of adaptation from the static profile. Empty when the state predates it.
-PROF245760=""; PROF262144=""
-if [ -e $STATES/wiki256k-245760.profile ]; then PROF245760="QX_DS_PROFILE=$STATES/wiki256k-245760.profile"; fi
-if [ -e $STATES/wiki256k-262144.profile ]; then PROF262144="QX_DS_PROFILE=$STATES/wiki256k-262144.profile"; fi
+# The 256k resume cases rank the tiers by the golden profile (the engine's default, the server's): the ranking
+# qx-ds-check writes beside a state (the prompt's own hot set) measured 10.7% worse for the decode tail and the
+# same for the chunked prefill (notebook 2026-11-07), so it is kept for the record and not loaded here.
 B=target/release/qx-ds-check
 SERVER=target/release/quixiinfer
 PORT=${QX_PERF_PORT:-8089}
@@ -146,8 +144,8 @@ fi
 declare -A ARGS=( [decode]="" [prefill64]="QX_DS_WINDOW=64" [prefill32]="QX_DS_WINDOW=32" [prefill128]="QX_DS_WINDOW=128"
                   [prefill2]="QX_DS_WINDOW=2" [prefill4]="QX_DS_WINDOW=4" [prefill8]="QX_DS_WINDOW=8"
                   [long16k]="QX_DS_WINDOW=128 QX_DS_TAIL=64 QX_DS_SKIP=1 QX_DS_CHUNK=4096" [serve]="" [serve256k]=""
-                  [decode256k]="QX_DS_LOAD_STATE=$STATES/wiki256k-262144.state $PROF262144"
-                  [prefill256k]="QX_DS_WINDOW=128 QX_DS_SKIP=1 QX_DS_CHUNK=4096 QX_DS_LOAD_STATE=$STATES/wiki256k-245760.state $PROF245760" )
+                  [decode256k]="QX_DS_LOAD_STATE=$STATES/wiki256k-262144.state"
+                  [prefill256k]="QX_DS_WINDOW=128 QX_DS_SKIP=1 QX_DS_CHUNK=8192 QX_DS_LOAD_STATE=$STATES/wiki256k-245760.state" )
 declare -A TOKF=( [long16k]="$TOKENS16K" [decode256k]="$TOKENS256K" [prefill256k]="$TOKENS256K" )
 declare -A COUNT=( [long16k]=16384 [decode256k]=262208 [prefill256k]=262144 )
 declare -A TMO=( [long16k]=2400 [decode256k]=900 [prefill256k]=1500 )
