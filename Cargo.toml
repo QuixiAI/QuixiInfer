@@ -19,3 +19,8 @@ anyhow = "1"
 [profile.release]
 debug = 1
 codegen-units = 16
+
+# a patched copy of cubecl-cuda 0.11.3: the launch metadata cache's capacity from QX_INFO_CACHE_ENTRIES (third_party/cubecl-cuda,
+# one change in src/compute/stream.rs; see perf/optimization_status.md 2026-11-07, "launch-bound")
+[patch.crates-io]
+cubecl-cuda = { path = "third_party/cubecl-cuda" }
