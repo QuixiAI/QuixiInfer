@@ -194,6 +194,14 @@ invented one. The aggregate score lives in `scoreboard.md`.
   (the `g_x` group's small segments, the hc mixes) can ride along to clear 8%. **Blocked the same day:** the
   one-launch version built but its PTX took the driver's JIT more than 12 minutes at module load (notebook, "stalled
   in the driver's PTX JIT"); time `ptxas` offline before touching `mgemv.cu` again.
+- **Mechanics, read 2026-11-07:** CubeCL 0.11 compiles the *whole* flattened module to PTX with NVRTC for every
+  kernel id and loads it with `cuModuleLoadData`, so the driver runs ptxas over all of `mgemv.cu` (25 entries) or
+  `moe.cu` (93) once per PTX hash and caches the result in `~/.nv/ComputeCache`; that cache is capped at 1 GiB by
+  default and the engine's variants evicted each other (a binary swap cost 20 minutes before its first step;
+  `bench.sh` now exports `CUDA_CACHE_MAXSIZE=4294967296`). A CubeCL-compatible fix for the first-use cost: have
+  `CudaSource::source` return the module with every *other* `extern "C" __global__` body stripped (brace-matched),
+  so each kernel id's PTX holds one instance and a run pays ptxas only for the entries it launches; the server's
+  warm-up still pays for all of them. Tooling, not the 256k target: do it on a quiet day with a ds-checks run.
 - **Kill criteria:** achieved bandwidth already above 70% of peak on the shapes that carry the time, or any
   change that breaks `tools/ds-checks.sh` line 3.
 
