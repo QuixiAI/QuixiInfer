@@ -34,10 +34,16 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   `bench.sh` exports `CUDA_CACHE_MAXSIZE=4294967296` because the driver's 1 GiB JIT cache evicted the engine's
   modules and a binary swap paid 20 minutes of ptxas (memory note `cuda-jit-cache`); the mechanics (CubeCL loads
   the whole module's PTX per kernel) and the per-entry PTX split idea are in the backlog.
-- **Next levers, in order:** (1) the server's chunk size (2048 → 4096/8192) by serve256k A/B; (2) a decode-side
-  A/B of chunk9 against chunk17 to see whether the last 2% of decode is real and where; (3) the dense slab passes
-  (attention sharing a slab's keys; `qx_mgemv_t8z` at 40% of the chunk's GPU time wants a tiled exact kernel);
-  (4) the chunk path beside decoders in the server; (5) first-use JIT (per-entry PTX or shipped cubins).
+- **Afternoon:** the server's default prompt chunk at ctx ≥ 32k is 4096 (42c23e7; time to first token on 13.5k
+  tokens 47.7 → 43.8 s at 256k context with 3 slots, three-stream decode within spread; 8192 would be 37.3 s but
+  costs serve256k3 3.9%, kept as `QX_DS_CHUNK=8192`). Decode pairs chunk9 against chunk17 in one session: 33.5/32.7
+  against 32.8/32.9, prefill128 11.7 against 11.0: the split is level with the pre-groups kernel on decode and
+  ahead on windows; the morning's "2% left" was the session. Decode numbers differ 2-3% between sessions: pair
+  within a session. `~/qx-bins/chunk18` = the tree with the 4096 default (built after the pairs).
+- **Next levers, in order:** (1) the dense slab passes (attention sharing a slab's keys; `qx_mgemv_t8z` at 40% of
+  the chunk's GPU time wants a tiled exact kernel); (2) the chunk path beside decoders in the server (a prompt
+  arriving while others decode still runs windows); (3) a chunk size from the VRAM headroom after the context and
+  slots are placed, instead of a fixed default; (4) first-use JIT (per-entry PTX or shipped cubins).
 - Operational: every chain script in the scratchpad installs binaries into `target/release` atomically and runs
   `bench.sh --no-build`; `~/qx-bins/chunk17` is the landed tree (0ced38e). Killing a chain by PID leaves its
   bench/engine child running: kill the child too. A chain renamed with `sed` kept bare binary numbers in a loop
