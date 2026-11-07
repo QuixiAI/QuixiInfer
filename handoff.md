@@ -10,9 +10,10 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
 ## Update 2026-11-07, noon: set D promoted at 34.447; the GEMV's register story; the 256k cases re-based
 
 - **Scoreboard:** the chunk-path tree (6d8ce02) is the baseline, score 49.601 → **34.447** (prefill256k 21.5 →
-  6.8 in 4096-row chunks, exact). Promoted; `perf/baselines/` committed. A set D `--check` run on the final tree
-  of the day (`~/qx-bins/chunk17`, label `setd-split4`, started 11:50) is in flight: record it as the next row
-  with the note that the cases changed (below).
+  6.8 in 4096-row chunks, exact). Then the set D `--check` run on the final tree (0ced38e, `~/qx-bins/chunk17`,
+  label `setd-split4`): **31.470**, promoted (d6cfb45): decode256k 46.4 (golden profile), prefill256k 6.2
+  (8192-row chunks), serve256k3 108.3 (the GEMV split), every guard at or better than before. Two of the three
+  scored wins are case settings, said so on the scoreboard.
 - **The decode-side drift explained and mostly undone:** every decode case was +1 to +4.7% on the promoted tree.
   Cause: the in-block group loop in the shared `mgemv` template took the width 1-3 entries from 80 to 128
   registers (ptxas `--resource-usage` across four versions of `mgemv.cu`: notebook). Landed (0ced38e): two kernel
