@@ -14,6 +14,8 @@ use std::sync::Arc;
 pub struct Shared {
     pub mb: HostMapped,
     pub stop: AtomicBool,
+    /// The arena's flex tail size (0: none, and then nothing need hold it).
+    pub flex_bytes: usize,
     /// The chunk path's request for the arena's flex tail: wanted (a prompt runs in chunks) or not; the request
     /// counter and the driver's acknowledgement of the last applied request.
     pub flex_want: AtomicBool,
@@ -149,6 +151,7 @@ impl Driver {
             mb: HostMapped::new(mailbox::mb_bytes(host.n_embd)),
             stop: AtomicBool::new(false),
             flex_want: AtomicBool::new(false),
+            flex_bytes: host.flex_bytes,
             flex_req: AtomicU64::new(0),
             flex_ack: AtomicU64::new(0),
             vram_hits: Default::default(),

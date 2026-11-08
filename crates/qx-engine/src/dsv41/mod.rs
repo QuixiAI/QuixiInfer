@@ -1567,6 +1567,15 @@ impl<'a> DsEngine<'a> {
     /// a run on 2026-11-06). Every launch sees "slot 0" and returns; the wait sees its generation at once.
     /// Asks the driver for the arena's flex tail (the chunk buffers live there) and waits until its records are out
     /// of the VRAM table on host and device. A no-op without the tiers or when already held.
+    /// Every writer of the chunk buffers must hold the arena's flex tail (else it writes live expert records).
+    fn assert_flex_held(&self, who: &str) {
+        if let Some(d) = self.driver.as_ref() {
+            if d.shared.flex_bytes > 0 {
+                assert!(d.shared.flex_want.load(std::sync::atomic::Ordering::Acquire), "{who}: the chunk buffers written without the flex tail held");
+            }
+        }
+    }
+
     fn flex_enter(&self) {
         let Some(d) = self.driver.as_ref() else { return };
         let sh = &d.shared;
@@ -1601,6 +1610,7 @@ impl<'a> DsEngine<'a> {
         // (a no-op inside a chunk pass, which holds it already). The server's warm-up ran this without it on
         // 2026-11-08 and corrupted the coldest records at start-up; the caller releases the tail after.
         self.flex_enter();
+        self.assert_flex_held("chunk_warm");
         let d = self.driver.as_ref().unwrap().shared.clone();
         let cb = self.chunk.as_ref().unwrap();
         let (k, ff) = (self.cfg.n_expert_used, self.cfg.ff_exp);
@@ -1697,6 +1707,7 @@ impl<'a> DsEngine<'a> {
         // QX_RAW_LAUNCH=1: this pass's launches through the driver API on CubeCL's stream (qx_gpu::raw)
         let _raw = qx_gpu::raw::Scope::enter();
         self.flex_enter();
+        self.assert_flex_held("forward_chunk_opt");
         self.chunk_warm();
         // the chunk arrays and the Engram rows of every row
         {
