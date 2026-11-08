@@ -42,11 +42,18 @@ rejected (67.8 ms); the 256k decode wait is the CPU pool window (22 of 28 ms per
 reboot; a new session gets a different scratchpad), markers in its `chain-ab.out`, the chain scripts `chain-*.sh`
 beside it; a waiter (`chain-save.sh`) copies the SRV2 lines, logs and text dumps into
 `perf/results/2026-11-07/srv2-chunk32/` (git-ignored, on disk) when the chain logs `SRV2-DONE`. A partial copy of
-`chain-ab.out` is there already. **Read them first when resuming:** the hashes must equal bf4055905a (same generations; else the
-flex tail still corrupts something), and the speeds should be about the reference's (same 1270 records). If they
-hold, run `perf/harness/bench.sh --cases serve256k -- QX_DS_CHUNK=8192` and `=4096` for the formal numbers, then
-decide the server's chunk default (8192 cut the 13.5k-prompt TTFT 42.3 -> 35.5 s at the same tier). Then install
-`~/qx-bins/chunk33` (= head with the guard; chunk32 is installed in target/release now) and run ds-checks on it.
+`chain-ab.out` is there already. **Result so far:** the 4096 arm on the fixed binary matches the reference's speed
+(23.06 vs 23.31 tok/s at one stream, 9.40 vs 9.37 at three) and, matched prompt by prompt with
+`tools/compare_dumps.py`, every one of its 8 generations is identical to the reference's (the whole-file hashes
+differ only by completion order, so ignore the `texts <hash>` field; compare the dumps). The 8192 and second 4096
+arms were still to come; check them the same way (`srv2-8192.dump.jsonl`, `srv2-4096b.dump.jsonl` against
+`srv2-0.dump.jsonl`). **Queued after them:** `chain-srvbench.sh` runs the formal `bench.sh --cases serve256k` at
+`QX_DS_CHUNK=8192` then `4096` (labels `flex3-srv8192`, `flex3-srv4096`, results under `perf/results/`; `SRVB`
+lines in `chain-ab.out`, copied to `perf/results/2026-11-07/srv2-chunk32/` at the end). With those: decide the
+server's chunk default (8192 cut the 13.5k-prompt TTFT 42.3 -> 35.5 s at the same tier; the question is only its
+three-stream decode), record the outcome in the notebook, and if serve256k3 beats the baseline's 109.65 by the bar
+on the final tree, run the full set D with `--check` and promote. Then install `~/qx-bins/chunk33` (= head with the
+guard; chunk32 is installed in target/release now) and run ds-checks on it.
 
 **Next levers, in order (backlog family 15, items 9-13):** per-layer timeline instrumentation of the host wait
 (1 day; names the per-layer parts); then the pool's barrier structure (dataflow units, measure one record on one
