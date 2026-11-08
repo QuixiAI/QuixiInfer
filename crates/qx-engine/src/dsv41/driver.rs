@@ -49,6 +49,12 @@ pub struct Shared {
     pub tl_issue_ns: AtomicU64,
     pub tl_total_ns: AtomicU64,
     pub tl_gap_ns: AtomicU64,
+    /// Router prediction scoring (`QX_DS_PREDICT`): of every routed selection, how many the layer's prediction's top
+    /// 6 / 8 / 12 contained; the same over the host-served selections (pool + staged), the ones a prefetch could hide.
+    pub pred_hits: [AtomicU64; 3],
+    pub pred_total: AtomicU64,
+    pub pred_miss_hits: [AtomicU64; 3],
+    pub pred_miss_total: AtomicU64,
     pub stage_ns: AtomicU64,
     /// Set by the host after each token (the sampled token is known): the driver may run its promotions.
     pub tokens_done: AtomicU64,
@@ -182,6 +188,10 @@ impl Driver {
             tl_issue_ns: Default::default(),
             tl_total_ns: Default::default(),
             tl_gap_ns: Default::default(),
+            pred_hits: Default::default(),
+            pred_total: Default::default(),
+            pred_miss_hits: Default::default(),
+            pred_miss_total: Default::default(),
             tokens_done: Default::default(),
             profile_req: AtomicBool::new(false),
             profile: std::sync::Mutex::new(None),
@@ -463,6 +473,34 @@ impl Loop {
             sh.spec_miss_hits.fetch_add(mh as u64, Ordering::Relaxed);
             sh.spec_miss_total.fetch_add(miss.len() as u64, Ordering::Relaxed);
             self.last_sel[l] = cur;
+        }
+        if crate::dsv41::predict_mode() != 0 {
+            // the layer's predicted top-PRED_K per token against the real selections and the host-served ones
+            let pk = mailbox::PRED_K;
+            let pred: Vec<i32> = mb.slice::<i32>(mailbox::mb_pred(n, l), ntok * pk).to_vec();
+            let ks = [6usize, 8, 12];
+            for (tok, chunk) in all.chunks(kpt).enumerate() {
+                let p = &pred[tok * pk..(tok + 1) * pk];
+                for (i, &k) in ks.iter().enumerate() {
+                    let h = chunk.iter().filter(|e| p[..k.min(pk)].contains(e)).count() as u64;
+                    sh.pred_hits[i].fetch_add(h, Ordering::Relaxed);
+                }
+            }
+            sh.pred_total.fetch_add(all.len() as u64, Ordering::Relaxed);
+            let mut host_served: Vec<(i32, i32)> = ids.iter().copied().zip(kidx.iter().copied()).collect();
+            if nstage > 0 {
+                host_served.extend(mb.slice::<i32>(mailbox::MB_SIDS, nstage).iter().copied().zip(mb.slice::<i32>(mailbox::MB_SKIDX, nstage).iter().copied()));
+            }
+            for &(e, a) in &host_served {
+                let tok = a as usize / kpt;
+                let p = &pred[tok * pk..(tok + 1) * pk];
+                for (i, &k) in ks.iter().enumerate() {
+                    if p[..k.min(pk)].contains(&e) {
+                        sh.pred_miss_hits[i].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            sh.pred_miss_total.fetch_add(host_served.len() as u64, Ordering::Relaxed);
         }
         sh.vram_hits.fetch_add((all.len() - nm - nmap - nstage) as u64, Ordering::Relaxed);
         sh.mapped_hits.fetch_add(nmap as u64, Ordering::Relaxed);

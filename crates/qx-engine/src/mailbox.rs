@@ -36,8 +36,15 @@ pub fn mb_y(e: usize) -> usize {
 pub fn mb_all(_e: usize) -> usize {
     MB_ALL
 }
+/// The router predictions (`QX_DS_PREDICT`): per layer, TMAX tokens x PRED_K expert ids (i32), written by the GPU at
+/// the top of the layer (or by the previous layer) and scored by the driver against the layer's real selections.
+pub const PRED_K: usize = 12;
+pub const PRED_LAYERS: usize = 64;
+pub fn mb_pred(e: usize, l: usize) -> usize {
+    mb_y(e) + 4 * AMAX * e + 64 + l * TMAX * PRED_K * 4
+}
 pub fn mb_bytes(e: usize) -> usize {
-    mb_y(e) + 4 * AMAX * e + 64
+    mb_pred(e, PRED_LAYERS) + 64
 }
 pub const PLE_CONSUMED: usize = 0;
 pub const PLE_READY: usize = 64;

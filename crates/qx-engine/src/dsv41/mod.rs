@@ -120,6 +120,8 @@ struct Layer<'a> {
     g_ffn: MGemv,
     g_shd: MGemv,
     router_bias: DeviceBuf,
+    /// The router alone, into the predictor's logits (`QX_DS_PREDICT`).
+    g_route: MGemv,
     experts: Experts<'a>,
     has_comp: bool,
     has_idx_q: bool,
@@ -181,6 +183,17 @@ struct Scratch {
     erows_host: qx_gpu::mem::HostMapped,
     egates: DeviceBuf,
     logits_r: DeviceBuf,
+    /// The router predictor's own scratch (`QX_DS_PREDICT`): it must write nothing the real pass reads.
+    rn_p: DeviceBuf,
+    mixes_p: DeviceBuf,
+    mixsum_p: DeviceBuf,
+    pre_p: DeviceBuf,
+    post_p: DeviceBuf,
+    comb_p: DeviceBuf,
+    xpre_p: DeviceBuf,
+    xp: DeviceBuf,
+    logits_p: DeviceBuf,
+    wts_p: DeviceBuf,
     ids: DeviceBuf,
     wts: DeviceBuf,
     yk: DeviceBuf,
@@ -443,6 +456,17 @@ fn static_name(s: String) -> &'static str {
     n
 }
 
+/// `QX_DS_PREDICT`: 0 off, 1 `pre` (the layer's router on the pre-attention residual), 2 `next` (the next layer's
+/// router on this layer's FFN input). A measurement knob: the predictions are scored, never used.
+pub fn predict_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("QX_DS_PREDICT").as_deref() {
+        Ok("pre") | Ok("1") => 1,
+        Ok("next") | Ok("2") => 2,
+        _ => 0,
+    })
+}
+
 /// The CPUs this process may run on (`sched_getaffinity`), ascending.
 pub fn allowed_cpus() -> Vec<usize> {
     unsafe {
@@ -694,6 +718,16 @@ impl<'a> DsEngine<'a> {
             erows_host: qx_gpu::mem::HostMapped::new(cfg.engram_layers.len() * tm * cfg.engram_cols() * cfg.engram_dim * 4),
             egates: buf(hc * tm),
             logits_r: buf(cfg.n_expert * tm),
+            rn_p: buf(hcd * tm),
+            mixes_p: buf(24 * HC_SPLIT * tm),
+            mixsum_p: buf(24 * tm),
+            pre_p: buf(hc * tm),
+            post_p: buf(hc * tm),
+            comb_p: buf(hc * hc * tm),
+            xpre_p: buf(E * tm),
+            xp: buf(E * tm),
+            logits_p: buf(cfg.n_expert * tm),
+            wts_p: buf(crate::mailbox::PRED_K * tm),
             ids: buf(cfg.n_expert_used * tm),
             wts: buf(cfg.n_expert_used * tm),
             yk: buf(cfg.n_expert_used * E * tm),
@@ -777,6 +811,7 @@ impl<'a> DsEngine<'a> {
             let shg = mat(&b("ffn_gate_shexp.weight"))?;
             let shu = mat(&b("ffn_up_shexp.weight"))?;
             let g_ffn = MGemv::new(&[router.seg(&s.logits_r), shg.seg(&s.shg), shu.seg(&s.shu)]);
+            let g_route = MGemv::new(&[router.seg(&s.logits_p)]);
             keep.extend([router, shg, shu]);
             let shd = mat(&b("ffn_down_shexp.weight"))?;
             let g_shd = MGemv::new(&[shd.seg(&s.shy)]);
@@ -807,6 +842,7 @@ impl<'a> DsEngine<'a> {
                 g_ffn,
                 g_shd,
                 router_bias: vecf(&b("exp_probs_b.bias"))?,
+                g_route,
                 experts: Experts { gate, up, down, fmt, gate_ty: gt.ty, down_ty: dt.ty, gate_row_bytes, down_row_bytes },
                 has_comp,
                 has_idx_q,
@@ -1203,6 +1239,41 @@ impl<'a> DsEngine<'a> {
         self.k("qx_ds_hc_post", 256, ((E as u32).div_ceil(256), t as u32, 1), &[self.s.y.ptr, self.s.r.ptr, self.s.post.ptr, self.s.comb.ptr, E as u64, self.cfg.hc as u64]);
     }
 
+    /// Router prediction (`QX_DS_PREDICT=pre|next`, a measurement; presuppositions row 5): the layer's routing
+    /// guessed before its experts are known, written to the mailbox's prediction region for the driver to score
+    /// against the real selections (`pred6/8/12` in the stats line). Writes only the predictor's own scratch and
+    /// that region: the real pass's bits are untouched.
+    /// `pre`: layer `l`'s own router on the residual before `l`'s attention (the FFN pre-mix terms `pre_a` are
+    /// computable there; what is missing is the attention's update of `r`). The guess is available one attention +
+    /// dense phase ahead of the real routing.
+    fn predict_pre(&self, l: usize, t: usize) {
+        let Some(d) = self.driver.as_ref() else { return };
+        let (c, w, s) = (&self.cfg, &self.layers[l], &self.s);
+        let hcd = c.hc * E;
+        self.rms(s.r.ptr, s.ones.ptr, s.rn_p.ptr, hcd, t);
+        self.k("qx_ds_hc_mixes", 256, (24, HC_SPLIT as u32, t as u32), &[w.hc_attn.fn_.ptr, s.rn_p.ptr, s.mixes_p.ptr, hcd as u64, 24]);
+        self.k("qx_ds_hc_terms", 32, (t as u32, 1, 1), &[s.mixes_p.ptr, w.hc_attn.scale.ptr, w.hc_attn.base.ptr, s.pre_p.ptr, s.post_p.ptr, s.comb_p.ptr, bits(c.hc_eps), 20, HC_SPLIT as u64, s.mixsum_p.ptr]);
+        self.k("qx_ds_hc_pre", 256, ((E as u32).div_ceil(256), t as u32, 1), &[s.r.ptr, s.pre_p.ptr, s.xpre_p.ptr, E as u64, c.hc as u64]);
+        self.rms(s.xpre_p.ptr, w.ffn_norm.ptr, s.xp.ptr, E, t);
+        self.mgt(&w.g_route, s.xp.ptr, E, t, "route_pred");
+        let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l) as u64;
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale)]);
+    }
+
+    /// `next`: layer `l + 1`'s router on layer `l`'s FFN input (`xpre`, before `l`'s experts; what is missing is
+    /// `l`'s FFN output and `l + 1`'s attention). Available a whole expert phase plus an attention ahead.
+    fn predict_next(&self, l: usize, t: usize) {
+        let Some(d) = self.driver.as_ref() else { return };
+        if l + 1 >= self.layers.len() {
+            return;
+        }
+        let (c, w1, s) = (&self.cfg, &self.layers[l + 1], &self.s);
+        self.rms(s.xpre.ptr, w1.ffn_norm.ptr, s.xp.ptr, E, t);
+        self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
+        let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l + 1) as u64;
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w1.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale)]);
+    }
+
     /// Runs the routed experts for the token on the CPU pool (or exactly in f32) from the GGUF and uploads the k
     /// outputs. Returns the slots to hand the combine (all "CPU").
     fn experts_gguf(&self, l: usize, x: &[f32], ids: &[i32]) {
@@ -1284,7 +1355,12 @@ impl<'a> DsEngine<'a> {
             let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
             let calls = g(&sh.tl_calls).max(1) as f64;
             let us = |a: &std::sync::atomic::AtomicU64| g(a) as f64 / 1e3 / calls;
-            return Some(format!("  vram {} staged {} pcie {} ram {} nvme {} promos vram {} ram {} ({:.0} ms, pool {:.0} ms of which fetch {:.0}, stage wait {:.0}) spec {}/{} non-vram {}/{} | serve {} calls: read {:.0} us, issue {:.0}, total {:.0}, gap {:.0}", g(&sh.vram_hits), g(&sh.staged_hits), g(&sh.mapped_hits), g(&sh.ram_hits), g(&sh.nvme_misses), g(&sh.vram_promos), g(&sh.ram_promos), g(&sh.promo_ns) as f64 / 1e6, g(&sh.pool_ns) as f64 / 1e6, g(&sh.fetch_ns) as f64 / 1e6, g(&sh.stage_ns) as f64 / 1e6, g(&sh.spec_hits), g(&sh.spec_total), g(&sh.spec_miss_hits), g(&sh.spec_miss_total), g(&sh.tl_calls), us(&sh.tl_read_ns), us(&sh.tl_issue_ns), us(&sh.tl_total_ns), us(&sh.tl_gap_ns)));
+            let pred = if g(&sh.pred_total) > 0 {
+                format!(" | pred6 {}/{} pred8 {} pred12 {} non-vram pred6 {}/{} pred8 {} pred12 {}", g(&sh.pred_hits[0]), g(&sh.pred_total), g(&sh.pred_hits[1]), g(&sh.pred_hits[2]), g(&sh.pred_miss_hits[0]), g(&sh.pred_miss_total), g(&sh.pred_miss_hits[1]), g(&sh.pred_miss_hits[2]))
+            } else {
+                String::new()
+            };
+            return Some(format!("  vram {} staged {} pcie {} ram {} nvme {} promos vram {} ram {} ({:.0} ms, pool {:.0} ms of which fetch {:.0}, stage wait {:.0}) spec {}/{} non-vram {}/{} | serve {} calls: read {:.0} us, issue {:.0}, total {:.0}, gap {:.0}{pred}", g(&sh.vram_hits), g(&sh.staged_hits), g(&sh.mapped_hits), g(&sh.ram_hits), g(&sh.nvme_misses), g(&sh.vram_promos), g(&sh.ram_promos), g(&sh.promo_ns) as f64 / 1e6, g(&sh.pool_ns) as f64 / 1e6, g(&sh.fetch_ns) as f64 / 1e6, g(&sh.stage_ns) as f64 / 1e6, g(&sh.spec_hits), g(&sh.spec_total), g(&sh.spec_miss_hits), g(&sh.spec_miss_total), g(&sh.tl_calls), us(&sh.tl_read_ns), us(&sh.tl_issue_ns), us(&sh.tl_total_ns), us(&sh.tl_gap_ns)));
         }
         self.tiers.as_ref().map(|t| {
             let t = t.borrow();
@@ -1879,6 +1955,9 @@ impl<'a> DsEngine<'a> {
                 if l == 0 {
                     self.layer_init(t, &mut None);
                 }
+                if predict_mode() == 1 {
+                    self.predict_pre(l, t);
+                }
                 went_on = self.layer_attn(l, t, pos0 + r0, pos0 + r0 + t - 1, &mut None, kv_only);
                 if !went_on {
                     continue;
@@ -2253,6 +2332,9 @@ impl<'a> DsEngine<'a> {
     fn launch_window(&mut self, t: usize, pos: usize, last: usize, mut act: Option<&mut dyn FnMut(&str, Vec<f32>)>, kv_only: bool) {
         self.layer_init(t, &mut act);
         for l in 0..self.cfg.n_layer {
+            if predict_mode() == 1 {
+                self.predict_pre(l, t);
+            }
             if !self.layer_attn(l, t, pos, last, &mut act, kv_only) {
                 return;
             }
@@ -2434,6 +2516,9 @@ impl<'a> DsEngine<'a> {
         self.hc_pre(&self.s.pre_a, t);
         self.dump(format!("hc_ffn_pre-{l}"), &self.s.xpre, E, act);
         self.rms(self.s.xpre.ptr, w.ffn_norm.ptr, self.s.x.ptr, E, t);
+        if predict_mode() == 2 {
+            self.predict_next(l, t);
+        }
         self.dump(format!("ffn_norm-{l}"), &self.s.x, E, act);
         self.mgt(&w.g_ffn, self.s.x.ptr, E, t, "g_ffn");
         self.dump(format!("ffn_moe_logits-{l}"), &self.s.logits_r, c.n_expert, act);
