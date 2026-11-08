@@ -240,8 +240,10 @@ exact prefill is far below the card (our profile agrees). Their prefill lead is 
 2. **Per-record PCIe latency**: their 3090 lands an 8-9 MB record in 0.36 ms inside a gather kernel from mapped RAM
    (`nv2_dev.cu:369-491`, int4 loads, 48 x 256 threads) and 25 GB/s on the copy engine; our staged record costs 0.7
    ms and our 2026-11-04 mapped reads ran at 7 GB/s through the GEMV's access pattern. The 256k wait is per-layer
-   latency on ~2.4 records, so halving a record's landing time is the lever on the 28 ms. Exact. Micro-bench first
-   (hours): cudaMemcpyAsync pinned->VRAM vs a dedicated gather kernel over mapped memory, 9.5 MB records.
+   latency on ~2.4 records, so halving a record's landing time is the lever on the 28 ms. Exact. MEASURED 2026-11-08
+   (`kernels/bench/pcie_bench.cu`): the bus moves a 9.5 MB record in 0.19 ms (49 GB/s) by memcpy or by gather kernel
+   alike, so the gather form has nothing to give here; the 0.7 ms is driver-side overhead around the copy. Next step:
+   an nsys trace of a 256k decode step to split the 0.5 ms of overhead per record between host waits and GPU idle.
 3. **Layer-ahead router prediction, measured offline first**: layer l+1's router on layer l's pre-MoE state
    (`nv2.py:506-523`). Their GLM numbers are sobering (top-4 ~30% useful, 54% late, ~5% precision past rank 4; no
    DeepSeek figure). A numpy pass over dumped routing + pre-MoE states gives our precision in a day; build nothing
