@@ -20,6 +20,29 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
 - Landed since noon: `qx_ds_topk2` (decode256k 45.4 -> 43.5-44.2, 8fae0e7), the server's 4096 chunk default
   (42c23e7), README on today's facts (53a86c8). Set D row 31.470 (d6cfb45).
 
+## Update 2026-11-08, small hours: the launch-path fix is written; everything is behind knobs and under test
+
+- **Measured dead ends tonight** (all bit-identical, all in the notebook): rows per block with per-group barriers
+  (+12%), one barrier per block (+3%), the slab attention at a 32-token slice (+5%), a 262k-entry CubeCL info cache
+  (18.6 -> 46.6 s chunks, degrading: the pool does not scale), the 4-rows GEMV as one kernel (halves the Q8
+  launches, 409 us; the union of branches makes the one-row fallback 1.85x slower on the Q6_K/Q5_K layers).
+- **In the tree, off by default, compiled (chunk26), tests queued:** `QX_MGEMV_ZT=1` (one kernel per segment kind
+  on sub-tables: `_t8zt` Q8 4 rows, `_t8zf` f32 2 rows decode-once, `_t8z` the rest), `QX_DS_ATTN=tile` (now the
+  whole-window slice), and the big one: `QX_RAW_LAUNCH=1` (`crates/qx-gpu/src/raw.rs`): the chunk pass's launches
+  through the driver API on CubeCL's stream, info words through a pinned ring, no channel, no pool. Chains:
+  `chain-zt3.sh` (ZT=1: ds-checks, 16k tails, pairs), then `chain-raw.sh` (raw on/off tails and host breakdowns).
+  Expected: the chunk's 8.7 s slab enqueue and 6.9 s expert enqueue mostly gone, then the kernel forms show.
+- **Tooling that changed:** `kernels/bench/mgemv_bench.cu` (`~/qx-bins/mgemv_bench rows cols tokens [q6k]`): a
+  kernel form is measured there in seconds and compared bit for bit before any engine run. `qx-gpu`'s NVRTC
+  validation is PTX-only (a real target ran ptxas for 15 minutes per changed kernel file). `third_party/cubecl-cuda`
+  is a path-patched copy (the info cache size from `QX_INFO_CACHE_ENTRIES`, the stream handles in `QX_STREAMS`).
+- **Rules learned the hard way (memory notes):** no cargo work of any kind while an engine run is up (the reaper
+  killed a `cargo check` at 100 GB pinned); a copied chain keeps bare binary numbers in its loops; two gpu_free
+  waits race (an nsys run OOMed against a ds-checks run); every kernel-file change costs 20+ minutes of compiles
+  before the first check line.
+- **If the raw launcher lands:** re-measure ZT and the slab attention under it, then set D with
+  `--check`, then the server (the chunk path is its prompt path: time to first token).
+
 ## Update 2026-11-07, night: the chunk path is launch-bound, not kernel-bound
 
 - Every exact kernel form of the evening was bit-identical and read +5% in the engine's chunk timing while the
