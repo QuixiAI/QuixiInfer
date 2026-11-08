@@ -336,7 +336,9 @@ on a broken file. Before benchmarking a new model file, also check:
 
 ## License
 
-MIT. The model is under the [Qwen Community License](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE).
-QuixiInfer learns from DeepInfer, Strata, Basalt, colibri and llama.cpp (see
+MIT ([LICENSE](LICENSE)). The models keep their own licenses: Qwen3.8-Flash-Next under the
+[Qwen Community License](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), DeepSeek-V4.1-Flash under
+DeepSeek's model license. `third_party/cubecl-cuda` is a patched copy of the cubecl-cuda crate under its own license
+(MIT/Apache-2.0). QuixiInfer learns from DeepInfer, Strata, Basalt, colibri, Big-MoE-Small-Box and llama.cpp (see
 [docs/kernel-references.md](docs/kernel-references.md)), but it contains no code from them. The IQ lookup grids are
 ggml's data tables.
