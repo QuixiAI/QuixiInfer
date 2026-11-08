@@ -78,10 +78,17 @@ pub fn launch(module: &crate::kernel::Module, entry: &'static str, threads: u32,
         if std::env::var("QX_DS_VERBOSE").is_ok() {
             eprintln!("raw: compiling {}.cu", module.name);
         }
-        let opts = cudarc::nvrtc::CompileOptions { options: vec!["--gpu-architecture=compute_120a".into(), "-lineinfo".into()], ..Default::default() };
+        // the same target CubeCL compiles with (sm_120a; NVRTC still hands back PTX), so the PTX text, and with it the
+        // driver's JIT cache entry, is the one CubeCL's launches of the same module already produced
+        let opts = cudarc::nvrtc::CompileOptions { options: vec!["--gpu-architecture=sm_120a".into(), "-lineinfo".into()], ..Default::default() };
+        let t0 = std::time::Instant::now();
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(module.source, opts).unwrap_or_else(|e| panic!("raw: kernels/{}.cu does not compile with NVRTC:\n{e}", module.name));
         let src = CString::new(ptx.to_src()).expect("PTX text");
+        let t1 = std::time::Instant::now();
         let m = unsafe { result::module::load_data(src.as_ptr() as *const c_void) }.unwrap_or_else(|e| panic!("raw: cuModuleLoadData of {}.cu: {e:?}", module.name));
+        if std::env::var("QX_DS_VERBOSE").is_ok() {
+            eprintln!("raw: {}.cu compiled in {:.1} s, loaded in {:.1} s", module.name, (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
+        }
         let mut funcs = HashMap::new();
         for &name in module.entries {
             let cname = CString::new(name).unwrap();
