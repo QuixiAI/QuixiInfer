@@ -14,6 +14,11 @@ use std::sync::Arc;
 pub struct Shared {
     pub mb: HostMapped,
     pub stop: AtomicBool,
+    /// The chunk path's request for the arena's flex tail: wanted (a prompt runs in chunks) or not; the request
+    /// counter and the driver's acknowledgement of the last applied request.
+    pub flex_want: AtomicBool,
+    pub flex_req: AtomicU64,
+    pub flex_ack: AtomicU64,
     pub vram_hits: AtomicU64,
     pub ram_hits: AtomicU64,
     pub nvme_misses: AtomicU64,
@@ -110,7 +115,14 @@ pub struct Host {
     pub stage_cap: usize,
     pub slots_stg_dev: u64,
     pub slots_all_dev: u64,
+    /// The staged-ready words (u64 per stage stream; `stage_ready_by_words`): the job's sequence number is written
+    /// into each behind that stream's copies, and `qx_moe_wait_staged2` polls them.
+    pub stg_ready_dev: u64,
     pub arena_ptr: u64,
+    /// The arena's flex tail (address, bytes; 0 bytes: none): the chunk path's buffers live there during a prompt,
+    /// and the records there leave the VRAM table for the prompt's duration (`flex_check`).
+    pub flex_ptr: u64,
+    pub flex_bytes: usize,
     /// VRAM slots by size class: (bytes, free addresses); the holder of each slot.
     pub classes: Vec<(usize, Vec<u64>)>,
     pub layer_class: Vec<usize>,
@@ -136,6 +148,9 @@ impl Driver {
         let shared = Arc::new(Shared {
             mb: HostMapped::new(mailbox::mb_bytes(host.n_embd)),
             stop: AtomicBool::new(false),
+            flex_want: AtomicBool::new(false),
+            flex_req: AtomicU64::new(0),
+            flex_ack: AtomicU64::new(0),
             vram_hits: Default::default(),
             ram_hits: Default::default(),
             nvme_misses: Default::default(),
@@ -204,6 +219,11 @@ struct Loop {
     /// records they read from (not to be evicted before it).
     copy_event: cudarc::driver::sys::CUevent,
     inflight: Vec<usize>,
+    /// Whether the flex tail is given to the chunk path; while it is, the tail's empty slots (class, address) and
+    /// the records evicted from it (class, address, record), copied back at release if still in RAM.
+    flex_on: bool,
+    flex_slots: Vec<(usize, u64)>,
+    flex_evicted: Vec<(usize, u64, usize)>,
     /// RAM promotion candidates left from the last boundary, hottest first, done one at a time between jobs.
     pending_ram: Vec<usize>,
     /// RAM places taken from evicted records, free again two ticks later (a window in flight may read them in
@@ -213,6 +233,9 @@ struct Loop {
     /// an event per stream.
     stage_streams: Vec<cudarc::driver::sys::CUstream>,
     stage_events: Vec<cudarc::driver::sys::CUevent>,
+    /// Whether the GPU learns of the staged records' landing from the ready words (`stage_ready_by_words`) rather
+    /// than from a done word this thread posts after waiting for the copies (and after the pool's share).
+    stg_words: bool,
 }
 
 impl Loop {
@@ -468,8 +491,16 @@ impl Loop {
                 let st = self.stage_streams[si];
                 self.write_word_on(st, self.host.slots_stg_dev + 8 * a as u64, dst);
             }
-            for &si in &used_streams {
-                unsafe { cudarc::driver::result::event::record(self.stage_events[si], self.stage_streams[si]).expect("event record") };
+            if self.stg_words {
+                // the ready words behind the copies, on every stage stream (the GPU waits for all of them)
+                for si in 0..self.stage_streams.len() {
+                    let st = self.stage_streams[si];
+                    self.write_word_on(st, self.host.stg_ready_dev + 8 * si as u64, seq);
+                }
+            } else {
+                for &si in &used_streams {
+                    unsafe { cudarc::driver::result::event::record(self.stage_events[si], self.stage_streams[si]).expect("event record") };
+                }
             }
             self.missed.extend_from_slice(&staged);
         }
@@ -504,7 +535,7 @@ impl Loop {
             }
             sh.pool_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
-        if nstage > 0 {
+        if nstage > 0 && !self.stg_words {
             let tw = std::time::Instant::now();
             let _not_capturing = sh.capture.lock().unwrap();
             for &si in &used_streams {
@@ -623,6 +654,85 @@ impl Loop {
         sh.promo_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
+    /// Applies a pending flex request (`Shared::flex_*`): giving the arena's tail to the chunk path evicts every record
+    /// in it (table 0 on host and device, slot out of its class's free list) after the in-flight promotion copies
+    /// landed; taking it back returns the tail's slots to the free lists, empty, for the next promotions. The
+    /// acknowledgement is written after the device table words landed on this stream.
+    fn flex_check(&mut self, sh: &Shared) {
+        let req = sh.flex_req.load(Ordering::Acquire);
+        if req == sh.flex_ack.load(Ordering::Acquire) {
+            return;
+        }
+        let want = sh.flex_want.load(Ordering::Acquire);
+        if want != self.flex_on && self.host.flex_bytes > 0 {
+            let fp = self.host.flex_ptr;
+            // a slot is in the tail when any of its bytes are (the tail's start cuts through a slot of whichever class
+            // lies there: that record would be overwritten while still in the table if only starts were tested)
+            let in_tail = |a: u64, bytes: usize| a + bytes as u64 > fp;
+            if want {
+                // every promotion copy in flight has landed before the tail is written by the chunk path
+                self.finish_copies(sh, true);
+                let ne = self.host.n_expert;
+                let class_bytes: Vec<usize> = self.host.classes.iter().map(|c| c.0).collect();
+                let evict: Vec<(u64, usize)> = self.host.holder.iter().filter(|&(&a, &g)| in_tail(a, class_bytes[self.host.layer_class[g / ne]])).map(|(&a, &g)| (a, g)).collect();
+                for &(a, g) in &evict {
+                    self.write_entry(g, 0);
+                    self.host.holder.remove(&a);
+                    self.flex_evicted.push((self.host.layer_class[g / ne], a, g));
+                }
+                for (c, (bytes, free)) in self.host.classes.iter_mut().enumerate() {
+                    let bytes = *bytes;
+                    let (tail, keep): (Vec<u64>, Vec<u64>) = free.iter().partition(|&&a| in_tail(a, bytes));
+                    *free = keep;
+                    self.flex_slots.extend(tail.into_iter().map(|a| (c, a)));
+                }
+                // quarantined tail slots would return to the free lists later: keep them out too
+                let (tail_q, keep_q): (Vec<(u64, usize, u64)>, Vec<(u64, usize, u64)>) = self.quarantine.drain(..).partition(|&(_, c, a)| in_tail(a, class_bytes[c]));
+                self.quarantine.extend(keep_q);
+                self.flex_slots.extend(tail_q.into_iter().map(|(_, c, a)| (c, a)));
+                unsafe { cudarc::driver::result::stream::synchronize(self.stream).expect("flex: table words") };
+                if std::env::var("QX_DS_VERBOSE").is_ok() {
+                    let straddle = evict.iter().filter(|&&(a, _)| a < fp).count();
+                    eprintln!("flex: {} records out of the tail ({} slots to the chunk path; {} record(s) straddle its start)", evict.len(), evict.len() + self.flex_slots.len(), straddle);
+                }
+            } else {
+                // the evicted records go straight back into their slots (one to two GB, a few tens of ms on the
+                // copy stream, and the decode after a prompt pays nothing: without this, the promotions would
+                // refill the tail over hundreds of tokens); the tail's empty slots return to the free lists
+                self.finish_copies(sh, true);
+                let mut refilled = 0usize;
+                let evicted = std::mem::take(&mut self.flex_evicted);
+                for &(c, a, g) in &evicted {
+                    if self.host.table[g] == 0 && self.host.store.in_ram(g) && !self.host.holder.contains_key(&a) {
+                        let ptr = self.host.store.place[g] as *const u8;
+                        let nb = self.host.store.record_bytes(g);
+                        unsafe {
+                            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(a, ptr as *const _, nb, self.stream).result().expect("flex refill copy");
+                        }
+                        self.write_entry(g, a);
+                        self.host.holder.insert(a, g);
+                        self.inflight.push(g);
+                        refilled += 1;
+                    } else {
+                        self.host.classes[c].1.push(a);
+                    }
+                }
+                if !self.inflight.is_empty() {
+                    unsafe { cudarc::driver::result::event::record(self.copy_event, self.stream).expect("event record") };
+                }
+                for &(c, a) in &self.flex_slots {
+                    self.host.classes[c].1.push(a);
+                }
+                if std::env::var("QX_DS_VERBOSE").is_ok() {
+                    eprintln!("flex: {} records back into the tail, {} slots back to the tiers empty", refilled, evicted.len() - refilled + self.flex_slots.len());
+                }
+                self.flex_slots.clear();
+            }
+            self.flex_on = want;
+        }
+        sh.flex_ack.store(req, Ordering::Release);
+    }
+
     /// Clears the in-flight set once the copies landed (`wait` blocks for them).
     fn finish_copies(&mut self, sh: &Shared, wait: bool) {
         if self.inflight.is_empty() {
@@ -692,15 +802,28 @@ impl Loop {
 /// The mailbox offset of the "all routed experts" list (`MB_ALL` in qx_sys.cuh).
 const MB_ALL_OFF: usize = mailbox::MB_ALL;
 
+/// The copy streams the staged records are spread over (`QX_DS_STAGE_STREAMS`, default 4, at most 8).
+pub fn n_stage_streams() -> usize {
+    std::env::var("QX_DS_STAGE_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 8)
+}
+
+/// Whether the GPU waits for the staged records on per-stream ready words written behind the copies
+/// (`qx_moe_wait_staged2`, `QX_DS_STG_WAIT=words`) instead of the done word the driver posts after the copies
+/// and its pool share (the default: the words measured equal, decode256k 44.7/44.6 vs 44.8/44.9, 2026-11-08,
+/// because the pool share finishes no sooner than the copies and the staged kernels are small).
+pub fn stage_ready_by_words() -> bool {
+    std::env::var("QX_DS_STG_WAIT").is_ok_and(|v| v == "words")
+}
+
 fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Sender<()>) {
     qx_gpu::mem::bind();
     let pool = Pool::new(&cpus);
     let stream = unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("copy stream");
     let copy_event = cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("copy event");
-    let n_stage_streams: usize = std::env::var("QX_DS_STAGE_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 8);
+    let n_stage_streams = n_stage_streams();
     let stage_streams: Vec<cudarc::driver::sys::CUstream> = (0..n_stage_streams).map(|_| unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("stage stream")).collect();
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
-    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events };
+    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words() };
     // exercise every copy path once before a window can wait on this thread: whatever the CUDA driver
     // loads or allocates on a stream's first copy then happens while the device is idle
     let scratch = qx_gpu::mem::DeviceBuf::new(64);
@@ -729,6 +852,7 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
             return;
         }
         let mut worked = false;
+        lp.flex_check(&sh);
         let seq = sh.mb.atomic_u64(MB_SEQ).load(Ordering::Acquire);
         if seq != last_job {
             last_job = seq;

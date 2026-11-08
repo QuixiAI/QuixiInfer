@@ -29,6 +29,8 @@ pub struct Tiers {
     stage_wide_min: usize,
     pub store: crate::tiers::ExpertStore,
     arena: DeviceBuf,
+    /// The arena's flex tail (address, bytes) that the chunk path's buffers view during a prompt.
+    flex: Option<(u64, usize)>,
     /// Per global expert: its VRAM address or 0.
     table: Vec<u64>,
     /// VRAM slots by record size: (bytes, free slot addresses); and which expert holds each slot.
@@ -348,6 +350,8 @@ pub struct AsyncBufs {
     _stage: DeviceBuf,
     slots_all: DeviceBuf,
     slots_stg: DeviceBuf,
+    /// The staged-ready words, one per stage stream (`driver::stage_ready_by_words`).
+    stg_ready: DeviceBuf,
     step: DeviceBuf,
     slots: DeviceBuf,
     gpu_out: DeviceBuf,
@@ -712,44 +716,72 @@ impl<'a> DsEngine<'a> {
             // the selected rows and their count per token of a window
             sels.push(if has_idx_q { Some((buf(cfg.idx_top_k * DS_TMAX), buf(DS_TMAX))) } else { None });
         }
-        // QX_DS_CHUNK=N: the chunk path's buffers for N rows (before the tiers take the rest of the VRAM)
-        let chunk = std::env::var("QX_DS_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).map(|rows| {
+        // QX_DS_CHUNK=N: the chunk path's buffers for N rows. With the tiers they are views into the VRAM arena's tail
+        // (the coldest records' slots: evicted for a prompt's duration, back to the tiers after; `flex_check`), so a
+        // prompt borrows the memory instead of taking it from the expert tier for good. Their size is known here.
+        let chunk_rows = std::env::var("QX_DS_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0);
+        let chunk_sel_fallback = std::env::var("QX_DS_CHUNK_GROUPED").is_ok_and(|v| v == "0");
+        let chunk_sizes = |rows: usize| -> Vec<usize> {
             let k = cfg.n_expert_used;
-            let sel_fallback = std::env::var("QX_DS_CHUNK_GROUPED").is_ok_and(|v| v == "0");
+            let mut v = vec![rows * hcd, rows * hc, rows * hc, rows * hc * hc, rows * E, rows * E, rows * k, rows * k, rows * E / 4, rows * (E / 256),
+                             rows * if chunk_sel_fallback { k } else { 1 } * 2 * cfg.ff_exp, rows * k * E, rows, rows, rows, rows * k, cfg.cand_blocks.max(1) * rows, rows,
+                             rows * if chunk_sel_fallback { k } else { 1 } * cfg.ff_exp / 4, rows * if chunk_sel_fallback { k } else { 1 } * (cfg.ff_exp / 256)];
+            for l in 0..cfg.n_layer { if cfg.topk_src[l] == l as i32 { v.push(cfg.idx_top_k * rows); v.push(rows); } }
+            v.iter().map(|&n| (n * 4 + 255) / 256 * 256).collect()
+        };
+        let flex_bytes: usize = chunk_rows.map(|rows| chunk_sizes(rows).iter().sum()).unwrap_or(0);
+        // (built once the tiers exist: the big buffers are views into the arena's flex tail when the tiers have one,
+        // else their own allocations)
+        let mk_chunk = |rows: usize, flex: Option<(u64, usize)>| -> ChunkBufs {
+            let k = cfg.n_expert_used;
+            let sel_fallback = chunk_sel_fallback;
+            let mut off = 0usize;
+            let mut fbuf = |n: usize| -> DeviceBuf {
+                match flex {
+                    Some((fp, fb)) => {
+                        let bytes = (n * 4 + 255) / 256 * 256;
+                        assert!(off + bytes <= fb, "chunk buffers overflow the flex tail");
+                        let v = DeviceBuf::view(fp + off as u64, n * 4);
+                        off += bytes;
+                        v
+                    }
+                    None => buf(n),
+                }
+            };
             ChunkBufs {
                 rows,
-                r: buf(rows * hcd),
-                pre: buf(rows * hc),
-                post: buf(rows * hc),
-                comb: buf(rows * hc * hc),
-                x: buf(rows * E),
-                shy: buf(rows * E),
-                ids: buf(rows * k),
-                wts: buf(rows * k),
-                xq: DeviceBuf::new(rows * E),
-                xd: buf(rows * (E / 256)),
+                r: fbuf(rows * hcd),
+                pre: fbuf(rows * hc),
+                post: fbuf(rows * hc),
+                comb: fbuf(rows * hc * hc),
+                x: fbuf(rows * E),
+                shy: fbuf(rows * E),
+                ids: fbuf(rows * k),
+                wts: fbuf(rows * k),
+                xq: fbuf(rows * E / 4),
+                xd: fbuf(rows * (E / 256)),
                 // gate/up and the quantized hidden rows are a per-pass scratch indexed by a selection's place in
                 // its expert's list (at most `rows` of them in one pass); only the per-selection fallback
                 // (QX_DS_CHUNK_GROUPED=0) indexes them by selection id and needs k times as much
-                gu: buf(rows * if sel_fallback { k } else { 1 } * 2 * cfg.ff_exp),
-                out: buf(rows * k * E),
-                tok: buf(rows),
-                pos: buf(rows),
-                slot: buf(rows),
-                sel: buf(rows * k),
+                gu: fbuf(rows * if sel_fallback { k } else { 1 } * 2 * cfg.ff_exp),
+                out: fbuf(rows * k * E),
+                tok: fbuf(rows),
+                pos: fbuf(rows),
+                slot: fbuf(rows),
+                sel: fbuf(rows * k),
                 slots_tbl: [buf(2 * cfg.n_expert), buf(2 * cfg.n_expert)],
                 erows_host: qx_gpu::mem::HostMapped::new(cfg.engram_layers.len() * rows * cfg.engram_cols() * cfg.engram_dim * 4),
-                sels: (0..cfg.n_layer).map(|l| (cfg.topk_src[l] == l as i32).then(|| (buf(cfg.idx_top_k * rows), buf(rows)))).collect(),
-                cand_sel: buf(cfg.cand_blocks.max(1) * rows),
-                cand_count: buf(rows),
-                hq: DeviceBuf::new(rows * if sel_fallback { k } else { 1 } * cfg.ff_exp),
-                hd: buf(rows * if sel_fallback { k } else { 1 } * (cfg.ff_exp / 256)),
+                sels: (0..cfg.n_layer).map(|l| (cfg.topk_src[l] == l as i32).then(|| (fbuf(cfg.idx_top_k * rows), fbuf(rows)))).collect(),
+                cand_sel: fbuf(cfg.cand_blocks.max(1) * rows),
+                cand_count: fbuf(rows),
+                hq: fbuf(rows * if sel_fallback { k } else { 1 } * cfg.ff_exp / 4),
+                hd: fbuf(rows * if sel_fallback { k } else { 1 } * (cfg.ff_exp / 256)),
                 warm_word: DeviceBuf::from_slice(&[1u64 << 48]),
                 warm_desc: DeviceBuf::new(32),
                 bdesc: DeviceBuf::new(rows * k * 32),
                 warmed: false,
             }
-        });
+        };
         let output = mat("output.weight")?;
         let g_out = MGemv::new(&[output.seg(&s.logits)]);
         let cpus = pool_cpus();
@@ -815,7 +847,11 @@ impl<'a> DsEngine<'a> {
                     })
                     .collect();
                 let spare = 2usize;
-                let arena = DeviceBuf::new(used + sizes.iter().sum::<usize>() * spare);
+                // the flex tail: the chunk buffers' bytes at the end of the arena; the records that fill it are the coldest
+                let arena_bytes = used + sizes.iter().sum::<usize>() * spare;
+                let flex = if flex_bytes > 0 && arena_bytes >= flex_bytes { Some(flex_bytes) } else { None };
+                let arena = DeviceBuf::new(arena_bytes);
+                let flex = flex.map(|fb| (arena.ptr + (arena_bytes - fb) as u64, fb));
                 let mut store = crate::tiers::ExpertStore::build(&pack, cfg.n_layer, &order, &in_vram, (ram_gib * 1073741824.0) as usize, 64)?;
                 let t0 = std::time::Instant::now();
                 let mut table = vec![0u64; cfg.n_layer * n_expert];
@@ -856,6 +892,7 @@ impl<'a> DsEngine<'a> {
                     stage_wide_min,
                     store,
                     arena,
+                    flex,
                     table,
                     classes,
                     layer_class,
@@ -884,6 +921,7 @@ impl<'a> DsEngine<'a> {
                 (Some(tiers), Some((f, pack)))
             }
         };
+        let chunk = chunk_rows.map(|rows| mk_chunk(rows, tiers.as_ref().and_then(|t| t.flex)));
         let (tiers, driver, abufs) = match tiers {
             Some(t) if !std::env::var("QX_DS_ASYNC").is_ok_and(|v| v == "0") => {
                 let layers_fmt: Vec<driver::LayerFmt> = layers.iter().map(|l| driver::LayerFmt { fmt: l.experts.fmt, gate_bytes: cfg.ff_exp * l.experts.gate_row_bytes, gate_row_bytes: l.experts.gate_row_bytes, down_row_bytes: l.experts.down_row_bytes }).collect();
@@ -894,6 +932,8 @@ impl<'a> DsEngine<'a> {
                 let gpu_share: u64 = std::env::var("QX_DS_GPU_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0u64).min(8);
                 let slots_all = DeviceBuf::new(cfg.n_expert_used * DS_TMAX * 8);
                 let slots_stg = DeviceBuf::new(cfg.n_expert_used * DS_TMAX * 8);
+                let stg_ready = DeviceBuf::new(8 * 8);
+                stg_ready.zero();
                 let host = driver::Host {
                     store: t.store,
                     table_dev: table_dev.ptr,
@@ -905,7 +945,10 @@ impl<'a> DsEngine<'a> {
                     stage_cap: t.stage_cap,
                     slots_stg_dev: slots_stg.ptr,
                     slots_all_dev: slots_all.ptr,
+                    stg_ready_dev: stg_ready.ptr,
                     arena_ptr: t.arena.ptr,
+                    flex_ptr: t.flex.map(|f| f.0).unwrap_or(0),
+                    flex_bytes: t.flex.map(|f| f.1).unwrap_or(0),
                     classes: t.classes,
                     layer_class: t.layer_class,
                     holder: t.holder,
@@ -919,7 +962,7 @@ impl<'a> DsEngine<'a> {
                     n_embd: E,
                     ff: cfg.ff_exp,
                 };
-                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_wide_min: t.stage_wide_min, stage_cap: t.stage_cap, _stage: t.stage, slots_all, slots_stg, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
+                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_wide_min: t.stage_wide_min, stage_cap: t.stage_cap, _stage: t.stage, slots_all, slots_stg, stg_ready, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
                 abufs.step.zero();
                 let d = driver::Driver::start(host, cpus.clone());
                 (None, Some(d), Some(abufs))
@@ -1522,6 +1565,34 @@ impl<'a> DsEngine<'a> {
     /// load while the GPU spins in a wait kernel and the driver's copies are in flight deadlocks (the window path's
     /// dry pass exists for the same reason; the chunk path's first use of a format's grouped kernel at layer 10 hung
     /// a run on 2026-11-06). Every launch sees "slot 0" and returns; the wait sees its generation at once.
+    /// Asks the driver for the arena's flex tail (the chunk buffers live there) and waits until its records are out
+    /// of the VRAM table on host and device. A no-op without the tiers or when already held.
+    fn flex_enter(&self) {
+        let Some(d) = self.driver.as_ref() else { return };
+        let sh = &d.shared;
+        if sh.flex_want.load(std::sync::atomic::Ordering::Acquire) && sh.flex_ack.load(std::sync::atomic::Ordering::Acquire) == sh.flex_req.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        sh.flex_want.store(true, std::sync::atomic::Ordering::Release);
+        let req = sh.flex_req.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        let t0 = std::time::Instant::now();
+        while sh.flex_ack.load(std::sync::atomic::Ordering::Acquire) != req {
+            assert!(t0.elapsed().as_secs() < 120, "the driver did not give the flex tail to the chunk path");
+            std::thread::yield_now();
+        }
+    }
+
+    /// Gives the arena's flex tail back to the tiers (the chunk buffers are dead): call once a prompt's chunks are
+    /// done and no other prompt is about to run its chunks. The driver applies it at its next turn.
+    pub fn chunk_release(&self) {
+        if let Some(d) = self.driver.as_ref() {
+            let sh = &d.shared;
+            if sh.flex_want.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                sh.flex_req.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+    }
+
     pub fn chunk_warm(&mut self) {
         if self.chunk.as_ref().is_none_or(|cb| cb.warmed) {
             return;
@@ -1621,6 +1692,7 @@ impl<'a> DsEngine<'a> {
         }
         // QX_RAW_LAUNCH=1: this pass's launches through the driver API on CubeCL's stream (qx_gpu::raw)
         let _raw = qx_gpu::raw::Scope::enter();
+        self.flex_enter();
         self.chunk_warm();
         // the chunk arrays and the Engram rows of every row
         {
@@ -2272,8 +2344,13 @@ impl<'a> DsEngine<'a> {
             if stage_share > 0 {
                 // the staged experts: their records and slot addresses land on the copy stream, then the
                 // same kernels over the staged slot array (zero where nothing is staged)
-                self.trace("qx_moe_wait_staged");
-                gpu.run(STEP.kernel("qx_moe_wait_staged", CubeDim::new_1d(1)), (1, 1, 1), &[mb, ab.step.ptr]);
+                if driver::stage_ready_by_words() {
+                    self.trace("qx_moe_wait_staged2");
+                    gpu.run(STEP.kernel("qx_moe_wait_staged2", CubeDim::new_1d(1)), (1, 1, 1), &[mb, ab.step.ptr, ab.stg_ready.ptr, driver::n_stage_streams() as u64]);
+                } else {
+                    self.trace("qx_moe_wait_staged");
+                    gpu.run(STEP.kernel("qx_moe_wait_staged", CubeDim::new_1d(1)), (1, 1, 1), &[mb, ab.step.ptr]);
+                }
                 self.trace_done();
                 self.launch_resident(l, k, t, ab.slots_stg.ptr, ab.xq.ptr, ab.xd.ptr, ab.gu.ptr, ab.gpu_out.ptr);
             }

@@ -296,12 +296,19 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             let chunked = if chunk_rows > 0 && running.iter().all(|r| r.next.is_none()) {
                 let pick = (0..running.len()).filter(|&i| running[i].job.prompt.len() - running[i].read >= window.max(256)).max_by_key(|&i| running[i].job.prompt.len() - running[i].read);
                 if let Some(ri) = pick {
+                    // whether another running request still has a prompt stretch that would run in chunks
+                    let others_pending = (0..running.len()).filter(|&i| i != ri).any(|i| running[i].job.prompt.len() - running[i].read >= window.max(256));
                     let r = &mut running[ri];
                     let rem = r.job.prompt.len() - r.read;
                     let n = rem.min(chunk_rows);
                     let kv_only = skip_on && rem - n >= keep;
                     let last = eng.forward_chunk_opt(r.slot, &r.job.prompt[r.read..r.read + n], kv_only);
                     r.read += n;
+                    // the flex tail back to the tiers once this prompt's chunks are done and no other running request
+                    // still has a prompt stretch that would run in chunks
+                    if r.read == r.job.prompt.len() && !others_pending {
+                        eng.chunk_release();
+                    }
                     chunk_steps += 1;
                     if r.read == r.job.prompt.len() {
                         r.t_prompt = Some(r.t0.elapsed().as_secs_f64());

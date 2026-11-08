@@ -283,6 +283,23 @@ extern "C" __global__ void qx_moe_wait_staged(const u64* info) {
     }
 }
 
+/// `qx_moe_wait_staged` without the host round trip: behind each stage stream's copies the driver writes the job's
+/// sequence number into that stream's word of `ready`, so every word has reached `seq` exactly when every staged
+/// record has landed (the copy engine writes device memory through L2, where this poll reads). The driver no longer
+/// has to wait for the copies itself, and the staged experts no longer wait for the CPU pool's share of the job
+/// (the old form's done word was posted after the pool had finished). info: [0] mailbox, [1] step state, [2] ready
+/// words (u64 per stage stream), [3] stage streams. One thread.
+extern "C" __global__ void qx_moe_wait_staged2(const u64* info) {
+    if (reinterpret_cast<const u32*>(info[1])[11] == 0) return;
+    const u64 seq = *reinterpret_cast<const u64*>(reinterpret_cast<const u32*>(info[1]) + 4);
+    const u64* ready = reinterpret_cast<const u64*>(info[2]);
+    const u32 n = (u32)info[3];
+    for (u32 i = 0; i < n; ++i) {
+        while (ld_acquire_sys(ready + i) < seq) {
+        }
+    }
+}
+
 /// Waits until the CPU has answered the current MoE job, unless the job has no misses. info: [0] mailbox,
 /// [1] step state. One thread.
 extern "C" __global__ void qx_moe_wait(const u64* info) {

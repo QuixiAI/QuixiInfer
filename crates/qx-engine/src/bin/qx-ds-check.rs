@@ -139,6 +139,11 @@ fn main() -> anyhow::Result<()> {
                         kv_only_windows += 1;
                     }
                     let last = eng.forward_chunk_opt(0, w, kv_only);
+                    if p + w.len() >= toks.len() - tail {
+                        // the prompt's last chunk: the arena's flex tail goes back to the tiers (as the server does once
+                        // no other prompt is pending), so the decode tail measures what a server's decode would
+                        eng.chunk_release();
+                    }
                     // the chunk's rows but the last carry no logits: pad so the row index stays the position
                     let mut v = vec![0f32; last.len() * (w.len() - 1)];
                     v.extend_from_slice(&last);
