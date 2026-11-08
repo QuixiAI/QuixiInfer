@@ -1167,7 +1167,9 @@ impl<'a> DsEngine<'a> {
         if let Some(d) = &self.driver {
             let sh = &d.shared;
             let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
-            return Some(format!("  vram {} staged {} pcie {} ram {} nvme {} promos vram {} ram {} ({:.0} ms, pool {:.0} ms of which fetch {:.0}, stage wait {:.0}) spec {}/{} non-vram {}/{}", g(&sh.vram_hits), g(&sh.staged_hits), g(&sh.mapped_hits), g(&sh.ram_hits), g(&sh.nvme_misses), g(&sh.vram_promos), g(&sh.ram_promos), g(&sh.promo_ns) as f64 / 1e6, g(&sh.pool_ns) as f64 / 1e6, g(&sh.fetch_ns) as f64 / 1e6, g(&sh.stage_ns) as f64 / 1e6, g(&sh.spec_hits), g(&sh.spec_total), g(&sh.spec_miss_hits), g(&sh.spec_miss_total)));
+            let calls = g(&sh.tl_calls).max(1) as f64;
+            let us = |a: &std::sync::atomic::AtomicU64| g(a) as f64 / 1e3 / calls;
+            return Some(format!("  vram {} staged {} pcie {} ram {} nvme {} promos vram {} ram {} ({:.0} ms, pool {:.0} ms of which fetch {:.0}, stage wait {:.0}) spec {}/{} non-vram {}/{} | serve {} calls: read {:.0} us, issue {:.0}, total {:.0}, gap {:.0}", g(&sh.vram_hits), g(&sh.staged_hits), g(&sh.mapped_hits), g(&sh.ram_hits), g(&sh.nvme_misses), g(&sh.vram_promos), g(&sh.ram_promos), g(&sh.promo_ns) as f64 / 1e6, g(&sh.pool_ns) as f64 / 1e6, g(&sh.fetch_ns) as f64 / 1e6, g(&sh.stage_ns) as f64 / 1e6, g(&sh.spec_hits), g(&sh.spec_total), g(&sh.spec_miss_hits), g(&sh.spec_miss_total), g(&sh.tl_calls), us(&sh.tl_read_ns), us(&sh.tl_issue_ns), us(&sh.tl_total_ns), us(&sh.tl_gap_ns)));
         }
         self.tiers.as_ref().map(|t| {
             let t = t.borrow();

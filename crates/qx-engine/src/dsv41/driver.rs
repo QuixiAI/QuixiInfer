@@ -41,6 +41,14 @@ pub struct Shared {
     pub spec_total: AtomicU64,
     pub spec_miss_hits: AtomicU64,
     pub spec_miss_total: AtomicU64,
+    /// The per-layer timeline of `serve` (host side): calls, nanoseconds reading the mailbox and scoring, issuing the
+    /// staged copies, the whole call, and the gap from the previous call's end to this call's start (the GPU's
+    /// time between two jobs, as the host sees it).
+    pub tl_calls: AtomicU64,
+    pub tl_read_ns: AtomicU64,
+    pub tl_issue_ns: AtomicU64,
+    pub tl_total_ns: AtomicU64,
+    pub tl_gap_ns: AtomicU64,
     pub stage_ns: AtomicU64,
     /// Set by the host after each token (the sampled token is known): the driver may run its promotions.
     pub tokens_done: AtomicU64,
@@ -169,6 +177,11 @@ impl Driver {
             spec_miss_hits: Default::default(),
             spec_miss_total: Default::default(),
             stage_ns: Default::default(),
+            tl_calls: Default::default(),
+            tl_read_ns: Default::default(),
+            tl_issue_ns: Default::default(),
+            tl_total_ns: Default::default(),
+            tl_gap_ns: Default::default(),
             tokens_done: Default::default(),
             profile_req: AtomicBool::new(false),
             profile: std::sync::Mutex::new(None),
@@ -239,6 +252,8 @@ struct Loop {
     /// Whether the GPU learns of the staged records' landing from the ready words (`stage_ready_by_words`) rather
     /// than from a done word this thread posts after waiting for the copies (and after the pool's share).
     stg_words: bool,
+    /// When the previous `serve` call returned (for the timeline's gap).
+    last_serve_end: Option<std::time::Instant>,
 }
 
 impl Loop {
@@ -405,6 +420,10 @@ impl Loop {
 
     /// Answers one MoE job.
     fn serve(&mut self, sh: &Shared, seq: u64) {
+        let t_start = std::time::Instant::now();
+        if let Some(prev) = self.last_serve_end {
+            sh.tl_gap_ns.fetch_add(t_start.duration_since(prev).as_nanos() as u64, Ordering::Relaxed);
+        }
         let mb = &sh.mb;
         let n = self.host.n_embd;
         let l = *mb.slice::<u32>(MB_LAYER, 1).first().unwrap() as usize;
@@ -448,6 +467,8 @@ impl Loop {
         sh.vram_hits.fetch_add((all.len() - nm - nmap - nstage) as u64, Ordering::Relaxed);
         sh.mapped_hits.fetch_add(nmap as u64, Ordering::Relaxed);
         sh.staged_hits.fetch_add(nstage as u64, Ordering::Relaxed);
+        sh.tl_read_ns.fetch_add(t_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let t_read = std::time::Instant::now();
         // the staged share: each record copied from its RAM place into the staging area on the copy stream, its
         // address written to the staged slot array behind the copy, then the staged-done word once all landed
         // (after the pool share below, so the copies overlap it). The area is reused per job: the GPU finished
@@ -507,6 +528,7 @@ impl Loop {
             }
             self.missed.extend_from_slice(&staged);
         }
+        sh.tl_issue_ns.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let nm = ids.len();
         if nm > 0 {
             let t0 = std::time::Instant::now();
@@ -549,6 +571,9 @@ impl Loop {
             mb.atomic_u64(mailbox::MB_STG_DONE).store(seq, Ordering::Release);
         }
         mb.atomic_u64(MB_DONE).store(seq, Ordering::Release);
+        sh.tl_calls.fetch_add(1, Ordering::Relaxed);
+        sh.tl_total_ns.fetch_add(t_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.last_serve_end = Some(std::time::Instant::now());
     }
 
     /// Between tokens: decay, release quarantined slots, promote the hottest misses into VRAM and RAM.
@@ -826,7 +851,7 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     let n_stage_streams = n_stage_streams();
     let stage_streams: Vec<cudarc::driver::sys::CUstream> = (0..n_stage_streams).map(|_| unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("stage stream")).collect();
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
-    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words() };
+    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None };
     // exercise every copy path once before a window can wait on this thread: whatever the CUDA driver
     // loads or allocates on a stream's first copy then happens while the device is idle
     let scratch = qx_gpu::mem::DeviceBuf::new(64);
