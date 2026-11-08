@@ -165,10 +165,11 @@ fn zgroups() -> bool {
     *U.get_or_init(|| !std::env::var("QX_MGEMV_ZGROUPS").is_ok_and(|v| v == "0"))
 }
 
-/// Whether the one-launch path uses the one-barrier, 4-rows-per-block entries (`QX_MGEMV_ZT=1`).
+/// Whether the one-launch path runs one kernel per segment kind on the sub-tables (the default since 2026-11-08:
+/// the 16k chunk 18.6 -> 16.7 s, bit-identical; `QX_MGEMV_ZT=0` restores the single one-row launch).
 fn zt() -> bool {
     static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *U.get_or_init(|| std::env::var("QX_MGEMV_ZT").is_ok_and(|v| v == "1"))
+    *U.get_or_init(|| !std::env::var("QX_MGEMV_ZT").is_ok_and(|v| v == "0"))
 }
 
 /// Whether the one-launch path uses the one-barrier-per-block entries (`QX_MGEMV_ZB=1`).
