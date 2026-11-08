@@ -205,6 +205,25 @@ invented one. The aggregate score lives in `scoreboard.md`.
 - **Kill criteria:** achieved bandwidth already above 70% of peak on the shapes that carry the time, or any
   change that breaks `tools/ds-checks.sh` line 3.
 
+### 7b. Elastic VRAM for the chunk buffers: the design on our tier (2026-11-08, from the Big-MoE-Small-Box read)
+
+- The VRAM expert tier is one `DeviceBuf` arena filled in profile order, hottest first (`dsv41/mod.rs` ~790-850), so
+  its tail holds the coldest resident records: the natural flex region. Today the chunk buffers (~1.2 GiB at 4,096
+  rows, ~2.4 at 8,192) are separate allocations taken before the tier, permanently.
+- Design: allocate the arena with a tail of exactly the chunk buffers' size and make the chunk buffers views into
+  that tail. At a prompt's first chunk (`chunk_enter`): every record whose address lies in the tail leaves the VRAM
+  table (`table[g] = 0`, device table word written on the stream: the next window's wait serves it from RAM/NVMe as
+  a miss), and the tail's slots leave the class free lists so promotions do not land in the buffers. After the
+  prompt (`chunk_exit`, when no slot is in its prompt phase): the tail's slots return to the free lists empty and
+  `adapt`'s promotions refill them with the current hot set. Stream order makes the overwrite safe: the chunk pass's
+  kernels run after every earlier launch on the stream.
+- Buys: 8,192-row chunks everywhere (prefill256k 6.8 -> 6.2, server TTFT 43.8 -> 37.3 s) with no decode cost in
+  decode-only phases; under continuous prompts the behaviour equals today's. Exact. Cost per prompt: the tail's
+  ~250 records re-promoted afterwards (~2.4 GB at the promotion rate, seconds, against a 40 s prompt).
+- Implementation points: `ChunkBufs` as views + offsets into the tail; `chunk_enter/exit` in the engine with the
+  worker deciding the exit (`worker_ds.rs`: no slot in prompt phase); the class free lists and `holder` map know
+  the tail slots' sizes. Medium (a day), measurable with the server's serve256k TTFT and the serve256k3 decode.
+
 ### 15. Big-MoE-Small-Box (casper-hansen, exllamav3-based, 3090 + 64 GB) read 2026-11-08: what is worth porting
 
 Source: ~/git/Big-MoE-Small-Box (code read, mechanisms with file:line in the session notes; the README's layer-ahead
