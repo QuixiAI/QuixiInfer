@@ -164,8 +164,9 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let pack: &'static Gguf = Box::leak(Box::new(Gguf::open(&opt.pack).map_err(|e| anyhow!("pack {}: {e}", opt.pack.display()))?));
     std::thread::spawn(move || {
-        // thread placement (the engine thread off the pool's cores, the helpers on its siblings) happens inside the
-        // tiered load, after the fill and before the driver starts (`dsv41::place_threads`)
+        // the engine thread off the pool's cores before this thread touches CUDA (rayon built wide first);
+        // `dsv41::place_threads` tidies the rest inside the tiered load
+        qx_engine::dsv41::pin_engine_early();
         let mut eng = match DsEngine::load_tiered_slots(pack, opt.max_ctx, opt.vram_gib, opt.ram_gib, opt.profile.as_deref(), opt.slots) {
             Ok(e) => {
                 let _ = ready_tx.send(Ok(()));

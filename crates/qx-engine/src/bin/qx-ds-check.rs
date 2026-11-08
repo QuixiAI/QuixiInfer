@@ -44,7 +44,11 @@ fn main() -> anyhow::Result<()> {
     let model = qx_ref::dsv41::Model::load(&g)?;
     let mut st = model.new_state();
     // QX_DS_PACK=PACK.qxp with QX_DS_VRAM / QX_DS_RAM (GiB) runs the tiered path off the pack (QX_DS_PROFILE: ranking)
-    // thread placement (engine thread off the pool's cores) happens inside the tiered load, before the driver starts
+    // the engine thread off the pool's cores before CUDA starts (rayon built wide first); `place_threads` tidies the
+    // rest inside the tiered load
+    if std::env::var_os("QX_DS_PACK").is_some() {
+        qx_engine::dsv41::pin_engine_early();
+    }
     let pack = std::env::var("QX_DS_PACK").ok().map(|p| Gguf::open(std::path::Path::new(&p))).transpose()?;
     let max_ctx = (toks.len() + 64).next_multiple_of(256);
     let mut eng = match &pack {

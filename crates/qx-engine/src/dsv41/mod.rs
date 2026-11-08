@@ -577,6 +577,21 @@ fn set_affinity(tid: i32, cpus: &[usize]) -> bool {
     }
 }
 
+/// Pins the engine thread before CUDA initialises (call it first thing in the process or the engine thread, before
+/// any CUDA use), after building rayon's global pool on every allowed core so the tier fill keeps its parallelism.
+/// Measured 2026-11-08: CUDA's worker thread (`DSD-0-0`) created under a one-CPU mask stays idle while the engine
+/// decodes (decode256k 42.0-42.7); created with the wide mask and moved later, it spins beside the engine thread
+/// (44.2-44.7). The rayon workers spawned here keep the wide mask (threads inherit affinity at creation).
+pub fn pin_engine_early() {
+    let Some(main) = main_cpu() else { return };
+    let cores = physical_cores();
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(cores.len().max(1)).build_global();
+    let ok = pin_thread(main);
+    if std::env::var("QX_DS_VERBOSE").is_ok() || !ok {
+        eprintln!("cpus: engine thread on {main}{} before CUDA starts; rayon on {} cores", if ok { "" } else { " (pin failed)" }, cores.len());
+    }
+}
+
 /// Places the engine's threads before the driver and its pool start: the calling (engine) thread on `main_cpu`,
 /// every other thread that exists at this point (CUDA's driver and event threads, rayon's fill workers, a server's
 /// HTTP and scheduler threads) on that core's SMT siblings (`QX_DS_HELPERS=free` leaves them unpinned; the sibling
