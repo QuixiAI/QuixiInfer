@@ -320,6 +320,25 @@ geometry). Ranked for us:
    (all exllamav3's; no paging, no indexer), the pinned bounce-slot loader (exllamav3-specific), hugepages/NUMA
    (absent). Their CPU-lane result is not bit-exact with their GPU path (fp32 partial, KL 0.001); only X16 is.
 
+**Re-ranked 2026-11-08 (late) by the conjecturer pass (`perf/ideation/2026-11-08-conjecturer.md`), against the
+measured facts:** item 2 (per-record driver overhead, "~45 ms") retired: the staged copies are not on the decode
+critical path (ready-words test equal) and in serve they run at bus rate; item 9 (dataflow pool) downgraded to
+<= 1.6 ms per 256k token: the pool's floor is DRAM at ~0.19 ms per record (one core does 2.55 ms, compute-bound;
+16 cores 0.23), not barriers; item 10 (MWAITX) closed by the 5.3 GHz clock measurement; item 11 (per-layer
+DMA/pool planner) rejected for the scored cases: both lanes draw on the same DRAM ceiling and the share sweep is
+flat. Ranked in their place: (a) the layer-ahead router prediction, measured first (`QX_DS_PREDICT=pre|next`
+counters, ec924e7; colibri measured 71.6% recall for layer L+1's router on layer L's state on GLM; our previous-token
+signal is 13-23%): at recall r the decode256k host window (16 ms) shrinks by about r x 14 ms; (b) the 256-slot
+staging area as an LRU cache of staged records (trace simulation: 25% of host-served selections single-stream at
+256 slots, 37% under three streams at 1024; serve256k3 is within 10-20% of DRAM-bound, so bytes are its only lever:
+-18 to -30% with a 512-1024-slot area lent by the flex tail); (c) per-layer timeline with GPU `%globaltimer`
+stamps (is the `gap` counter GPU time, and what is the bus-bubble fraction in serve); (d) latent KV rows in host
+memory re-costed: a serve256k3 lever (-20% at +1100 records over three slots), ~0 for decode256k by the trace
+slope (1.2 hit-rate points per 100 records); (e) staggered slot streams in the server (fills the bus bubble, ceiling
+from (c)); (f) NVMe read latency on the width-1 path (two reads per record, gate/up first): -4 to -6% decode256k;
+(g) DSpark acceptance measured with the local Strata binary before any build (the 256k break-even is ~31%, lower
+than at 1k).
+
 Not transferable: warm prefill / BCP / tail skip (lossy, and they attack an NVMe floor our tier removes); the int16
 VBMI trellis lane (EXL3-specific; our pool is DRAM-bound at decode); X16 (emulating fp16 tensor-core rounding on the
 CPU at 5.5x the cost: the problem our integer kernels designed away); the dynamic per-layer lane planner (our share

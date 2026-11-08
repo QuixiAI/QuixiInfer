@@ -1,4 +1,4 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, late night)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, night, second session)
 
 ## Goal
 
@@ -19,6 +19,27 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   lossy opt-in option by the goal's rules, not taken; exact forms first.
 - Landed since noon: `qx_ds_topk2` (decode256k 45.4 -> 43.5-44.2, 8fae0e7), the server's 4096 chunk default
   (42c23e7), README on today's facts (53a86c8). Set D row 31.470 (d6cfb45).
+
+## Update 2026-11-08, night (new session under the updated goal prompt): roles in use; placement reworked; prediction measurement queued
+
+- **Set D on chunk36 (first placement) 29.316, correctness pass; adjudicator HOLD** (no server-level identity check
+  for a server-touching change; `perf/ideation/2026-11-08-adjudicator-setd-pin.md`). Recorded, not promoted.
+- **Breaker on the placement** (`perf/ideation/2026-11-08-breaker-placement.md`): the early pin confined CUDA's
+  threads and the tier fill to one CPU (fill 8 -> 12 s, warm-up 15 -> 22 s), attribution unclear between the engine
+  thread and the CUDA helper, pins ignored failures, no pool cap, `physical_cores()` broke at a hole. All fixed in
+  5d185f2 (chunk37): pin after the fill, before the driver; helpers on the engine core's siblings
+  (`QX_DS_HELPERS=free` to compare); topology from online/allowed CPUs; pool capped at 16. Running: `PLACE`
+  (ds-checks, sibling/free arms, set D `setd-place`), then `IDENT` (loadgen dump vs the no-chunk reference), then
+  `PRED`. Promote chunk37's run after the identity check and the adjudicator.
+- **Outsider and conjecturer passes** (`perf/ideation/2026-11-08-{outsider,conjecturer}.md`): compression of records
+  closed (0.02%); drafting re-costed at 256k; serve256k3 is within 10-20% of DRAM-bound (bytes are its lever); the
+  pool's floor is DRAM (0.19), not barriers; an LRU staging cache simulated at 25-37% of host-served selections;
+  the layer-ahead router prediction is the top long shot (colibri: 71.6% recall on GLM). Presupposition rows 4, 9,
+  11, 15, 17-25 updated; backlog re-ranked (family 15 items 2, 9, 10, 11 retired or downgraded).
+- **Built: `QX_DS_PREDICT=pre|next`** (ec924e7, chunk38): the layer's routing guessed before its experts are known,
+  scored in the stats line (`pred6/8/12` over all and over host-served selections). Queued after IDENT: ds-checks
+  with the predictor on, decode256k and decode with each variant. If recall over host-served selections is >= 0.5,
+  the prefetch (staging the predicted records during attention + dense) is the next build; if < 0.3, row 5 is held.
 
 ## Update 2026-11-08, late night: the engine thread shared a physical core with a pool worker; pinning it -6.9% on decode256k
 
