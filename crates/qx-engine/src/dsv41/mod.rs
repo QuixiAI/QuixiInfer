@@ -1597,6 +1597,10 @@ impl<'a> DsEngine<'a> {
         if self.chunk.as_ref().is_none_or(|cb| cb.warmed) {
             return;
         }
+        // the dry pass writes the chunk buffers, which are the arena tail's records until the tail is taken: take it
+        // (a no-op inside a chunk pass, which holds it already). The server's warm-up ran this without it on
+        // 2026-11-08 and corrupted the coldest records at start-up; the caller releases the tail after.
+        self.flex_enter();
         let d = self.driver.as_ref().unwrap().shared.clone();
         let cb = self.chunk.as_ref().unwrap();
         let (k, ff) = (self.cfg.n_expert_used, self.cfg.ff_exp);

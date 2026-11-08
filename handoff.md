@@ -28,11 +28,14 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   record and the 4096 tail differed), `chunk_release` (worker, once no other prompt is pending; qx-ds-check after
   the prompt's last chunk) gives it back with the evicted records copied straight back into their slots. 16k tails
   bit-identical at 4096 and 8192; ds-checks pass. Server TTFT at 262k/3 slots on the 13.5k prompt: 8192 chunks
-  35.5 s, 4096 42.3 s, both at the full 12.2 GiB expert tier. serve256k: 8192 arm 105.5 (baseline 109.65), **4096
-  arm 76.8 / 27.4 (serve256k3 / serve256k1)**, which is 30% better than anything before and not explained yet: the
-  tier counters show 69% VRAM hits against 53-55% with the same 1270 records; the chunk path never ran (88-token
-  prompts). An A/B/B/A with text dumps (`chain-srv.sh`, `tools/loadgen.py --dump`) is queued to tell a real effect
-  from a changed generation. Do not promote the 4096 number until that is understood.
+  35.5 s, 4096 42.3 s, both at the full 12.2 GiB expert tier. **The serve256k numbers measured on bb9e370 (8192
+  105.5, 4096 76.8 / 27.4) are invalid:** the server's warm-up ran `chunk_warm`'s dry pass without taking the flex
+  tail, so the dry pass wrote into the coldest live records; generations degenerated (the 8192 arm's stats showed
+  near-total VRAM hits, i.e. collapsed routing). qx-ds-check never calls `chunk_warm` outside a chunk pass, which is
+  why every tail check passed. Fixed: `chunk_warm` takes the tail itself and the worker releases it after
+  (chunk32). The 16k tails, the TTFT timings and every qx-ds-check bench stand (no warm-up there, or the chunk pass
+  evicted first). Re-test running: server arms no-chunk (reference text) / 4096 / 8192 / 4096 with the generated
+  text hashed (`tools/loadgen.py --dump`); then bench.sh serve256k for the 4096 vs 8192 default decision.
 - **Staged-ready words (knob `QX_DS_STG_WAIT=words`, off):** the GPU's staged wait no longer depends on the driver's
   done word, which was posted after the pool share. Equal in time (decode256k 44.7/44.6 vs 44.8/44.9): the pool
   share finishes no sooner than the copies. What the counters say about the 28 ms per 256k token: the pool window

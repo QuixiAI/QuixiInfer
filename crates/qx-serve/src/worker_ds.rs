@@ -204,7 +204,8 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             eng.reset(0);
             // the chunk path's kernels too (every format's expert kernels, the waits and marks), before the set seals
         if eng.chunk_rows() > 0 {
-            eng.chunk_warm();
+            eng.chunk_warm();  // takes the arena's flex tail for its dry pass
+            eng.chunk_release();
         }
         qx_gpu::kernel::seal();
             let (free, total) = qx_gpu::mem::mem_info();

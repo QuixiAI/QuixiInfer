@@ -44,7 +44,7 @@ def one(url, prompt, max_tokens, temperature, unique=False, history=None, think=
         headers["Authorization"] = f"Bearer {API_KEY}"
     req = urllib.request.Request(url + "/chat/completions", body, headers)
     t0 = time.time()
-    first, n, usage, text = None, 0, None, []
+    first, n, usage, text, reasoning = None, 0, None, [], []
     with urllib.request.urlopen(req, timeout=900) as r:
         for line in r:
             line = line.strip()
@@ -60,13 +60,15 @@ def one(url, prompt, max_tokens, temperature, unique=False, history=None, think=
                 delta = c.get("delta", {})
                 if delta.get("content"):
                     text.append(delta["content"])
+                if delta.get("reasoning_content"):
+                    reasoning.append(delta["reasoning_content"])
                 if delta.get("content") or delta.get("reasoning_content"):
                     n += 1
                     if first is None:
                         first = time.time()
     t1 = time.time()
     toks = usage["completion_tokens"] if usage else n
-    return dict(ttft=(first or t1) - t0, total=t1 - t0, tokens=toks, decode=(t1 - (first or t1)), prompt_tokens=usage["prompt_tokens"] if usage else 0, text="".join(text), sent_prompt=sent_prompt)
+    return dict(ttft=(first or t1) - t0, total=t1 - t0, tokens=toks, decode=(t1 - (first or t1)), prompt_tokens=usage["prompt_tokens"] if usage else 0, text="".join(text), reasoning="".join(reasoning), sent_prompt=sent_prompt)
 
 def level(url, c, rounds, max_tokens, temperature, unique=False, turns=1, dump=None):
     res, lock = [], threading.Lock()
@@ -89,7 +91,7 @@ def level(url, c, rounds, max_tokens, temperature, unique=False, turns=1, dump=N
     if dump:
         with open(dump, "a") as f:
             for r in res:
-                f.write(json.dumps({"c": c, "prompt": r.get("sent_prompt"), "text": r["text"], "tokens": r["tokens"], "prompt_tokens": r["prompt_tokens"], "ttft": round(r["ttft"], 3), "decode": round(r["decode"], 3)}) + "\n")
+                f.write(json.dumps({"c": c, "prompt": r.get("sent_prompt"), "text": r["text"], "reasoning": r.get("reasoning", ""), "tokens": r["tokens"], "prompt_tokens": r["prompt_tokens"], "ttft": round(r["ttft"], 3), "decode": round(r["decode"], 3)}) + "\n")
     toks = sum(r["tokens"] for r in res)
     ttft = sorted(r["ttft"] for r in res)
     per = [(r["tokens"] - 1) / r["decode"] for r in res if r["decode"] > 0 and r["tokens"] > 1]
