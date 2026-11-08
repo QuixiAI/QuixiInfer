@@ -10,7 +10,10 @@ fn huge(bytes: usize) -> *mut u8 {
     unsafe {
         let p = libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
         assert!(p != libc::MAP_FAILED);
-        libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+        // QX_POOLBW_HUGE=0: 4 KiB pages (as a pinned tier has), else transparent huge pages
+        if !std::env::var("QX_POOLBW_HUGE").is_ok_and(|v| v == "0") {
+            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+        }
         p as *mut u8
     }
 }
