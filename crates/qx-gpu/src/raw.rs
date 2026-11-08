@@ -26,7 +26,7 @@ pub static RAW: AtomicBool = AtomicBool::new(false);
 
 /// The info ring: slots of `WORDS` u64 each.
 const SLOTS: usize = 1 << 16;
-const WORDS: usize = 16;
+const WORDS: usize = 32;  // (the attention kernels take 17 info words)
 
 struct Module {
     funcs: HashMap<&'static str, sys::CUfunction>,
