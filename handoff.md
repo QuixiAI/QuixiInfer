@@ -35,10 +35,14 @@ compiled out below sm_90, `QX_NVCC_ARCHS`); loadgen `--dump`; notebook entries 8
 the raw launcher a wash; staged-ready words equal; decode staging share 8/8 and 5/8 flat at 256k; pool on 32 threads
 rejected (67.8 ms); the 256k decode wait is the CPU pool window (22 of 28 ms per token).
 
-**In flight on the GPU when we stopped:** `chain-srv2.sh` (scratchpad), the serve256k arms on chunk32 (the fixed
-binary): arm 0 (no chunk buffers, the reference) gave 42.9 / 106.7 ms per token (c1 / c3) and text hash
-bf4055905a; arms 4096, 8192, 4096 follow, each logging `SRV2 arm N :: ... texts <hash>` to the scratchpad's
-`chain-ab.out`. **Read them first when resuming:** the hashes must equal bf4055905a (same generations; else the
+**In flight on the GPU when we stopped:** `chain-srv2.sh`, the serve256k arms on chunk32 (the fixed binary): arm 0
+(no chunk buffers, the reference) gave 42.9 / 106.7 ms per token (c1 / c3) and text hash bf4055905a; arms 4096,
+8192, 4096 follow, each logging `SRV2 arm N :: ... texts <hash>`. Where to find them: this session's scratchpad is
+`/tmp/claude-1000/-home-eric-git-QuixiInfer/7b27a076-c316-432c-a7a6-fc085686af11/scratchpad/` (tmpfs: gone at a
+reboot; a new session gets a different scratchpad), markers in its `chain-ab.out`, the chain scripts `chain-*.sh`
+beside it; a waiter (`chain-save.sh`) copies the SRV2 lines, logs and text dumps into
+`perf/results/2026-11-07/srv2-chunk32/` (git-ignored, on disk) when the chain logs `SRV2-DONE`. A partial copy of
+`chain-ab.out` is there already. **Read them first when resuming:** the hashes must equal bf4055905a (same generations; else the
 flex tail still corrupts something), and the speeds should be about the reference's (same 1270 records). If they
 hold, run `perf/harness/bench.sh --cases serve256k -- QX_DS_CHUNK=8192` and `=4096` for the formal numbers, then
 decide the server's chunk default (8192 cut the 13.5k-prompt TTFT 42.3 -> 35.5 s at the same tier). Then install
@@ -459,7 +463,17 @@ Read `perf/backlog.md` families 9, 11, 12 and 6, `perf/findings.md` "The neighbo
   still off limits.
 - **Commit and push only when asked.** The user asked once for this workstream. Origin's default branch is
   `master`. `tools/golden/golden-dsv41` is a tracked binary that is modified and left uncommitted on purpose.
-- **Commit trailer:** `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- **Commit trailer:** `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` (was Opus 5.5 until 2026-11-07).
+- **Heavy jobs:** one at a time, inside a memory cap: `tools/capped.sh <GiB> <command...>` (a systemd scope with
+  `MemoryMax`), or the `systemd-run --user --scope -p MemoryMax=112G -p MemorySwapMax=0` form the chains use. No
+  cargo builds while a 100 GB engine run is up unless the build is itself capped (`-p MemoryMax=10G`, `-j4`); build
+  into `~/qx-targets/<name>` (never `/tmp`: tmpfs), keep binaries in `~/qx-bins/<name>`, install into
+  `target/release` atomically (`cp` to a dotfile, then `mv`) and only when no chain is using them.
+- **Standing loop:** `goal-prompt.md` at the repo root is the directive (set D at 256k, exactness, the notebook, the
+  3% / 8% bars, stop conditions). `perf/perf.md` is the measurement handbook; `perf/harness/bench.sh` and
+  `perf/harness/perf_diff.py gate|promote|score|index` are the tools; `perf/optimization_status.md` is the notebook
+  (90 entries, every outcome), `perf/backlog.md` the ranked ideas, `perf/findings.md` the facts, `perf/scoreboard.md`
+  the promoted rows.
 
 ## Where things stand
 
