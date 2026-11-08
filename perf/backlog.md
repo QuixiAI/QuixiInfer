@@ -263,6 +263,63 @@ exact prefill is far below the card (our profile agrees). Their prefill lead is 
    pre-stream 400 `context_length_exceeded` with a 1,024-token reserve, OOM retry with halved chunks, /health 503 on
    a dead engine thread.
 
+**Second pass (2026-11-08, after the counters showed the 256k decode wait is the pool window: 22 of 28 ms per token,
+~47 records through 16 threads at 0.37 ms each, 4.8 ms of NVMe fetch waits).** Their DeepSeek config runs the CPU lane,
+NVMe->CPU streaming by landed pieces and early write-back; the layer-ahead prediction, the staging pool, the fast
+publish kernel and X16 are OFF for DeepSeek (only GLM turns the first three on), so none of their DeepSeek numbers
+include them. Their per-layer timeline at 32k: 4.5 ms = copy 1.2 + MoE 1.6 + CPU wait 1.0 + rest 0.6; CPU 508 us per
+expert on 5 Zen 4 threads in RAM-only layers (0.39 experts/ms/thread against our 0.17 on the same H=5120/I=2304
+geometry). Ranked for us:
+
+9. **Dataflow CPU job, no stage barriers** (`ft_n135.h:688-979`): one unit queue prep -> gate/up bands -> act -> down
+   bands -> out, workers take units from one atomic counter and spin only on the counter of the job they need; a
+   unit is a contiguous 12 KB row band; late (NVMe) jobs' units are ordered by predicted landing. Our pool runs two
+   pool-wide barriers per layer call and splits every matrix over all 16 threads (`pool.rs:133-200`), so a 1.2-record
+   layer leaves threads idle at each barrier. Exact (integer sums, fixed output order). Measure first: one record on
+   one pinned core with no barriers; if ~0.4 ms the gap to our 0.37-per-record-on-16-threads is barriers/idle, if
+   ~0.9 ms it is the kernel or clocks. Expected 4-8 ms per 256k token if 20-40% of the window is idle. 2-4 days.
+10. **MWAITX idle waits for the power budget** (`nv2_host.cpp:66-77, 1737-1748`): their controller sleeping on
+   MONITORX/MWAITX instead of PAUSE spins lifted the lane cores from 4.34 to 4.8 GHz and the CPU cost per expert
+   from 0.40 to 0.29 ms (-27%). Our driver thread spins 2M iterations before sleeping and the pool threads spin at
+   barriers while the GPU runs attention. Check with turbostat during decode; then umwait/mwaitx (or a short spin
+   budget then futex) in the driver loop and the pool barriers. Exact. Hours; 2-5 ms per token if the pool is
+   compute-bound (25.7 GB/s says it is).
+11. **Per-layer makespan planner** (`nv2_host.cpp:926-1062`, `Pol` costs): the host splits each layer's host-served
+   picks between DMA and CPU to minimise max(cpu, gpu) from a cost model (DMA 0.36 ms per pick, CPU 0.42 + 0.12 per
+   extra token, 0.145 fixed), colder picks to the CPU so DMA-staged ones are the promotion candidates, NVMe picks to
+   whichever lane finishes first given the predicted landing. Ours is a fixed 3/8 share (the sweep said 3/8 at 1k
+   and 256k alike). Exact. 1-2 days with the constants from our own timeline (item 13).
+12. **NVMe reader classes and piece streaming into the pool** (`nv2_host.cpp:86-250, 1384-1406`): blocking O_DIRECT
+   preads on 16 threads (6.7-7 GB/s, no io_uring), 512 KB pieces for decode, demand FIFO capped at 12 MB in flight so
+   a layer's records land one after another, prefetch LIFO under a 6 MB cap, bulk behind; the CPU lane binds an NVMe
+   pick when its read starts and each band unit waits only for its own pieces. NVMe wait 6.2 ms per token with it,
+   25.3 in their exact (no CPU lane) mode. Ours: 7 NVMe records per token, 4.8 ms of fetch waits, read whole then
+   staged. Compute NVMe-landed records on the pool as their gate/up pieces land; cap demand bytes in flight. Exact.
+   1-2 ms per token. 2-3 days.
+13. **Per-layer timeline instrumentation** (`nv2_dev.cu` globaltimer ring + host CLOCK_REALTIME stamps, `nv2.py:874-937`):
+   publish, reply seen, copy start/end, CPU job start/end, last landing, combine start, per layer and split by layers
+   with/without NVMe reads. We know the 28 ms total; this names the per-layer parts and feeds item 11's constants.
+   1 day; do this before 9 and 11.
+14. **PCIe-contention gating of background copies** (`HC_CPDONE`/`HC_MOEDONE` flags, `nv2_host.cpp:403-406`): promotions
+   and write-backs only after the layer's critical copies finished. Ours issue promotions at the token boundary on
+   the copy stream, which may overlap the next layers' staged copies. Hours; up to promos x 0.19 ms per token.
+15. **Exclusive tiers with victim write-back by DMA** (`nv2_host.cpp:635-654, 720-775`): a VRAM victim parks in a 32-slot
+   VRAM ring, the host copies it D2H on a side stream (0.83 ms mean) and flips its home to RAM; "SM stores to host
+   memory run at ~4 GB/s vs 25 GB/s for the DMA engine". Ours evicts VRAM records that are still in RAM (inclusive at
+   the VRAM/RAM boundary), so no write-back; the point stands only if we ever drop the RAM copy of a VRAM resident
+   (+~1,700 RAM records). Low.
+16. **Zero-copy no-admit policy** (`LN_RZC/LN_NZC`, `nv_noadmit`): NVMe-landed picks and single-token verify picks are
+   read from RAM without taking a VRAM slot, so one-off picks cause no eviction churn. Hours; small.
+17. **Hygiene worth copying:** startup self-tests that disable a lane on any mismatch (`nv2.py:652-753`), a `verify()`
+   that byte-compares sampled VRAM/RAM slots against fresh O_DIRECT reads (`nv2.py:800-845`), per-record sha256 in
+   the store with re-read verify, `posix_fadvise(DONTNEED)` on the checkpoint after the tier fill (our 7-8 GB of
+   page cache from the pack mmap), the RAM tier sized from the cgroup's `memory.max - current - margin`, OOM retry
+   with halved prefill chunks, bounded device waits that raise an error word a watchdog turns into SIGTERM.
+18. Checked, not for us: X16 (CPU emulation of fp16 MMA rounding at 5.5x; `docs/x16.md`'s "would INT32 accumulation
+   fix it" is our design), B70 remote tier, BCP/tail skip (lossy), the EXL3 VBMI trellis lane, their attention/KV
+   (all exllamav3's; no paging, no indexer), the pinned bounce-slot loader (exllamav3-specific), hugepages/NUMA
+   (absent). Their CPU-lane result is not bit-exact with their GPU path (fp32 partial, KL 0.001); only X16 is.
+
 Not transferable: warm prefill / BCP / tail skip (lossy, and they attack an NVMe floor our tier removes); the int16
 VBMI trellis lane (EXL3-specific; our pool is DRAM-bound at decode); X16 (emulating fp16 tensor-core rounding on the
 CPU at 5.5x the cost: the problem our integer kernels designed away); the dynamic per-layer lane planner (our share
