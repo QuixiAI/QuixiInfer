@@ -1,4 +1,4 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, late evening)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, night)
 
 ## Goal
 
@@ -19,6 +19,19 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   lossy opt-in option by the goal's rules, not taken; exact forms first.
 - Landed since noon: `qx_ds_topk2` (decode256k 45.4 -> 43.5-44.2, 8fae0e7), the server's 4096 chunk default
   (42c23e7), README on today's facts (53a86c8). Set D row 31.470 (d6cfb45).
+
+## Update 2026-11-08, night: resumed; the flex tail is clean in the server, 8192 is the server default, set D running
+
+- All three serve arms on the fixed binary (4096, 8192, 4096) generate the same texts as the no-chunk reference,
+  prompt by prompt (`tools/compare_dumps.py`); formal serve256k: 8192 107.18 / 42.34, 4096 107.07 / 40.16
+  (serve256k3 / serve256k1) against the baseline's 109.65 / 43.61. Server default 8192 (328338b). Notebook 91.
+- Running: `chain-setd5.sh` = ds-checks on chunk34 (the landed tree) then `bench.sh --check` on the full set D
+  (label `setd-flex`), `SETD5` lines in `chain-ab.out`. When done: `perf_diff.py promote` + `score --record` if
+  ds-checks and the correctness column pass; expected score a little under 30.210 (serve256k3 -2.3%, the rest
+  unchanged).
+- Written meanwhile (uncommitted until measured): a host-side per-layer timeline in the driver's stats line
+  (`serve N calls: read/issue/total/gap us`, backlog family 15 item 13, first step): where the host's part of
+  the 0.7 ms per layer goes before touching the pool's structure.
 
 ## Update 2026-11-08, late evening: stopping for a while — where everything stands
 
