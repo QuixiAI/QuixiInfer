@@ -48,10 +48,11 @@ unsafe impl Send for Launcher {}
 
 static LAUNCHER: Mutex<Option<Launcher>> = Mutex::new(None);
 
-/// Whether the raw launcher is enabled for this process (`QX_RAW_LAUNCH=1`).
+/// Whether the raw launcher is enabled for this process: the default since 2026-11-08 (set D 31.470 -> 30.210 with it;
+/// `QX_RAW_LAUNCH=0` sends the chunk path's launches through CubeCL again).
 pub fn enabled() -> bool {
     static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *U.get_or_init(|| std::env::var("QX_RAW_LAUNCH").is_ok_and(|v| v == "1"))
+    *U.get_or_init(|| !std::env::var("QX_RAW_LAUNCH").is_ok_and(|v| v == "0"))
 }
 
 fn launcher() -> std::sync::MutexGuard<'static, Option<Launcher>> {
