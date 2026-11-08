@@ -162,6 +162,8 @@ impl EventStreamBackend for CudaStreamBackend {
             MemoryManagementOptions::new("Pinned CPU Memory").mode(MemoryAllocationMode::Auto),
         );
 
+        // QuixiInfer: the raw stream handle, for launches that bypass the client/server channel (qx_gpu::raw)
+        crate::QX_STREAMS.lock().unwrap().push(stream as usize);
         Ok(Stream {
             sys: stream,
             memory_management_gpu,

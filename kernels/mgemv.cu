@@ -314,6 +314,92 @@ extern "C" __global__ void __launch_bounds__(256) qx_mgemv_t8(const u64* info) {
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu_t8(const u64* info) { mgemv<1, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t8(const u64* info) { mgemv<2, 8>(info); }
 #endif
+
+/// The f32-path segments (dequantized rows against f32 inputs) with 2 rows per block, for split-K segments of at most
+/// 4,096 columns (the engine's ZF table): the lane's two steps decoded once per block, both steps' inputs loaded
+/// before the arithmetic; per (row, token) the chain is `row_partial`'s for (lane, 32, warp, 8) at these widths,
+/// single steps into a0 and out = (a0 + a1) + (a2 + a3) with a1..a3 zero, spelled out so the bits are the same.
+/// Its own kernel so its register budget is its own: a union with the Q8 branch halved the one-row code's occupancy
+/// (2026-11-07 engine profile: 3,289 us against 1,774 on a 5,120 x 8,192 Q6_K launch).
+template <int XM, int NT> QX_DEV void mgemv_zf(const u64* info) {
+    const u64* segs = reinterpret_cast<const u64*>(info[1]);
+    const u32 nseg = (u32)info[2];
+    u32 s = 0;
+    while (s + 1 < nseg && blockIdx.x >= (u32)segs[(s + 1) * 8 + 6]) ++s;
+    const u64* d = segs + s * 8;
+    const u32 rows = (u32)d[2], cols = (u32)d[3], ty = (u32)d[4];
+    const u64 stride = d[7] ? d[7] : type_row_bytes(ty, cols);
+    const u32 blk = blockIdx.x - (u32)d[6];
+    const u32 warp = threadIdx.x / 32, wl = threadIdx.x % 32;
+    float* y = reinterpret_cast<float*>(d[1]);
+    const u32 nz = (u32)(info[5] >> 32) ? (u32)(info[5] >> 32) : 1;
+    constexpr int RBF = 2;
+    __shared__ float part[8][RBF * 128];
+    const u32 r0 = blk * RBF;
+    const u32 nr = min((u32)RBF, rows - r0);
+    const u8* w = reinterpret_cast<const u8*>(d[0]) + (u64)r0 * stride;
+    const u32 b0 = warp * 256 + 8 * wl, b1 = b0 + 8 * 256;
+    // the reference's steps for this lane: st = warp while st * 256 < cols (so none at all for the warps past
+    // a row of fewer than 2,048 columns), then warp + 8 when that is still inside the row
+    const bool one = b0 < cols, two = b1 < cols;
+    float w0[RBF][8], w1[RBF][8];
+#pragma unroll
+    for (int r = 0; r < RBF; ++r) {
+        const u8* row = w + (u64)(r < nr ? r : 0) * stride;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) w0[r][i] = w1[r][i] = 0.f;
+        if (!one) continue;
+        switch (ty) {
+#define DQ(t) case t: dec<t>(row, cols, b0, w0[r]); if (two) dec<t>(row, cols, b1, w1[r]); break;
+            DQ(QX_F32) DQ(QX_BF16) DQ(QX_Q8_0) DQ(QX_Q6_K) DQ(QX_IQ4_NL) DQ(QX_IQ3_S) DQ(QX_IQ2_S) DQ(QX_Q6_K_P) DQ(QX_NVFP4)
+            DQ(QX_IQ2_XXS) DQ(QX_IQ2_XS) DQ(QX_IQ3_XXS) DQ(QX_IQ1_S) DQ(QX_Q2_K) DQ(QX_Q5_K)
+#undef DQ
+            default:
+#pragma unroll
+                for (int i = 0; i < 8; ++i) w0[r][i] = w1[r][i] = 0.f;
+        }
+    }
+    for (u32 z = 0; z < nz; ++z) {
+        const u64 z0 = (u64)z * NT;
+        float a0[RBF][NT];
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+            XIn<XM> xi;
+            xi.x = reinterpret_cast<const float*>(info[0]) + (z0 + n) * info[3];
+            xi.arg = XM == 2 ? info[4] + 4ull * (z0 + n) * info[3] : info[4];
+            xi.xq = nullptr;
+            xi.xd = nullptr;
+            float4 xa = make_float4(0.f, 0.f, 0.f, 0.f), xb = xa, xc = xa, xd = xa;
+            if (one) ldx8<XM>(xi, b0, xa, xb);
+            if (two) ldx8<XM>(xi, b1, xc, xd);
+#pragma unroll
+            for (int r = 0; r < RBF; ++r) {
+                float a = 0.f;
+                if (one) a += dot8x(w0[r], xa, xb);
+                if (two) a += dot8x(w1[r], xc, xd);
+                a0[r][n] = a;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < RBF; ++r)
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                const float v = warp_sum((a0[r][n] + 0.f) + (0.f + 0.f));
+                if (wl == 0) part[warp][r * 128 + z0 + n] = v;
+            }
+    }
+    __syncthreads();
+    const u32 nt = nz * NT;
+    for (u32 i = threadIdx.x; i < RBF * nt; i += blockDim.x) {
+        const u32 r = i / nt, n = i % nt;
+        if (r < nr) {
+            float t = 0.f;
+            for (int k = 0; k < 8; ++k) t += part[k][r * 128 + n];
+            y[(info[6] + n) * rows + r0 + r] = t;
+        }
+    }
+}
+
 /// `mgemv_z` with one barrier per block instead of two per group: on the split-K path each warp's partial for every
 /// (group, token) goes to shared memory as it is computed (the warp_sum needs no barrier), and one pass at the end
 /// sums the 8 warps per token in the same order (t = 0, then warps 0..7). The row-blocked attempt (`mgemv_zr`)
@@ -484,123 +570,7 @@ template <int XM, int NT, int RB> QX_DEV void mgemv_zt(const u64* info) {
         }
         return;
     }
-    if (lanes == 0 && ty != QX_Q8_0_P && cols <= 4096) {
-        // the f32 path (dequantized rows against f32 inputs), RBF rows per block, the lane's two steps (warp, and
-        // warp + 8 when cols == 4096) decoded once per block instead of once per token group (bench: 240 -> 176 us
-        // on 1,024 planar-Q6_K rows), both steps' inputs loaded before the arithmetic. The chain per (row, token)
-        // is `row_partial`'s for (lane, 32, warp, 8) at cols <= 4096: single steps into a0, out = (a0 + a1) + (a2 + a3)
-        // with a1..a3 zero, spelled out below so the bits are the same.
-        constexpr int RBF = 2;
-        const u32 r0 = blk * RBF;
-        const u32 nr = min((u32)RBF, rows - r0);
-        const u8* w = reinterpret_cast<const u8*>(d[0]) + (u64)r0 * stride;
-        const u32 b0 = warp * 256 + 8 * wl, b1 = b0 + 8 * 256;
-        // the reference's steps for this lane: st = warp while st * 256 < cols (so none at all for the warps past
-        // a row of fewer than 2,048 columns), then warp + 8 when that is still inside the row
-        const bool one = b0 < cols, two = b1 < cols;
-        float w0[RBF][8], w1[RBF][8];
-#pragma unroll
-        for (int r = 0; r < RBF; ++r) {
-            const u8* row = w + (u64)(r < nr ? r : 0) * stride;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) w0[r][i] = w1[r][i] = 0.f;
-            if (!one) continue;
-            switch (ty) {
-#define DQ(t) case t: dec<t>(row, cols, b0, w0[r]); if (two) dec<t>(row, cols, b1, w1[r]); break;
-                DQ(QX_F32) DQ(QX_BF16) DQ(QX_Q8_0) DQ(QX_Q6_K) DQ(QX_IQ4_NL) DQ(QX_IQ3_S) DQ(QX_IQ2_S) DQ(QX_Q6_K_P) DQ(QX_NVFP4)
-                DQ(QX_IQ2_XXS) DQ(QX_IQ2_XS) DQ(QX_IQ3_XXS) DQ(QX_IQ1_S) DQ(QX_Q2_K) DQ(QX_Q5_K)
-#undef DQ
-                default:
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) w0[r][i] = w1[r][i] = 0.f;
-            }
-        }
-        for (u32 z = 0; z < nz; ++z) {
-            const u64 z0 = (u64)z * NT;
-            float a0[RBF][NT];
-#pragma unroll
-            for (int n = 0; n < NT; ++n) {
-                XIn<XM> xi;
-                xi.x = reinterpret_cast<const float*>(info[0]) + (z0 + n) * info[3];
-                xi.arg = XM == 2 ? info[4] + 4ull * (z0 + n) * info[3] : info[4];
-                xi.xq = nullptr;
-                xi.xd = nullptr;
-                float4 xa = make_float4(0.f, 0.f, 0.f, 0.f), xb = xa, xc = xa, xd = xa;
-                if (one) ldx8<XM>(xi, b0, xa, xb);
-                if (two) ldx8<XM>(xi, b1, xc, xd);
-#pragma unroll
-                for (int r = 0; r < RBF; ++r) {
-                    float a = 0.f;
-                    if (one) a += dot8x(w0[r], xa, xb);
-                    if (two) a += dot8x(w1[r], xc, xd);
-                    a0[r][n] = a;
-                }
-            }
-#pragma unroll
-            for (int r = 0; r < RBF; ++r)
-#pragma unroll
-                for (int n = 0; n < NT; ++n) {
-                    const float v = warp_sum((a0[r][n] + 0.f) + (0.f + 0.f));
-                    if (wl == 0) part[warp][r * 128 + z0 + n] = v;
-                }
-        }
-        __syncthreads();
-        const u32 nt = nz * NT;
-        for (u32 i = threadIdx.x; i < RBF * nt; i += blockDim.x) {
-            const u32 r = i / nt, n = i % nt;
-            if (r < nr) {
-                float t = 0.f;
-                for (int k = 0; k < 8; ++k) t += part[k][r * 128 + n];
-                y[(info[6] + n) * rows + r0 + r] = t;
-            }
-        }
-        return;
-    }
-    // every other segment: the one-row code with one barrier per block
-    for (u32 z = 0; z < nz; ++z) {
-        const u64 z0 = (u64)z * NT;
-        XIn<XM> x[NT];
-#pragma unroll
-        for (int n = 0; n < NT; ++n) {
-            x[n].x = reinterpret_cast<const float*>(info[0]) + (z0 + n) * info[3];
-            x[n].arg = XM == 2 ? info[4] + 4ull * (z0 + n) * info[3] : info[4];
-            x[n].xq = info[7] ? reinterpret_cast<const i8*>(info[7]) + (z0 + n) * info[9] : nullptr;
-            x[n].xd = info[7] ? reinterpret_cast<const float*>(info[8]) + (z0 + n) * (info[9] / 32) : nullptr;
-        }
-        float a[NT];
-        if (lanes == 0) {
-            const u32 r = blk;
-            partial<XM, NT>(ty, reinterpret_cast<const u8*>(d[0]) + (u64)r * stride, x, cols, wl, 32, warp, 8, a);
-#pragma unroll
-            for (int n = 0; n < NT; ++n) {
-                const float v = warp_sum(a[n]);
-                if (wl == 0) part[warp][z0 + n] = v;
-            }
-            continue;
-        }
-        const u32 rpw = 32 / lanes;  // rows per warp
-        const u32 r = (blk * 8 + warp) * rpw + wl / lanes;
-        const u32 lane = wl % lanes;
-        if (r < rows) partial<XM, NT>(ty, reinterpret_cast<const u8*>(d[0]) + (u64)r * stride, x, cols, lane, lanes, 0, 1, a);
-        else
-#pragma unroll
-            for (int n = 0; n < NT; ++n) a[n] = 0.f;
-#pragma unroll
-        for (int n = 0; n < NT; ++n) {
-            float v = a[n];
-            for (u32 o = lanes / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-            if (r < rows && lane == 0) y[(info[6] + z0 + n) * rows + r] = v;
-        }
-    }
-    if (lanes == 0) {
-        __syncthreads();
-        const u32 nt = nz * NT;
-        for (u32 n = threadIdx.x; n < nt; n += blockDim.x) {
-            float t = 0.f;
-            for (int i = 0; i < 8; ++i) t += part[i][n];
-            y[(info[6] + n) * rows + blk] = t;
-        }
-    }
+    // (the engine's ZT table holds planar-Q8 split-K segments only; other kinds launch on mgemv_zf / mgemv_z)
 }
 
 #ifndef QX_MGEMV_BENCH
@@ -608,6 +578,10 @@ template <int XM, int NT, int RB> QX_DEV void mgemv_zt(const u64* info) {
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_t8z(const u64* info) { mgemv_z<0, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu_t8z(const u64* info) { mgemv_z<1, 8>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t8z(const u64* info) { mgemv_z<2, 8>(info); }
+// the f32-path split-K segments of at most 4,096 columns, 2 rows per block (the ZT launch's second table)
+extern "C" __global__ void __launch_bounds__(256) qx_mgemv_t8zf(const u64* info) { mgemv_zf<0, 8>(info); }
+extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu_t8zf(const u64* info) { mgemv_zf<1, 8>(info); }
+extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silumul_t8zf(const u64* info) { mgemv_zf<2, 8>(info); }
 // one barrier per block and 4 rows per block on the Q8 split-K segments (`QX_MGEMV_ZT=1`)
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_t8zt(const u64* info) { mgemv_zt<0, 8, 4>(info); }
 extern "C" __global__ void __launch_bounds__(256) qx_mgemv_silu_t8zt(const u64* info) { mgemv_zt<1, 8, 4>(info); }

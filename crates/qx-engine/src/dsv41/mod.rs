@@ -1619,6 +1619,8 @@ impl<'a> DsEngine<'a> {
         for &w in &widths {
             self.warm_width(w, pos0, pos0 + w - 1);
         }
+        // QX_RAW_LAUNCH=1: this pass's launches through the driver API on CubeCL's stream (qx_gpu::raw)
+        let _raw = qx_gpu::raw::Scope::enter();
         self.chunk_warm();
         // the chunk arrays and the Engram rows of every row
         {

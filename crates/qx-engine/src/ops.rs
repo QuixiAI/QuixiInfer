@@ -106,9 +106,11 @@ pub struct MGemv {
     /// `table`'s entries for the segments that are not planar Q8_0 (entries, blocks, segments): beside the int8
     /// `qx_tmv`, these run in f32, each token with the bits of its one-token product.
     pub rest: (qx_gpu::mem::DeviceBuf, u32, usize),
-    /// The one-launch path's table with 4 rows per block on the planar Q8_0 split-K segments (`qx_mgemv_*_t8zt`):
-    /// (entries, blocks, segments).
-    pub ztable: (qx_gpu::mem::DeviceBuf, u32, usize),
+    /// The one-launch path's tables by segment kind (`QX_MGEMV_ZT=1`), each (entries, blocks, segments): [0] the
+    /// planar Q8_0 split-K segments, 4 rows per block (`qx_mgemv_*_t8zt`); [1] the other split-K segments of at
+    /// most 4,096 columns, 2 rows per block (`_t8zf`); [2] the rest, as the one-row `_t8z`. One kernel per kind so
+    /// each has its own register budget (a union halved the one-row code's occupancy, 2026-11-07).
+    pub ztable: [(qx_gpu::mem::DeviceBuf, u32, usize); 3],
     /// `qx_tmv`'s tables (entries, blocks, segments): every segment (bf16); the planar Q8_0 ones (int8 entry).
     pub ttable: [(qx_gpu::mem::DeviceBuf, u32, usize); 2],
     /// The input length every segment shares.
@@ -210,7 +212,7 @@ impl MGemv {
         let mut blocks = 0u32;
         // the same entries for the segments that are not planar Q8_0 alone: `qx_tmv`'s int8 mode runs them here
         let (mut rwords, mut rblocks) = (Vec::new(), 0u32);
-        let (mut zwords, mut zblocks) = (Vec::new(), 0u32);
+        let mut zw: [(Vec<u64>, u32); 3] = [(Vec::new(), 0), (Vec::new(), 0), (Vec::new(), 0)];
         for s in segs {
             // Row-per-warp needs enough blocks to fill 170 SMs several times; otherwise split each row's columns
             // across a block's warps.
@@ -224,10 +226,10 @@ impl MGemv {
             let nb = if lanes == 0 { s.rows as u32 } else { (s.rows as u32).div_ceil(8 * (32 / lanes as u32)) };
             words.extend_from_slice(&[s.w, s.y, s.rows as u64, s.cols as u64, s.qx, lanes, blocks as u64, s.stride as u64]);
             blocks += nb;
-            // 4 rows per block on the planar Q8_0 split-K segments, 2 on the other split-K ones (the f32 path)
-            let znb = if lanes == 0 && (s.qx == QX_Q8_0_P || s.cols <= 4096) { (s.rows as u32).div_ceil(if s.qx == QX_Q8_0_P { 4 } else { 2 }) } else { nb };
-            zwords.extend_from_slice(&[s.w, s.y, s.rows as u64, s.cols as u64, s.qx, lanes, zblocks as u64, s.stride as u64]);
-            zblocks += znb;
+            // by kind: planar Q8_0 split-K (4 rows per block), other split-K at <= 4,096 columns (2 rows), the rest
+            let (zi, znb) = if lanes == 0 && s.qx == QX_Q8_0_P { (0usize, (s.rows as u32).div_ceil(4)) } else if lanes == 0 && s.cols <= 4096 { (1, (s.rows as u32).div_ceil(2)) } else { (2, nb) };
+            zw[zi].0.extend_from_slice(&[s.w, s.y, s.rows as u64, s.cols as u64, s.qx, lanes, zw[zi].1 as u64, s.stride as u64]);
+            zw[zi].1 += znb;
             if s.qx != QX_Q8_0_P {
                 rwords.extend_from_slice(&[s.w, s.y, s.rows as u64, s.cols as u64, s.qx, lanes, rblocks as u64, s.stride as u64]);
                 rblocks += nb;
@@ -275,7 +277,8 @@ impl MGemv {
         let tab = |l: usize| (qx_gpu::mem::DeviceBuf::from_slice(if tw[l].0.is_empty() { &[0u64][..] } else { &tw[l].0 }), tw[l].1, tw[l].0.len() / 12);
         let rn = rwords.len() / 8;
         let rtable = qx_gpu::mem::DeviceBuf::from_slice(if rn == 0 { &[0u64][..] } else { &rwords });
-        let ztable = (qx_gpu::mem::DeviceBuf::from_slice(&zwords), zblocks, segs.len());
+        let zt = |i: usize| (qx_gpu::mem::DeviceBuf::from_slice(if zw[i].0.is_empty() { &[0u64; 8][..] } else { &zw[i].0 }), zw[i].1, zw[i].0.len() / 8);
+        let ztable = [zt(0), zt(1), zt(2)];
         Self { table: qx_gpu::mem::DeviceBuf::from_slice(&words), n: segs.len(), blocks, rest: (rtable, rblocks, rn), ztable, ttable: [tab(0), tab(1)], tcols, q8, _tscratch: (partials, counters) }
     }
 
@@ -365,14 +368,19 @@ impl MGemv {
             const ZB: [&str; 3] = ["qx_mgemv_t8zb", "qx_mgemv_silu_t8zb", "qx_mgemv_silumul_t8zb"];
             // QX_MGEMV_ZT=1: one barrier per block and 4 rows per block on the Q8 split-K segments (its own table)
             const ZT: [&str; 3] = ["qx_mgemv_t8zt", "qx_mgemv_silu_t8zt", "qx_mgemv_silumul_t8zt"];
-            let (entry, tab, blocks) = if zt() {
-                (ZT[mode as usize], self.ztable.0.ptr, self.ztable.1)
-            } else if zb() {
-                (ZB[mode as usize], self.table.ptr, self.blocks)
-            } else {
-                (ZENTRIES[mode as usize], self.table.ptr, self.blocks)
-            };
-            gpu.run(modules::MGEMV.kernel(entry, CubeDim::new_1d(256)), (blocks, 1, 1), &[x, tab, self.n as u64, x_stride as u64, arg, 8 | (((t / 8) as u64) << 32), 0, xq, xd, self.tcols as u64]);
+            const ZF: [&str; 3] = ["qx_mgemv_t8zf", "qx_mgemv_silu_t8zf", "qx_mgemv_silumul_t8zf"];
+            if zt() {
+                // one launch per segment kind present
+                for (i, entries) in [(0usize, &ZT), (1, &ZF), (2, &ZENTRIES)] {
+                    let (tab, blocks, n) = &self.ztable[i];
+                    if *n > 0 {
+                        gpu.run(modules::MGEMV.kernel(entries[mode as usize], CubeDim::new_1d(256)), (*blocks, 1, 1), &[x, tab.ptr, *n as u64, x_stride as u64, arg, 8 | (((t / 8) as u64) << 32), 0, xq, xd, self.tcols as u64]);
+                    }
+                }
+                return;
+            }
+            let entry = if zb() { ZB[mode as usize] } else { ZENTRIES[mode as usize] };
+            gpu.run(modules::MGEMV.kernel(entry, CubeDim::new_1d(256)), (self.blocks, 1, 1), &[x, self.table.ptr, self.n as u64, x_stride as u64, arg, 8 | (((t / 8) as u64) << 32), 0, xq, xd, self.tcols as u64]);
             return;
         }
         for c in (0..t).step_by(8) {

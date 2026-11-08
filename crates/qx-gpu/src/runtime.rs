@@ -42,8 +42,13 @@ impl Gpu {
         self.client.launch(Box::new(k), CubeCount::Static(grid.0, grid.1, grid.2), args);
     }
 
-    /// Launches `k` with no buffer bindings: every address travels in `info`.
+    /// Launches `k` with no buffer bindings: every address travels in `info`. Inside a chunk pass with
+    /// `QX_RAW_LAUNCH=1` the launch goes through the driver API on CubeCL's stream (`crate::raw`).
     pub fn run(&self, k: CudaSource, grid: (u32, u32, u32), info: &[u64]) {
+        if crate::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::raw::launch(&k.module, k.entry, k.cube_dim.0.x, grid, info);
+            return;
+        }
         self.launch(k, grid, &[], info);
     }
 

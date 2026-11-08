@@ -94,3 +94,8 @@ mod tests {
     cubecl_core::testgen_profiling!();
     cubecl_core::testgen_profiling_nested!();
 }
+
+/// QuixiInfer: every CUDA stream this backend created, as raw `CUstream` handles (usize), in creation order. The
+/// engine's raw launcher (`qx_gpu::raw`) enqueues on the first one, the client's default stream, so its launches
+/// stay ordered with CubeCL's.
+pub static QX_STREAMS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
