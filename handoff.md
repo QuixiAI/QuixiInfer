@@ -48,9 +48,12 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   hard-coded `sm_120a` in the raw launcher, the NVRTC validation and the tmv launch plan; software E4M3 conversions
   below sm_89 (`kernels/bench/e4m3_check.cu` checks every float against the instructions; queued on the GPU);
   `qx_tmv`'s bf16 form compiled out below sm_90 and never selected there (`use_tmv`); `QX_NVCC_ARCHS` for the
-  build-time nvcc check. attn/gemm/prefill/smoke now compile for sm_86; the full sm_86/sm_89 matrix is running
-  (mgemv's ptxas takes minutes per target). README has an "Other GPUs" paragraph. Untested on real 30/40-series
-  cards: nothing here can be measured on this box beyond compiling.
+  build-time nvcc check. Done: every module compiles for sm_86 and sm_89 (mgemv: 22 min of ptxas per target;
+  small spills in `qx_mgemv_t8/_t8zb/_t3` and `qx_tmv_q8_*` on both, a speed matter on those cards); the software
+  E4M3 is bit-identical to the instructions over every float and byte (NaN loses its sign: 0x7f, and decodes to
+  0x7fffffff). README has an "Other GPUs" paragraph. Untested on real 30/40-series cards: nothing here can be
+  measured on this box beyond compiling. What a 24 GB card would need next: `--ctx`/`--slots` defaults sized from
+  free VRAM (today the expert tier just takes what is left), and a PCIe 4.0 staging share sweep.
 
 ## Update 2026-11-08, morning: set D 30.210; the GEMV kernels and the raw launcher are the defaults
 

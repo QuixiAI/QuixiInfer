@@ -139,7 +139,9 @@ dense weights, the context slots and the staging area, so a 24 GB card at 256k c
 serves most from RAM (set `--ctx` and `--slots` to what the card can hold; `QX_DS_STAGE_CAP` shrinks the 2.4 GB
 staging area); PCIe 4.0 lands a 9.5 MB expert record in 0.4 ms against 0.2 on PCIe 5.0, which moves the best
 staging share (`QX_DS_STAGE_SHARE_DECODE`) toward the CPU pool. `QX_NVCC_ARCHS=sm_86,sm_89,sm_120a cargo build`
-compiles every kernel for all three at build time. Only the 5090 has been run here; the other two are build-checked.
+compiles every kernel for all three at build time (the default check is `sm_120a` alone; on a 40-series box set
+`QX_NVCC_ARCHS=sm_89`, the check takes about 20 minutes per target the first time). Only the 5090 has been run
+here; the other two are build-checked.
 
 **2. Make the model pack.** Download [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
 (`tools/pardl.py` is a parallel, resumable downloader). Convert it with llama.cpp PR #30817's converter, which
