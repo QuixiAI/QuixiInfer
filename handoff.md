@@ -1,4 +1,4 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, evening)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, late evening)
 
 ## Goal
 
@@ -19,6 +19,39 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   lossy opt-in option by the goal's rules, not taken; exact forms first.
 - Landed since noon: `qx_ds_topk2` (decode256k 45.4 -> 43.5-44.2, 8fae0e7), the server's 4096 chunk default
   (42c23e7), README on today's facts (53a86c8). Set D row 31.470 (d6cfb45).
+
+## Update 2026-11-08, late evening: stopping for a while — where everything stands
+
+**Head: 6fadd17.** Promoted set D baseline is still 30.210 on fd2473e (nothing promoted since; every later run
+was flat, rejected, or withdrawn). Tree clean except `tools/golden/golden-dsv41` (modified on purpose, never commit).
+
+**Landed since the morning (all pushed):** the elastic flex tail (bb9e370) with the straddle fix and the refill; the
+warm-up bug fix (251d142: the server's `chunk_warm` dry pass wrote live expert records until the tail was taken) and
+its guard (6fadd17, `assert_flex_held`); staged-ready words knob (`QX_DS_STG_WAIT=words`, off, equal); portability
+to sm_86/sm_89 (bd4c2af, c7d838d, 94fa2fd: runtime arch detection, software E4M3 verified bit for bit, bf16 tmv
+compiled out below sm_90, `QX_NVCC_ARCHS`); loadgen `--dump`; notebook entries 84-90; backlog family 15 second pass.
+
+**Measured and recorded (no default change):** PCIe landing 0.19 ms per record (bus ceiling); slab attention under
+the raw launcher a wash; staged-ready words equal; decode staging share 8/8 and 5/8 flat at 256k; pool on 32 threads
+rejected (67.8 ms); the 256k decode wait is the CPU pool window (22 of 28 ms per token).
+
+**In flight on the GPU when we stopped:** `chain-srv2.sh` (scratchpad), the serve256k arms on chunk32 (the fixed
+binary): arm 0 (no chunk buffers, the reference) gave 42.9 / 106.7 ms per token (c1 / c3) and text hash
+bf4055905a; arms 4096, 8192, 4096 follow, each logging `SRV2 arm N :: ... texts <hash>` to the scratchpad's
+`chain-ab.out`. **Read them first when resuming:** the hashes must equal bf4055905a (same generations; else the
+flex tail still corrupts something), and the speeds should be about the reference's (same 1270 records). If they
+hold, run `perf/harness/bench.sh --cases serve256k -- QX_DS_CHUNK=8192` and `=4096` for the formal numbers, then
+decide the server's chunk default (8192 cut the 13.5k-prompt TTFT 42.3 -> 35.5 s at the same tier). Then install
+`~/qx-bins/chunk33` (= head with the guard; chunk32 is installed in target/release now) and run ds-checks on it.
+
+**Next levers, in order (backlog family 15, items 9-13):** per-layer timeline instrumentation of the host wait
+(1 day; names the per-layer parts); then the pool's barrier structure (dataflow units, measure one record on one
+core first) and MWAITX/umwait idle waits (turbostat during decode first); then the per-layer DMA/pool split. The
+rest of the 44.7 ms at 256k is kernels already at their bars.
+
+**Portability caveats:** only compile-checked for sm_86/sm_89; small register spills in `qx_mgemv_t8/_t8zb/_t3` and
+`qx_tmv_q8_*` on those targets; a 24 GB card needs `--ctx`/`--slots` sized to free VRAM (the tier takes what is
+left) and a PCIe 4.0 staging-share sweep; nothing of that can be measured on this box.
 
 ## Update 2026-11-08, evening: the flex tail landed; the 256k wait is the CPU pool; portability to the 30/40 series begun
 
