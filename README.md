@@ -132,7 +132,7 @@ cargo build --release      # target/release/quixiinfer, qx-pack and the check to
 **Other GPUs (RTX 40 and 30 series).** The engine reads the card's compute capability at start and compiles its
 kernels for it (the same target CubeCL uses: `sm_120a` on Blackwell, `sm_89` / `sm_86` on Ada / Ampere). What
 differs by card: the FP8 KV-cache conversions use Ada's `cvt` instructions from sm_89 on and a bit-identical software
-form before it (`kernels/bench/e4m3_check.cu` compares it with the instructions over every float); the bf16 tensor-core products for batched decode
+form before it (checked bit for bit against the instructions over every float and every byte, `kernels/bench/e4m3_check.cu`); the bf16 tensor-core products for batched decode
 (`qx_tmv`) need 51 KB of static shared memory and exist from sm_90 on, so on the 40 and 30 series batched decode
 stays on the f32 path (exact, slower per token above 8 sequences); the expert tier is what is left of VRAM after the
 dense weights, the context slots and the staging area, so a 24 GB card at 256k context holds few experts and

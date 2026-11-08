@@ -42,14 +42,15 @@ QX_DEV u16 f32_to_f16(float f) {
 // The conversions are Ada's (sm_89) and later cards' `cvt` instructions; on older cards (the RTX 30 series, sm_86)
 // the same values come from the `_sw` forms below; `kernels/bench/e4m3_check.cu` compares them bit for bit with the
 // instructions over every float. E4M3 here is the OCP FP8 E4M3FN encoding: bias 7, no infinities,
-// 0x7f / 0xff NaN, largest finite 448; the f32 conversion saturates to +-448 and keeps NaN.
+// 0x7f / 0xff NaN, largest finite 448; the f32 conversion saturates to +-448 and turns any NaN into 0x7f (the
+// checker found the instruction drops a NaN's sign both ways; every other pattern matched at the first try).
 
 /// One float to one E4M3 byte in software (round to nearest even, saturating to the largest finite value).
 QX_DEV u8 f32_to_e4m3_sw(float f) {
     const u32 u = __float_as_uint(f);
     const u8 s = (u8)((u >> 24) & 0x80);
     const u32 a = u & 0x7fffffffu;
-    if (a > 0x7f800000u) return s | 0x7f;                // NaN
+    if (a > 0x7f800000u) return 0x7f;                    // NaN: the instruction drops the sign
     if (a >= 0x43e00000u) return s | 0x7e;               // >= 448 (infinity included): the largest finite
     if (a < 0x3c800000u) {                               // below 2^-6: subnormal, units of 2^-9 (rint: ties to even)
         const int m = __float2int_rn(__uint_as_float(a) * 512.0f);
@@ -62,11 +63,12 @@ QX_DEV u8 f32_to_e4m3_sw(float f) {
     return s | (u8)r;
 }
 
-/// One E4M3 byte to a float in software (exact; NaN as the canonical f32 NaN with the sign kept).
+/// One E4M3 byte to a float in software (exact; a NaN byte gives what the instructions give through f16: the
+/// positive all-ones NaN, 0x7fffffff, whatever the byte's sign).
 QX_DEV float e4m3_to_f32_sw(u8 v) {
     const u32 s = ((u32)v & 0x80) << 24;
     const u32 e = (v >> 3) & 15, m = v & 7;
-    if (e == 15 && m == 7) return __uint_as_float(s | 0x7fc00000u);
+    if (e == 15 && m == 7) return __uint_as_float(0x7fffffffu);
     const float mag = e == 0 ? (float)m * (1.0f / 512.0f) : ldexpf(1.0f + (float)m * 0.125f, (int)e - 7);
     return __uint_as_float(s | __float_as_uint(mag));
 }
