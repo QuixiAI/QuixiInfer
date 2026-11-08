@@ -205,6 +205,48 @@ invented one. The aggregate score lives in `scoreboard.md`.
 - **Kill criteria:** achieved bandwidth already above 70% of peak on the shapes that carry the time, or any
   change that breaks `tools/ds-checks.sh` line 3.
 
+### 15. Big-MoE-Small-Box (casper-hansen, exllamav3-based, 3090 + 64 GB) read 2026-11-08: what is worth porting
+
+Source: ~/git/Big-MoE-Small-Box (code read, mechanisms with file:line in the session notes; the README's layer-ahead
+prefetch and staging pool are OFF for DeepSeek in their own config). Their DeepSeek numbers: exact 10.6-11.8 tok/s
+decode, 33 / 248 tok/s prefill at 1k / 8k (fp16 tensor cores, an NVMe floor of ~15 s per 8192 chunk); lossy "warm
+prefill" (drop the cold experts' picks beyond the 64 heaviest per layer, rescale) 680-725 tok/s at KL 0.023. We are
+2.5-3x ahead on exact decode on ~2x the hardware; our exact prefill lands where their 3090 does, which says our
+exact prefill is far below the card (our profile agrees). Their prefill lead is the lossy mode. Ranked for us:
+
+1. **Elastic VRAM for the chunk buffers** (`engine/tiers.py:454-492`, `wb_bulk`): evict the tier's last chunks at a
+   chunk prefill's entry, give the memory to 8192-row buffers, re-enable the slots empty after. Buys our measured
+   8192 gains (prefill256k 6.8 -> 6.2, server TTFT -22%) without the -3.9% three-stream decode that pinned the
+   server at 4096. Exact. Medium. (Family 7 with a worked design to copy.)
+2. **Per-record PCIe latency**: their 3090 lands an 8-9 MB record in 0.36 ms inside a gather kernel from mapped RAM
+   (`nv2_dev.cu:369-491`, int4 loads, 48 x 256 threads) and 25 GB/s on the copy engine; our staged record costs 0.7
+   ms and our 2026-11-04 mapped reads ran at 7 GB/s through the GEMV's access pattern. The 256k wait is per-layer
+   latency on ~2.4 records, so halving a record's landing time is the lever on the 28 ms. Exact. Micro-bench first
+   (hours): cudaMemcpyAsync pinned->VRAM vs a dedicated gather kernel over mapped memory, 9.5 MB records.
+3. **Layer-ahead router prediction, measured offline first**: layer l+1's router on layer l's pre-MoE state
+   (`nv2.py:506-523`). Their GLM numbers are sobering (top-4 ~30% useful, 54% late, ~5% precision past rank 4; no
+   DeepSeek figure). A numpy pass over dumped routing + pre-MoE states gives our precision in a day; build nothing
+   before it. Union with the previous-token signal (23%). Exact (residency only).
+4. **DSpark re-costed**: their head with confidence 0.5 accepted 75% of drafted tokens (2.83 per verify) for +12.5%
+   on an SSD-bound box; against our w_4 19.4 / w_8 15.7 ms per position that is past the 41-46% break-even. Measure
+   acceptance on our prompts (family 6, as written). Also their rule: experts picked by one verify token are read
+   zero-copy, never admitted (`nv2_host.cpp:1007-1010`), to stop VRAM churn.
+5. **Exclusive VRAM/RAM tiers with victim write-back** (`nv2_host.cpp:635-654, 720-775`): +~1,600 records of host
+   capacity if ours is inclusive (check); costs a 9.5 MB D2H per promotion. Uncertain; rank after the check.
+6. **Piece-level NVMe streaming + strict demand-over-prefetch classes** (`pmask`, `Reader::pick`): <=2% at 256k
+   forced decode, more in serving (NVMe wait 31 of 104 ms in serve3). Small-medium with io_uring CQEs per piece.
+7. **Hygiene**: a startup bit-identity self-test (one token per layer with half the picks on the pool, compared bit
+   for bit; lane off on mismatch, `nv2.py:653-707`) in the server's warm-up; routing-trace capture for offline tier
+   simulation; MWAITX instead of PAUSE in the mailbox waits (a spinning core held their shared clock rail).
+8. **Serving**: a disk tier behind parked sequences (re-prefill of a 256k state ~27 min vs ~1 s restore), the
+   pre-stream 400 `context_length_exceeded` with a 1,024-token reserve, OOM retry with halved chunks, /health 503 on
+   a dead engine thread.
+
+Not transferable: warm prefill / BCP / tail skip (lossy, and they attack an NVMe floor our tier removes); the int16
+VBMI trellis lane (EXL3-specific; our pool is DRAM-bound at decode); X16 (emulating fp16 tensor-core rounding on the
+CPU at 5.5x the cost: the problem our integer kernels designed away); the dynamic per-layer lane planner (our share
+sweep says DMA and pool cost the same per record here); their layer-ahead staging pool (they kept it off).
+
 ### 14. Prefill to Strata's number (new 2026-11-07 evening: the user's priority is matching Strata's 935 tok/s on a 16k prompt; ours 190-250)
 
 - **Where the chunk's GPU time goes** (profile on chunk19, two 4096-row chunks, per slab-layer): the dense one-launch

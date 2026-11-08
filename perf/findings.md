@@ -162,6 +162,20 @@ Read for the "bridge the gap" plan (families 11-13). Numbers are theirs, on thei
   bit-identity between windows and single steps rests on the per-(row, selection) integer block sums and the
   in-order float chain `acc += d·dq·isum` (`moe.cu:383-389`), which a grouped kernel can keep.
 
+## Big-MoE-Small-Box (2026-11-08, code read; backlog family 15)
+
+- exllamav3-based, 3090 + 64 GB + SN850X. DeepSeek exact: 10.6-11.8 tok/s decode, 248 tok/s prefill at 8k with
+  fp16 tensor cores and an NVMe floor of ~15 s per 8192-token chunk (half its experts come from SSD each chunk);
+  its 680-725 tok/s prefill is the lossy warm prefill (KL 0.023 vs its exact prefill). Not bit-identical between
+  prefill and decode even in its exact mode (DSpark verify forwards round in other GEMM shapes).
+- Its README's layer-ahead prefetch and staging pool are off for DeepSeek in its own launch spec; measured on GLM:
+  ~30% useful stagings, 54% late, ~5% precision past rank 4. Consistent with our 23% previous-token figure.
+- Its CPU lane is near-exact (KL 0.001) and an opt-in mode emulates the GPU's fp16 MMA rounding on the CPU at 5.5x
+  the cost; its own doc names integer products + exact accumulation + one rounding (our design) as the way out.
+- Mechanisms worth our time: elastic VRAM for prefill buffers (8192 chunks without the decode cost), the per-record
+  PCIe landing latency (0.36 ms per 8-9 MB record there vs our 0.7 ms per staged record), DSpark acceptance data
+  (75% at confidence 0.5), serving hardening and a disk tier for parked states.
+
 ## Rejected: with the reason, so they are not retried
 
 - **GPU reads of RAM-resident experts in place over PCIe (`QX_DS_GPU_SHARE`) were rejected on 2026-11-04.**
