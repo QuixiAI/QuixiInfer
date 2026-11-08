@@ -68,7 +68,7 @@ def one(url, prompt, max_tokens, temperature, unique=False, history=None, think=
     toks = usage["completion_tokens"] if usage else n
     return dict(ttft=(first or t1) - t0, total=t1 - t0, tokens=toks, decode=(t1 - (first or t1)), prompt_tokens=usage["prompt_tokens"] if usage else 0, text="".join(text), sent_prompt=sent_prompt)
 
-def level(url, c, rounds, max_tokens, temperature, unique=False, turns=1):
+def level(url, c, rounds, max_tokens, temperature, unique=False, turns=1, dump=None):
     res, lock = [], threading.Lock()
     def client(i):
         for k in range(rounds):
@@ -86,6 +86,10 @@ def level(url, c, rounds, max_tokens, temperature, unique=False, turns=1):
     [t.start() for t in th]
     [t.join() for t in th]
     wall = time.time() - t0
+    if dump:
+        with open(dump, "a") as f:
+            for r in res:
+                f.write(json.dumps({"c": c, "prompt": r.get("sent_prompt"), "text": r["text"], "tokens": r["tokens"], "prompt_tokens": r["prompt_tokens"], "ttft": round(r["ttft"], 3), "decode": round(r["decode"], 3)}) + "\n")
     toks = sum(r["tokens"] for r in res)
     ttft = sorted(r["ttft"] for r in res)
     per = [(r["tokens"] - 1) / r["decode"] for r in res if r["decode"] > 0 and r["tokens"] > 1]
@@ -103,6 +107,7 @@ def main():
     ap.add_argument("--unique", action="store_true", help="prefix every prompt with a nonce, so no prompt repeats (no prefix-cache hits)")
     ap.add_argument("--turns", type=int, default=1, help="turns per conversation (follow-ups carry the history; thinking off)")
     ap.add_argument("--api-key", default=None, help="bearer token")
+    ap.add_argument("--dump", default=None, help="append every measured response (prompt, text, token counts) as JSON lines to this file")
     a = ap.parse_args()
     global API_KEY
     API_KEY = a.api_key
@@ -110,7 +115,7 @@ def main():
         level(a.url, min(16, a.warmup), max(1, a.warmup // 16), a.max_tokens, a.temperature, a.unique, a.turns)
     print(f"{'conc':>4} {'reqs':>4} {'tokens':>6} {'prompt':>7} {'wall s':>7} {'agg tok/s':>9} {'per-req tok/s':>13} {'TTFT med':>8} {'TTFT p90':>8}", flush=True)
     for c in [int(x) for x in a.levels.split(",")]:
-        r = level(a.url, c, a.rounds, a.max_tokens, a.temperature, a.unique, a.turns)
+        r = level(a.url, c, a.rounds, a.max_tokens, a.temperature, a.unique, a.turns, a.dump)
         print(f"{r['c']:>4} {r['requests']:>4} {r['tokens']:>6} {r['prompt_tokens']:>7} {r['wall']:>7.1f} {r['agg']:>9.2f} {r['per_req']:>13.2f} {r['ttft_med']:>8.2f} {r['ttft_p90']:>8.2f}", flush=True)
 
 if __name__ == "__main__":

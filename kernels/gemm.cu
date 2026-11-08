@@ -668,10 +668,19 @@ QX_DEV void tmv_rows_q8(const u8* W, u64 stride, u32 rows, u32 K, u32 r0, const 
     tmv_finish(acc, T, NT, rows, r0, part, y, kb, ks, ws, partials, counter);
 }
 
+// The bf16 form's staged tiles and the partials take 51 KB of shared memory: more than the 48 KB static limit of
+// cards before sm_90 (Ampere, Ada). On those the bf16 form is compiled out (the engine's `use_tmv` never selects it
+// there: the products stay on the f32 path) and the entry keeps only the int8 form.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+#define QX_TMV_BF16 1
+#else
+#define QX_TMV_BF16 0
+#endif
+
 template <int Q8> QX_DEV void tmv(const u64* info) {
     __shared__ float part[8][4][4][32];
     // the int8 entry stages nothing: without the bf16 tiles more blocks fit on an SM
-    __shared__ u32 tiles[Q8 > 0 ? 1 : 8][16][TMV_LD];
+    __shared__ u32 tiles[(Q8 > 0 || !QX_TMV_BF16) ? 1 : 8][16][TMV_LD];
     const u64* segs = reinterpret_cast<const u64*>(info[1]);
     const u32 nseg = (u32)info[2];
     u32 s = 0;
@@ -691,6 +700,7 @@ template <int Q8> QX_DEV void tmv(const u64* info) {
         tmv_rows_q8<Q8>(W, stride, rows, K, r0, reinterpret_cast<const i8*>(info[6]), reinterpret_cast<const float*>(info[7]), (u32)info[5], part, y, kb, ks, ws, partials, counter);
         return;
     }
+#if QX_TMV_BF16
     if constexpr (Q8 == 0) {
         switch (ty) {
 #define C(t) case t: tmv_rows<t>(W, stride, rows, K, r0, xb, (u32)info[5], part, tiles[threadIdx.x / 32], y, kb, ks, ws, partials, counter); return;
@@ -698,6 +708,9 @@ template <int Q8> QX_DEV void tmv(const u64* info) {
 #undef C
         }
     }
+#else
+    __trap();  // the bf16 form is not built for this card
+#endif
 }
 
 /// info: [0] x prepared by qx_tmv_prep (bf16, 32 token rows of K), [1] segments, [2] segment count, [5] tokens

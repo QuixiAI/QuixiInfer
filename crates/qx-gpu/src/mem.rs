@@ -98,6 +98,32 @@ impl Drop for DeviceBuf {
     }
 }
 
+/// The device's compute capability as major * 10 + minor (120 for an RTX 50-series card, 89 for a 40-series, 86 for
+/// a 30-series), and its multiprocessor count.
+pub fn arch() -> u32 {
+    static A: OnceLock<u32> = OnceLock::new();
+    *A.get_or_init(|| {
+        bind();
+        let (major, minor) = CTX.get().unwrap().compute_capability().expect("compute capability");
+        (major * 10 + minor) as u32
+    })
+}
+
+pub fn sm_count() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        bind();
+        CTX.get().unwrap().attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).expect("SM count") as u32
+    })
+}
+
+/// The NVRTC target for this device: `sm_120a` style (the architecture-specific variant, as CubeCL compiles, from
+/// sm_90 on) or `sm_86` style for older cards; `virtual` asks for the `compute_` form (PTX only).
+pub fn nvrtc_arch(virtual_: bool) -> String {
+    let a = arch();
+    format!("--gpu-architecture={}_{}{}", if virtual_ { "compute" } else { "sm" }, a, if a >= 90 { "a" } else { "" })
+}
+
 /// Free and total device memory, in bytes.
 pub fn mem_info() -> (usize, usize) {
     bind();

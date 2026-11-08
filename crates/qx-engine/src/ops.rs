@@ -128,6 +128,10 @@ pub struct MGemv {
 /// alone. `QX_TMV=1`: `qx_tmv` for every width (each token's bits independent of its window); `QX_TMV=0`: never.
 pub fn use_tmv(t: usize) -> bool {
     static U: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    // the bf16 form needs 51 KB of static shared memory: sm_90 and later only (kernels/gemm.cu `QX_TMV_BF16`)
+    if qx_gpu::mem::arch() < 90 {
+        return false;
+    }
     match *U.get_or_init(|| std::env::var("QX_TMV").ok().map(|v| v != "0")) {
         Some(always) => always && t <= 32,
         None => t <= 32 && (t > 8 || (t > 4 && TMV_BATCHED.load(std::sync::atomic::Ordering::Relaxed))),
@@ -238,17 +242,17 @@ impl MGemv {
         }
         // qx_tmv: warps per 16-row tile (1 to 8) and then blocks per tile (k split) until the launch has about 16
         // warps per SM, every warp keeping a 128-column chunk at least
-        const TARGET: usize = 170 * 16;
+        let target: usize = qx_gpu::mem::sm_count() as usize * 16;
         let plan: Vec<(usize, usize, usize)> = segs
             .iter()
             .map(|s| {
                 assert!(s.cols % 32 == 0, "qx_tmv needs whole 32-column steps ({} columns)", s.cols);
                 let (tiles, chunks) = (s.rows.div_ceil(16), (s.cols / 128).max(1));
                 let mut ws = 1;
-                while ws < 8 && tiles * ws < TARGET && ws * 2 <= chunks {
+                while ws < 8 && tiles * ws < target && ws * 2 <= chunks {
                     ws *= 2;
                 }
-                let ks = if ws == 8 { TARGET.div_ceil(tiles * 8).min(chunks / 8).max(1) } else { 1 };
+                let ks = if ws == 8 { target.div_ceil(tiles * 8).min(chunks / 8).max(1) } else { 1 };
                 (tiles, ws, ks)
             })
             .collect();

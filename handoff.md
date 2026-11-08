@@ -1,4 +1,4 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-07, noon)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, evening)
 
 ## Goal
 
@@ -19,6 +19,38 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   lossy opt-in option by the goal's rules, not taken; exact forms first.
 - Landed since noon: `qx_ds_topk2` (decode256k 45.4 -> 43.5-44.2, 8fae0e7), the server's 4096 chunk default
   (42c23e7), README on today's facts (53a86c8). Set D row 31.470 (d6cfb45).
+
+## Update 2026-11-08, evening: the flex tail landed; the 256k wait is the CPU pool; portability to the 30/40 series begun
+
+- **Elastic flex tail (bb9e370):** the chunk path's buffers are views into the VRAM arena's last `flex_bytes`;
+  `forward_chunk_opt` asks the driver (`flex_check`) to evict every record any of whose bytes lie in the tail
+  (a slot straddling the tail's start counted too: the first build tested starts only, overwrote one straddling
+  record and the 4096 tail differed), `chunk_release` (worker, once no other prompt is pending; qx-ds-check after
+  the prompt's last chunk) gives it back with the evicted records copied straight back into their slots. 16k tails
+  bit-identical at 4096 and 8192; ds-checks pass. Server TTFT at 262k/3 slots on the 13.5k prompt: 8192 chunks
+  35.5 s, 4096 42.3 s, both at the full 12.2 GiB expert tier. serve256k: 8192 arm 105.5 (baseline 109.65), **4096
+  arm 76.8 / 27.4 (serve256k3 / serve256k1)**, which is 30% better than anything before and not explained yet: the
+  tier counters show 69% VRAM hits against 53-55% with the same 1270 records; the chunk path never ran (88-token
+  prompts). An A/B/B/A with text dumps (`chain-srv.sh`, `tools/loadgen.py --dump`) is queued to tell a real effect
+  from a changed generation. Do not promote the 4096 number until that is understood.
+- **Staged-ready words (knob `QX_DS_STG_WAIT=words`, off):** the GPU's staged wait no longer depends on the driver's
+  done word, which was posted after the pool share. Equal in time (decode256k 44.7/44.6 vs 44.8/44.9): the pool
+  share finishes no sooner than the copies. What the counters say about the 28 ms per 256k token: the pool window
+  is 22 ms (~47 records at 0.37 ms on 16 threads, 4.8 ms of it NVMe fetch waits on 7 records). Tests queued:
+  decode staging share 8/8 and 5/8 under the words path (`STGS`), the pool on all 32 hardware threads (`CPUS`).
+- **PCIe landing time measured:** 0.19 ms per 9.5 MB record by memcpy or by gather kernel, the bus ceiling; the
+  gather-from-mapped form Big-MoE-Small-Box uses buys nothing here (`kernels/bench/pcie_bench.cu`).
+- **Big-MoE-Small-Box, second pass** (backlog family 15, items 9-18): dataflow CPU job without stage barriers,
+  MWAITX idle waits for the power budget (their lane cores 4.34 -> 4.8 GHz, -27% per expert), per-layer makespan
+  planner, NVMe piece streaming into the pool, per-layer timeline instrumentation. Measure first: one record on one
+  core without barriers; turbostat during decode.
+- **Portability (the user's ask, in progress):** `qx_gpu::mem::arch()`/`sm_count()`/`nvrtc_arch()` replace the
+  hard-coded `sm_120a` in the raw launcher, the NVRTC validation and the tmv launch plan; software E4M3 conversions
+  below sm_89 (`kernels/bench/e4m3_check.cu` checks every float against the instructions; queued on the GPU);
+  `qx_tmv`'s bf16 form compiled out below sm_90 and never selected there (`use_tmv`); `QX_NVCC_ARCHS` for the
+  build-time nvcc check. attn/gemm/prefill/smoke now compile for sm_86; the full sm_86/sm_89 matrix is running
+  (mgemv's ptxas takes minutes per target). README has an "Other GPUs" paragraph. Untested on real 30/40-series
+  cards: nothing here can be measured on this box beyond compiling.
 
 ## Update 2026-11-08, morning: set D 30.210; the GEMV kernels and the raw launcher are the defaults
 

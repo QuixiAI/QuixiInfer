@@ -39,19 +39,68 @@ QX_DEV u16 f32_to_f16(float f) {
 
 // ---- FP8 E4M3 -----------------------------------------------------------------------------
 
+// The conversions are Ada's (sm_89) and later cards' `cvt` instructions; on older cards (the RTX 30 series, sm_86)
+// the same values come from the `_sw` forms below; `kernels/bench/e4m3_check.cu` compares them bit for bit with the
+// instructions over every float. E4M3 here is the OCP FP8 E4M3FN encoding: bias 7, no infinities,
+// 0x7f / 0xff NaN, largest finite 448; the f32 conversion saturates to +-448 and keeps NaN.
+
+/// One float to one E4M3 byte in software (round to nearest even, saturating to the largest finite value).
+QX_DEV u8 f32_to_e4m3_sw(float f) {
+    const u32 u = __float_as_uint(f);
+    const u8 s = (u8)((u >> 24) & 0x80);
+    const u32 a = u & 0x7fffffffu;
+    if (a > 0x7f800000u) return s | 0x7f;                // NaN
+    if (a >= 0x43e00000u) return s | 0x7e;               // >= 448 (infinity included): the largest finite
+    if (a < 0x3c800000u) {                               // below 2^-6: subnormal, units of 2^-9 (rint: ties to even)
+        const int m = __float2int_rn(__uint_as_float(a) * 512.0f);
+        return s | (u8)m;                                // m == 8 is the smallest normal, 0x08
+    }
+    const u32 e = a >> 23, mant = a & 0x7fffffu;
+    u32 r = ((e - 127 + 7) << 3) | (mant >> 20);
+    const u32 rem = mant & 0xfffffu;
+    if (rem > 0x80000u || (rem == 0x80000u && (r & 1))) ++r;
+    return s | (u8)r;
+}
+
+/// One E4M3 byte to a float in software (exact; NaN as the canonical f32 NaN with the sign kept).
+QX_DEV float e4m3_to_f32_sw(u8 v) {
+    const u32 s = ((u32)v & 0x80) << 24;
+    const u32 e = (v >> 3) & 15, m = v & 7;
+    if (e == 15 && m == 7) return __uint_as_float(s | 0x7fc00000u);
+    const float mag = e == 0 ? (float)m * (1.0f / 512.0f) : ldexpf(1.0f + (float)m * 0.125f, (int)e - 7);
+    return __uint_as_float(s | __float_as_uint(mag));
+}
+
+QX_DEV u16 f32x2_to_e4m3x2_sw(float lo, float hi) {
+    return (u16)f32_to_e4m3_sw(lo) | ((u16)f32_to_e4m3_sw(hi) << 8);
+}
+
+QX_DEV void e4m3x2_to_f32x2_sw(u16 v, float& lo, float& hi) {
+    lo = e4m3_to_f32_sw((u8)(v & 0xff));
+    hi = e4m3_to_f32_sw((u8)(v >> 8));
+}
+
 /// Two floats to two E4M3 bytes (lo in bits 0..7), round to nearest, saturating.
 QX_DEV u16 f32x2_to_e4m3x2(float lo, float hi) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     u16 r;
     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;" : "=h"(r) : "f"(lo), "f"(hi));
     return r;
+#else
+    return f32x2_to_e4m3x2_sw(lo, hi);
+#endif
 }
 
 /// Two E4M3 bytes (lo in bits 0..7) to two floats.
 QX_DEV void e4m3x2_to_f32x2(u16 v, float& lo, float& hi) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     u32 h2;
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(v));
     lo = f16_to_f32((u16)(h2 & 0xffff));
     hi = f16_to_f32((u16)(h2 >> 16));
+#else
+    e4m3x2_to_f32x2_sw(v, lo, hi);
+#endif
 }
 
 // ---- warp reductions ----------------------------------------------------------------------

@@ -116,7 +116,8 @@ about 4 users. The levers are:
 Requirements:
 
 - Linux x86-64 with AVX-512 VNNI;
-- an RTX 50-series GPU (sm_120);
+- an NVIDIA GPU: developed and measured on an RTX 5090 (sm_120); the kernels also build for the RTX 40 series
+  (sm_89) and the RTX 30 series (sm_86), see "Other GPUs" below;
 - CUDA 13 (`nvcc` at `/usr/local/cuda-13.3/bin`, or set `QX_NVCC`);
 - a recent stable Rust;
 - about 128 GB of RAM: 63 GiB of pinned experts, plus the KV pool and the PLE row cache;
@@ -127,6 +128,18 @@ Requirements:
 ```sh
 cargo build --release      # target/release/quixiinfer, qx-pack and the check tools
 ```
+
+**Other GPUs (RTX 40 and 30 series).** The engine reads the card's compute capability at start and compiles its
+kernels for it (the same target CubeCL uses: `sm_120a` on Blackwell, `sm_89` / `sm_86` on Ada / Ampere). What
+differs by card: the FP8 KV-cache conversions use Ada's `cvt` instructions from sm_89 on and a bit-identical software
+form before it (`kernels/bench/e4m3_check.cu` compares it with the instructions over every float); the bf16 tensor-core products for batched decode
+(`qx_tmv`) need 51 KB of static shared memory and exist from sm_90 on, so on the 40 and 30 series batched decode
+stays on the f32 path (exact, slower per token above 8 sequences); the expert tier is what is left of VRAM after the
+dense weights, the context slots and the staging area, so a 24 GB card at 256k context holds few experts and
+serves most from RAM (set `--ctx` and `--slots` to what the card can hold; `QX_DS_STAGE_CAP` shrinks the 2.4 GB
+staging area); PCIe 4.0 lands a 9.5 MB expert record in 0.4 ms against 0.2 on PCIe 5.0, which moves the best
+staging share (`QX_DS_STAGE_SHARE_DECODE`) toward the CPU pool. `QX_NVCC_ARCHS=sm_86,sm_89,sm_120a cargo build`
+compiles every kernel for all three at build time. Only the 5090 has been run here; the other two are build-checked.
 
 **2. Make the model pack.** Download [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
 (`tools/pardl.py` is a parallel, resumable downloader). Convert it with llama.cpp PR #30817's converter, which
