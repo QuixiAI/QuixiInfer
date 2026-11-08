@@ -22,7 +22,7 @@ gate` compares against `perf/baselines/rtx-5090_ryzen-9-9950x_121g/`. Measured s
 0.2-3%, prefill256k 0-2%, serve256k3 0.2-1.7%, decode 1-4%: three repeats are enough; a knob flip needs no five.
 
 ## Read first, every session
-  perf/perf.md (rules), perf/findings.md (what is known and what was rejected, with the conditions for re-opening), perf/backlog.md, the last entries of perf/optimization_status.md, handoff.md (constraints, how to run things).
+  perf/perf.md (rules), perf/presuppositions.md (the beliefs the design rests on and how each would be killed), perf/findings.md (what is known and what was rejected, with the conditions for re-opening), perf/backlog.md, the last entries of perf/optimization_status.md, handoff.md (constraints, how to run things).
 
   ## Think wide before you pick
   Before each experiment, spend a real ideation pass, not a token one. The backlog is a starting beam, not a fence. Sources to mine, all local:
@@ -37,7 +37,26 @@ gate` compares against `perf/baselines/rtx-5090_ryzen-9-9950x_121g/`. Measured s
 
   Ideas that trade accuracy for speed (cache-aware routing, relaxed drafting, fewer experts) may be built, but only behind an opt-in knob that is OFF by default, never counted on the scoreboard, and recorded in a separate "lossy, opt-in" table in findings.md with their quality cost measured by tools/ds-checks.sh deltas. The default path stays exact.
 
-  Budget: roughly one in four experiments should be a long shot (a bigger structural idea or a measurement of something unknown); the rest should be the best-expected-value items. Record long shots honestly as INCONCLUSIVE or REJECTED when they fail; that is a win for the next agent, not a loss.
+  ## Break presuppositions on purpose
+  The wins that mattered this week were beliefs overturned by cheap measurements (a record lands in 0.19 ms, not
+  0.7; the pool was not memory-bound, it was sharing cores with a spinning thread), and the folklore that blocked
+  them was never written down. `perf/presuppositions.md` is the table of beliefs the design rests on, each with the
+  measurement that would kill it and the date it was last tested. Rules:
+  - A belief overturned is a LANDED-class outcome: update the row first, then the notebook and findings; list
+    "beliefs tested" in every handoff update and in the stop report.
+  - Every fourth experiment MUST attack an untested or stale row (or add and attack a new one), chosen by payoff x
+    chance-it-is-false / cost. Count them in the handoff; the adjudicator flags four safe landings in a row.
+  - Ideation is divergent before convergent: twenty "what if X is false" ideas with judgment deferred before any
+    scoring, and the rejected list is read AFTER ideating, then checked against (the `perf-conjecturer` agent does
+    this; the `perf-outsider` agent does it with no project context at all, from the physics of the box alone). Run
+    the outsider at least once a day and whenever two experiments in a row are flat.
+  - Vendor and folklore claims ("requires hardware support", "has to be on the GPU", "must be whole records",
+    "cannot be predicted") are presuppositions until measured. QuixiCore ran NVFP4 on hardware that "could not":
+    the math of any format can be implemented exactly anywhere; the question is only cost.
+  - A long shot's cost is bounded by its cheapest killing measurement, not by the build: measure first, build only
+    what survives.
+
+  Budget: at least one in four experiments is a long shot (a bigger structural idea or a measurement of something unknown); the rest are the best-expected-value items. Record long shots honestly as INCONCLUSIVE or REJECTED when they fail; that is a win for the next agent, not a loss.
 
   ## The loop — repeat until a stop condition
   1. Choose: write the hypothesis, the counter that will confirm or refute it, the expected gain, and why it is better than the next-best idea. After every third experiment, or after two flat results in a row, run the `perf-conjecturer` agent (fresh context, given the facts and not your hypotheses) and re-rank against its list.
@@ -79,7 +98,7 @@ gate` compares against `perf/baselines/rtx-5090_ryzen-9-9950x_121g/`. Measured s
 - Five consecutive REJECTED/INCONCLUSIVE experiments, excluding deliberate measurements.
 - The next step would change the exactness contract, the standard settings or the case set (beyond item 1 above), or needs sudo beyond gdb attach, another disk, or more than the memory cap.
 - Any ds-checks line stops matching and a revert does not restore it.
-When stopping, give: current score vs the promoted baseline (scoreboard last row), what landed, what was rejected and why, which beliefs changed, and the next three experiments ranked by expected value.
+When stopping, give: current score vs the promoted baseline (scoreboard last row), what landed, what was rejected and why, which presupposition rows were tested and how they changed, the long-shot count against the one-in-four rule, and the next three experiments ranked by expected value.
 
 ## Secondary objectives (sanctioned, the 256k objective still orders the GPU queue)
 - Portability: the engine runs on the card it finds (RTX 30/40 series build-checked; nothing measured there). Keep it so; note what a 24 GB card would need when you learn it.
