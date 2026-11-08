@@ -443,18 +443,53 @@ fn static_name(s: String) -> &'static str {
     n
 }
 
-/// The machine's physical cores as the lowest CPU id of each core (from sysfs; SMT siblings folded), ascending.
+/// The CPUs this process may run on (`sched_getaffinity`), ascending.
+pub fn allowed_cpus() -> Vec<usize> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return (0..std::thread::available_parallelism().map_or(16, |n| n.get())).collect();
+        }
+        (0..libc::CPU_SETSIZE as usize).filter(|&c| libc::CPU_ISSET(c, &set)).collect()
+    }
+}
+
+/// The SMT siblings of `cpu` (itself excluded), from sysfs; empty without SMT or topology files.
+pub fn siblings_of(cpu: usize) -> Vec<usize> {
+    let Ok(s) = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")) else { return Vec::new() };
+    parse_cpu_list(s.trim()).into_iter().filter(|&c| c != cpu).collect()
+}
+
+fn parse_cpu_list(spec: &str) -> Vec<usize> {
+    let mut v = Vec::new();
+    for part in spec.split(',') {
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                v.extend(a..=b);
+            }
+        } else if let Ok(c) = part.trim().parse::<usize>() {
+            v.push(c);
+        }
+    }
+    v
+}
+
+/// The machine's physical cores this process may use, as the lowest allowed CPU id of each core (sysfs
+/// `thread_siblings_list`, SMT siblings folded; offline CPUs and CPUs outside the affinity mask skipped), ascending.
 pub fn physical_cores() -> Vec<usize> {
+    let allowed = allowed_cpus();
     let mut cores: Vec<usize> = Vec::new();
-    for cpu in 0..4096usize {
-        let Ok(s) = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")) else { break };
-        let first = s.trim().split([',', '-']).next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(cpu);
+    for &cpu in &allowed {
+        let first = match std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")) {
+            Ok(s) => parse_cpu_list(s.trim()).into_iter().filter(|c| allowed.contains(c)).min().unwrap_or(cpu),
+            Err(_) => cpu,  // no topology file (a container, a VM): every allowed CPU counts as a core
+        };
         if first == cpu {
             cores.push(cpu);
         }
     }
     if cores.is_empty() {
-        cores = (0..std::thread::available_parallelism().map_or(16, |n| n.get())).collect();
+        cores = allowed;
     }
     cores
 }
@@ -475,12 +510,13 @@ pub fn main_cpu() -> Option<usize> {
 }
 
 /// The pool's CPUs: `QX_DS_CPUS` as `a-b` or `a,b,c`, else every physical core but the last (the engine thread's,
-/// `main_cpu`); one worker per physical core, never the SMT siblings (measured 1.5x slower, 2026-11-08). The first
-/// is the driver thread, which is pool thread 0.
+/// `main_cpu`), at most 16 (the pool is near the DRAM ceiling at 16 cores: 43 of ~52-59 GB/s; more workers mean
+/// more barrier waiters, not more bandwidth); one worker per physical core, never the SMT siblings (measured 1.5x
+/// slower, 2026-11-08). The first is the driver thread, which is pool thread 0.
 pub fn pool_cpus() -> Vec<usize> {
     let spec = std::env::var("QX_DS_CPUS").unwrap_or_else(|_| {
         let cores = physical_cores();
-        let n = if cores.len() >= 4 { cores.len() - 1 } else { cores.len() };
+        let n = if cores.len() >= 4 { (cores.len() - 1).min(16) } else { cores.len() };
         cores[..n].iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
     });
     let mut v = Vec::new();
@@ -496,12 +532,54 @@ pub fn pool_cpus() -> Vec<usize> {
     v
 }
 
-/// Pins the calling thread to one CPU.
-pub fn pin_thread(cpu: usize) {
+/// Pins the calling thread to one CPU; false (with a warning) when the kernel refuses (the CPU is outside the
+/// process's cpuset: then the thread keeps its previous mask).
+pub fn pin_thread(cpu: usize) -> bool {
+    set_affinity(0, &[cpu])
+}
+
+/// Sets thread `tid`'s (0: the caller's) affinity to `cpus`; false with a warning on failure.
+fn set_affinity(tid: i32, cpus: &[usize]) -> bool {
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        for &c in cpus {
+            libc::CPU_SET(c, &mut set);
+        }
+        if libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            eprintln!("cpus: sched_setaffinity({tid}, {cpus:?}) failed: {} (the process's cpuset excludes it?); thread left where it was", std::io::Error::last_os_error());
+            return false;
+        }
+        true
+    }
+}
+
+/// Places the engine's threads before the driver and its pool start: the calling (engine) thread on `main_cpu`,
+/// every other thread that exists at this point (CUDA's driver and event threads, rayon's fill workers, a server's
+/// HTTP and scheduler threads) on that core's SMT siblings (`QX_DS_HELPERS=free` leaves them unpinned; the sibling
+/// placement is the default so that nothing spins on a pool worker's core). Done after the tier fill, so the fill
+/// ran on every core, and before the pool exists, so pool workers (which pin themselves) are untouched. The old
+/// form pinned the engine thread before CUDA initialised, which confined CUDA's threads and the fill to one CPU
+/// (2026-11-08: the tier fill 8 -> 12 s, warm-up 15 -> 22 s).
+pub fn place_threads() {
+    let Some(main) = main_cpu() else { return };
+    let helpers_free = std::env::var("QX_DS_HELPERS").is_ok_and(|v| v == "free");
+    let sib = siblings_of(main);
+    let helper_cpus: Vec<usize> = if sib.is_empty() { vec![main] } else { sib };
+    let me = unsafe { libc::gettid() };
+    let mut moved = 0usize;
+    if !helpers_free {
+        if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
+            for e in rd.flatten() {
+                let Ok(tid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
+                if tid != me && set_affinity(tid, &helper_cpus) {
+                    moved += 1;
+                }
+            }
+        }
+    }
+    let ok = pin_thread(main);
+    if std::env::var("QX_DS_VERBOSE").is_ok() || !ok {
+        eprintln!("cpus: pool on {:?}, engine thread on {main}{}, {moved} other threads on {:?}", pool_cpus(), if ok { "" } else { " (pin failed)" }, if helpers_free { vec![] } else { helper_cpus.clone() });
     }
 }
 
@@ -1000,6 +1078,7 @@ impl<'a> DsEngine<'a> {
                 };
                 let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_wide_min: t.stage_wide_min, stage_cap: t.stage_cap, _stage: t.stage, slots_all, slots_stg, stg_ready, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
                 abufs.step.zero();
+                place_threads();
                 let d = driver::Driver::start(host, cpus.clone());
                 (None, Some(d), Some(abufs))
             }
