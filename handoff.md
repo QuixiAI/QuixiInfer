@@ -20,6 +20,21 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
 - Landed since noon: `qx_ds_topk2` (decode256k 45.4 -> 43.5-44.2, 8fae0e7), the server's 4096 chunk default
   (42c23e7), README on today's facts (53a86c8). Set D row 31.470 (d6cfb45).
 
+## Update 2026-11-08, morning: set D 30.210; the GEMV kernels and the raw launcher are the defaults
+
+- Set D on fd2473e with `QX_RAW_LAUNCH=1` (3113dd8 makes it the default): **31.470 → 30.210**. prefill256k 6.2 → 5.6
+  ms/token (179 tok/s on the last 16k of a 256k prompt; 21.5 at the start of 2026-11-07), decode256k 44.9 (the
+  tiled top-k), serve256k3 +1.2% (below the bar), guards within noise. Promoted.
+- Defaults now: `QX_MGEMV_ZT` on (one kernel per segment kind: `_t8zt` Q8 4 rows, `_t8zf` f32 2 rows decode-once,
+  `_t8z` rest), `QX_RAW_LAUNCH` on (chunk pass launches through the driver API on CubeCL's stream, pinned info ring;
+  `qx_gpu::raw`, never inside a graph capture). Both `=0` restore the old paths.
+- Queued on the GPU: the slab attention under the raw launcher (`QX_DS_ATTN=tile`, whole-window slice), the
+  per-record PCIe latency bench (`kernels/bench/pcie_bench.cu`), the elastic flex tail (uncommitted in the tree:
+  chunk buffers as views into the VRAM arena's tail, evicted for a prompt's duration by the driver's `flex_check`,
+  `chunk_release` from the worker; chain-flex builds chunk28 and tests tails, the server's TTFT and serve256k at 8192).
+- Read: Big-MoE-Small-Box (backlog family 15, findings): elastic VRAM (the above), per-record PCIe landing latency,
+  layer-ahead router precision to measure offline, DSpark's 75% acceptance, serving hardening. LICENSE: MIT.
+
 ## Update 2026-11-08, small hours: the launch-path fix is written; everything is behind knobs and under test
 
 - **Measured dead ends tonight** (all bit-identical, all in the notebook): rows per block with per-group barriers

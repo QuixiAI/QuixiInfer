@@ -196,11 +196,11 @@ resume bit-exactly; structured outputs go through the same grammar engine as the
 | | ms per token | tok/s |
 |---|--:|--:|
 | Decode at 1k context (one stream) | 33 | 30 |
-| Decode at a 256k position (one stream, resumed state) | 43-46 | 22-23 |
+| Decode at a 256k position (one stream, resumed state) | 44-45 | 22-23 |
 | Server at 262k context, 3 slots: one request | 43 | 23 |
 | Server at 262k context, 3 slots: three concurrent requests | 108 per request | 9.2 each, 28 aggregate |
 | Server at 8k context, 3 slots: three concurrent requests | 97 per request | 10.3 each, 31 aggregate |
-| Prefill, the last 16k tokens of a 256k prompt (8192-row chunks) | 6.2 | 161 |
+| Prefill, the last 16k tokens of a 256k prompt (8192-row chunks) | 5.6 | 179 |
 | Prefill, a 16k prompt from empty (4096-row chunks) | 4-5 | 190-250 |
 | Time to first token, a 13.5k-token prompt on the 262k / 3-slot server | 44 s | 308 (prompt rate) |
 
