@@ -586,9 +586,15 @@ fn set_affinity(tid: i32, cpus: &[usize]) -> bool {
 /// (2026-11-08: the tier fill 8 -> 12 s, warm-up 15 -> 22 s).
 pub fn place_threads() {
     let Some(main) = main_cpu() else { return };
-    let helpers_free = std::env::var("QX_DS_HELPERS").is_ok_and(|v| v == "free");
+    let pool = pool_cpus();  // before the pin narrows this thread's mask (physical_cores reads it)
+    let mode = std::env::var("QX_DS_HELPERS").unwrap_or_default();
+    let helpers_free = mode == "free";
     let sib = siblings_of(main);
-    let helper_cpus: Vec<usize> = if sib.is_empty() { vec![main] } else { sib };
+    // `same` (default): the helpers time-share the engine's own CPU (what the first placement did by accident and
+    // what measured best: the spinning CUDA thread and the engine thread throttle each other); `sibling`: on the
+    // engine core's SMT siblings (44.2); `free`: left unpinned (44.5)
+    // measured 2026-11-08 (decode256k, three repeats each): same 42.0, sibling 44.2, free 44.5: `same` is the default
+    let helper_cpus: Vec<usize> = if mode == "sibling" && !sib.is_empty() { sib } else { vec![main] };
     let me = unsafe { libc::gettid() };
     let mut moved = 0usize;
     if !helpers_free {
@@ -603,7 +609,7 @@ pub fn place_threads() {
     }
     let ok = pin_thread(main);
     if std::env::var("QX_DS_VERBOSE").is_ok() || !ok {
-        eprintln!("cpus: pool on {:?}, engine thread on {main}{}, {moved} other threads on {:?}", pool_cpus(), if ok { "" } else { " (pin failed)" }, if helpers_free { vec![] } else { helper_cpus.clone() });
+        eprintln!("cpus: pool on {pool:?}, engine thread on {main}{}, {moved} other threads on {:?}", if ok { "" } else { " (pin failed)" }, if helpers_free { vec![] } else { helper_cpus.clone() });
     }
 }
 

@@ -13,7 +13,30 @@ static CTX: OnceLock<std::sync::Arc<cudarc::driver::CudaContext>> = OnceLock::ne
 
 /// Binds the primary context to the calling thread. Every thread that calls the driver directly needs it.
 pub fn bind() {
-    let ctx = CTX.get_or_init(|| cudarc::driver::CudaContext::new(0).expect("CUDA primary context"));
+    let ctx = CTX.get_or_init(|| {
+        // QX_CUDA_SCHED=spin|yield|blocking: how host threads wait on the device (the primary context's scheduling
+        // flag, set before the context is retained). Default: the driver's AUTO. A measurement knob (2026-11-08):
+        // the engine thread's spin on syncs shared a core with CUDA's own thread, and throttling both was worth 7%.
+        if let Ok(v) = std::env::var("QX_CUDA_SCHED") {
+            let flag = match v.as_str() {
+                "spin" => sys::CUctx_flags_enum::CU_CTX_SCHED_SPIN as u32,
+                "yield" => sys::CUctx_flags_enum::CU_CTX_SCHED_YIELD as u32,
+                "blocking" => sys::CUctx_flags_enum::CU_CTX_SCHED_BLOCKING_SYNC as u32,
+                _ => 0,
+            };
+            if flag != 0 {
+                unsafe {
+                    let _ = sys::cuInit(0);
+                    let mut dev: sys::CUdevice = 0;
+                    if sys::cuDeviceGet(&mut dev, 0) == sys::CUresult::CUDA_SUCCESS {
+                        let r = sys::cuDevicePrimaryCtxSetFlags_v2(dev, flag);
+                        eprintln!("cuda: primary context scheduling {v}: {r:?}");
+                    }
+                }
+            }
+        }
+        cudarc::driver::CudaContext::new(0).expect("CUDA primary context")
+    });
     ctx.bind_to_thread().expect("bind CUDA context");
 }
 
