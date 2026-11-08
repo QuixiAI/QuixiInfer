@@ -443,10 +443,46 @@ fn static_name(s: String) -> &'static str {
     n
 }
 
-/// The pool's CPUs: `QX_DS_CPUS` as `a-b` or `a,b,c` (default 0-15: one thread per physical core on a 16-core
-/// part; the first is the driver thread, which is pool thread 0).
+/// The machine's physical cores as the lowest CPU id of each core (from sysfs; SMT siblings folded), ascending.
+pub fn physical_cores() -> Vec<usize> {
+    let mut cores: Vec<usize> = Vec::new();
+    for cpu in 0..4096usize {
+        let Ok(s) = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")) else { break };
+        let first = s.trim().split([',', '-']).next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(cpu);
+        if first == cpu {
+            cores.push(cpu);
+        }
+    }
+    if cores.is_empty() {
+        cores = (0..std::thread::available_parallelism().map_or(16, |n| n.get())).collect();
+    }
+    cores
+}
+
+/// The CPU the engine thread is pinned to (its sync spins must not share a physical core with a pool worker: on
+/// this box that cost the pool 7% of decode256k, 2026-11-08). Default: the last physical core, which `pool_cpus`
+/// leaves out; `QX_DS_MAIN_CPU=N` picks another, `QX_DS_MAIN_CPU=none` leaves the thread unpinned.
+pub fn main_cpu() -> Option<usize> {
+    match std::env::var("QX_DS_MAIN_CPU") {
+        Ok(v) if v == "none" || v == "-1" => None,
+        Ok(v) => v.parse().ok(),
+        Err(_) => {
+            let cores = physical_cores();
+            let pool = pool_cpus();
+            cores.last().copied().filter(|c| !pool.contains(c) && cores.len() >= 4)
+        }
+    }
+}
+
+/// The pool's CPUs: `QX_DS_CPUS` as `a-b` or `a,b,c`, else every physical core but the last (the engine thread's,
+/// `main_cpu`); one worker per physical core, never the SMT siblings (measured 1.5x slower, 2026-11-08). The first
+/// is the driver thread, which is pool thread 0.
 pub fn pool_cpus() -> Vec<usize> {
-    let spec = std::env::var("QX_DS_CPUS").unwrap_or_else(|_| "0-15".into());
+    let spec = std::env::var("QX_DS_CPUS").unwrap_or_else(|_| {
+        let cores = physical_cores();
+        let n = if cores.len() >= 4 { cores.len() - 1 } else { cores.len() };
+        cores[..n].iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+    });
     let mut v = Vec::new();
     for part in spec.split(',') {
         if let Some((a, b)) = part.split_once('-') {

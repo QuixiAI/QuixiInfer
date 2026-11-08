@@ -44,9 +44,12 @@ fn main() -> anyhow::Result<()> {
     let model = qx_ref::dsv41::Model::load(&g)?;
     let mut st = model.new_state();
     // QX_DS_PACK=PACK.qxp with QX_DS_VRAM / QX_DS_RAM (GiB) runs the tiered path off the pack (QX_DS_PROFILE: ranking)
-    // QX_DS_MAIN_CPU: pin the engine thread (its sync spins) off the pool's cores
-    if let Some(cpu) = std::env::var("QX_DS_MAIN_CPU").ok().and_then(|v| v.parse().ok()) {
+    // the engine thread (its sync spins) on its own physical core, off the pool's (QX_DS_MAIN_CPU overrides)
+    if let Some(cpu) = qx_engine::dsv41::main_cpu() {
         qx_engine::dsv41::pin_thread(cpu);
+        if verbose {
+            eprintln!("cpus: pool on {:?}, engine thread on {cpu}", qx_engine::dsv41::pool_cpus());
+        }
     }
     let pack = std::env::var("QX_DS_PACK").ok().map(|p| Gguf::open(std::path::Path::new(&p))).transpose()?;
     let max_ctx = (toks.len() + 64).next_multiple_of(256);

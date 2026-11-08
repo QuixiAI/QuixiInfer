@@ -164,6 +164,12 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let pack: &'static Gguf = Box::leak(Box::new(Gguf::open(&opt.pack).map_err(|e| anyhow!("pack {}: {e}", opt.pack.display()))?));
     std::thread::spawn(move || {
+        // the engine thread on its own physical core, off the pool's (its sync spins otherwise share a core with a
+        // pool worker and the pool's barriers wait for it: 7% of decode256k, 2026-11-08)
+        if let Some(cpu) = qx_engine::dsv41::main_cpu() {
+            qx_engine::dsv41::pin_thread(cpu);
+            eprintln!("quixiinfer: pool on {:?}, engine thread on cpu {cpu}", qx_engine::dsv41::pool_cpus());
+        }
         let mut eng = match DsEngine::load_tiered_slots(pack, opt.max_ctx, opt.vram_gib, opt.ram_gib, opt.profile.as_deref(), opt.slots) {
             Ok(e) => {
                 let _ = ready_tx.send(Ok(()));

@@ -1,4 +1,4 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, night)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, late night)
 
 ## Goal
 
@@ -19,6 +19,21 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   lossy opt-in option by the goal's rules, not taken; exact forms first.
 - Landed since noon: `qx_ds_topk2` (decode256k 45.4 -> 43.5-44.2, 8fae0e7), the server's 4096 chunk default
   (42c23e7), README on today's facts (53a86c8). Set D row 31.470 (d6cfb45).
+
+## Update 2026-11-08, late night: the engine thread shared a physical core with a pool worker; pinning it -6.9% on decode256k
+
+- The pool's per-record time in the engine (0.33-0.37 ms) against the pool alone (0.23): DMA contention 7%, pages
+  nothing, clocks nothing (5.3 GHz while generating). The cause: the unpinned engine thread spins on CUDA syncs on
+  an SMT sibling of a pool core, and the pool's barriers wait for the slowed worker. decode256k 45.0 -> **42.0** with
+  the engine thread on its own physical core and the pool on the other 15 (two repeats at 0.2-0.5% spread); a
+  sibling pin gives 44.5. Default in chunk36 (`pool_cpus`/`main_cpu` from sysfs topology; `QX_DS_CPUS`,
+  `QX_DS_MAIN_CPU=none` override), pinned in qx-ds-check and the server worker. Notebook 96. Running: ds-checks on
+  chunk36 then the full set D `--check` (`SETD6`, label `setd-pin`); promote when it passes.
+- Five design issues filed on Big-MoE-Small-Box (#1-#5: layer skip above 20, elastic refill, integer-exact lane,
+  indexer measurement, batch/lane invariance), written in their terms with predicted gains.
+- Open after this: the pool's own 30% (barriers, 0.23 vs 0.16 ideal; family 15 item 9), the staged/NVMe shares
+  re-tuned under the new placement (the balance may move now that the pool is faster), the server's other threads
+  (HTTP, scheduler) kept off the pool cores (they float today; measure serve256k3 before changing).
 
 ## Update 2026-11-08, night: resumed; the flex tail is clean in the server, 8192 is the server default, set D running
 
