@@ -1336,7 +1336,10 @@ impl<'a> DsEngine<'a> {
             // tell the driver: layer and tokens; the kernel adds a device-side counter so every prediction is
             // distinct, also when this launch is replayed from a window's CUDA graph
             if let Some(ab) = self.abufs.as_ref() {
-                self.k("qx_ds_pred_post", 1, (1, 1, 1), &[d.shared.mb.dptr, l as u64 | ((t as u64) << 8), ab.pred_ctr.ptr]);
+                // the kernel lives in step.cu (STEP), not dsv41.cu, which `self.k` launches from
+                self.trace("qx_ds_pred_post");
+                self.gpu.run(STEP.kernel("qx_ds_pred_post", CubeDim::new_1d(1)), (1, 1, 1), &[d.shared.mb.dptr, l as u64 | ((t as u64) << 8), ab.pred_ctr.ptr]);
+                self.trace_done();
             }
         }
     }
