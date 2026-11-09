@@ -24,6 +24,8 @@ QX_DEV void st_release_sys(u64* p, u64 v) { asm volatile("st.release.sys.global.
 #define MB_KPT 140    // u32: experts per token (k)
 #define MB_NMAP 144   // u32: selections the GPU computes from device-mapped RAM (statistics)
 #define MB_NSTAGE 148 // u32: selections the driver stages into VRAM for the GPU (DMA from their RAM records)
+#define MB_NPRE 152 // u32: selections served from the prefetch's speculative slots (prestaged, counted as resident)
+#define MB_PRED_HDR 200 // u64: the latest router prediction posted: layer | tokens << 8 | counter << 32
 #define MB_STG_DONE 192 // u64: the job whose staged records and slot addresses have landed
 #define MB_IDS 256    // i32[QX_AMAX]: the missing experts
 #define MB_KIDX 5376  // i32[QX_AMAX]: their selection index a

@@ -165,6 +165,11 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
             }
             const u64* table = reinterpret_cast<const u64*>(info[1]) + info[2];
             const u64* rtable = info[14] ? reinterpret_cast<const u64*>(info[14]) + info[2] : nullptr;
+            // [20] the prefetch's prestaged table (u64 per expert: the speculative slot holding the record, or 0):
+            // a miss found there is resident at that address, no host round trip (the driver wrote the entry behind
+            // the record's copy on its stream, so the bytes are there when the entry is)
+            const u64* prestaged = info[20] ? reinterpret_cast<const u64*>(info[20]) + info[2] : nullptr;
+            u32 npre = 0;
             const u32 share = (u32)info[15], sshare = (u32)info[16], scap = (u32)info[19];
             const i32* ids = reinterpret_cast<const i32*>(info[3]);
             u32 n = 0, nmap = 0, ns = 0, nram = vst[9];  // the RAM-miss round robin persists across layers and windows
@@ -175,6 +180,10 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
             for (u32 j = 0; j < A; ++j) {
                 u64 slot = *reinterpret_cast<const volatile u64*>(&table[ids[j]]);
                 bool staged = false;
+                if (slot == 0 && prestaged) {
+                    const u64 ps = *reinterpret_cast<const volatile u64*>(&prestaged[ids[j]]);
+                    if (ps) { slot = ps; ++npre; }
+                }
                 if (slot == 0 && rtable) {
                     const u64 ram = *reinterpret_cast<const volatile u64*>(&rtable[ids[j]]);
                     if (ram) {
@@ -206,6 +215,7 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
             *reinterpret_cast<u32*>(mb + MB_KPT) = (u32)info[8];
             *reinterpret_cast<u32*>(mb + MB_NMAP) = nmap;
             *reinterpret_cast<u32*>(mb + MB_NSTAGE) = ns;
+            *reinterpret_cast<u32*>(mb + MB_NPRE) = npre;
             vst[9] = nram;
             vst[11] = ns;
             vst[6] = n;
@@ -271,6 +281,13 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
             st_release_sys(reinterpret_cast<u64*>(mb + MB_SEQ), seq);
         }
     }
+}
+
+/// Posts a router prediction's header to the mailbox after its ids landed (same stream): info: [0] mailbox,
+/// [1] the header word (layer | tokens << 8 | counter << 32). One thread.
+extern "C" __global__ void qx_ds_pred_post(const u64* info) {
+    __threadfence_system();
+    st_release_sys(reinterpret_cast<u64*>(reinterpret_cast<u8*>(info[0]) + MB_PRED_HDR), info[1]);
 }
 
 /// Waits until the driver has staged the current job's records into VRAM and written their slot addresses,

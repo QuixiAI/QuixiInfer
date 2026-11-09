@@ -24,6 +24,10 @@ pub struct Tiers {
     /// The DMA staging area for the GPU's share of RAM-resident misses, its capacity in records, and the share.
     stage: DeviceBuf,
     stage_cap: usize,
+    /// The prefetch's speculative slots (2 x PRE_SLOTS records) and the device table of prestaged addresses.
+    pred_stage: DeviceBuf,
+    prestaged: DeviceBuf,
+    rec_max: usize,
     stage_share: u64,
     stage_share_decode: u64,
     stage_wide_min: usize,
@@ -361,6 +365,8 @@ pub struct AsyncBufs {
     stage_wide_min: usize,
     stage_cap: usize,
     _stage: DeviceBuf,
+    _pred_stage: DeviceBuf,
+    prestaged: DeviceBuf,
     slots_all: DeviceBuf,
     slots_stg: DeviceBuf,
     /// The staged-ready words, one per stage stream (`driver::stage_ready_by_words`).
@@ -409,6 +415,8 @@ pub struct DsEngine<'a> {
     pub exact_experts: bool,
     /// The tiers when loaded from a pack; else the experts are read from the GGUF by the pool.
     pub tiers: Option<std::cell::RefCell<Tiers>>,
+    /// Router predictions posted so far (the prefetch's header counter).
+    pred_seq: std::sync::atomic::AtomicU64,
     /// The asynchronous mode (`QX_DS_ASYNC`, default on with a pack): the driver thread and the device buffers.
     pub driver: Option<driver::Driver>,
     abufs: Option<AsyncBufs>,
@@ -457,15 +465,28 @@ fn static_name(s: String) -> &'static str {
 }
 
 /// `QX_DS_PREDICT`: 0 off, 1 `pre` (the layer's router on the pre-attention residual), 2 `next` (the next layer's
-/// router on this layer's FFN input). A measurement knob: the predictions are scored, never used.
+/// router on this layer's FFN input). Scored in the stats line. `pre` is also what the prefetch (`QX_DS_PREFETCH`)
+/// consumes, so it is on whenever the prefetch is.
 pub fn predict_mode() -> u8 {
     static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *M.get_or_init(|| match std::env::var("QX_DS_PREDICT").as_deref() {
         Ok("pre") | Ok("1") => 1,
         Ok("next") | Ok("2") => 2,
-        _ => 0,
+        _ => if prefetch_k() > 0 { 1 } else { 0 },
     })
 }
+
+/// `QX_DS_PREFETCH=K`: the driver copies the predicted top-K experts per token that are RAM-resident but not in
+/// VRAM into speculative staging slots during the layer's attention + dense phase, and `qx_moe_post` serves them
+/// from there (presuppositions row 5: 76-88% of the host-served selections are predicted). 0 (default): off.
+/// Width-1 and small windows only (<= 8 tokens): wider windows are bytes-bound and wrong guesses cost bytes.
+pub fn prefetch_k() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("QX_DS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(crate::mailbox::PRED_K))
+}
+
+/// Speculative staging slots per layer parity (two parities: a layer's slots are reused two layers later).
+pub const PRE_SLOTS: usize = 24;
 
 /// The CPUs this process may run on (`sched_getaffinity`), ascending.
 pub fn allowed_cpus() -> Vec<usize> {
@@ -983,6 +1004,8 @@ impl<'a> DsEngine<'a> {
                 let stage_cap: usize = if stage_share > 0 || stage_share_decode > 0 { std::env::var("QX_DS_STAGE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(256) } else { 1 };
                 let max_rec = (0..cfg.n_layer).map(|l| pack.experts.record[l] as usize).max().unwrap_or(0);
                 let stage = DeviceBuf::new(stage_cap * max_rec.max(256));
+                let pred_stage = DeviceBuf::new(if prefetch_k() > 0 { 2 * PRE_SLOTS * max_rec } else { 256 });
+                let prestaged = DeviceBuf::new(cfg.n_layer * n_expert * 8);  // zeroed: nothing prestaged
                 let want = (vram_gib * 1073741824.0) as usize;
                 let (free, _) = qx_gpu::mem::mem_info();
                 // The headroom must hold what comes after the tier: CubeCL's pools, every kernel module, and one
@@ -1058,6 +1081,9 @@ impl<'a> DsEngine<'a> {
                 let tiers = Tiers {
                     stage,
                     stage_cap,
+                    pred_stage,
+                    prestaged,
+                    rec_max: max_rec,
                     stage_share,
                     stage_share_decode,
                     stage_wide_min,
@@ -1114,6 +1140,10 @@ impl<'a> DsEngine<'a> {
                     gpu_reads_ram: gpu_share > 0,
                     stage_base: t.stage.ptr,
                     stage_cap: t.stage_cap,
+                    pred_stage_base: t.pred_stage.ptr,
+                    pre_slots: if prefetch_k() > 0 { PRE_SLOTS } else { 0 },
+                    prestaged_dev: t.prestaged.ptr,
+                    rec_max: t.rec_max,
                     slots_stg_dev: slots_stg.ptr,
                     slots_all_dev: slots_all.ptr,
                     stg_ready_dev: stg_ready.ptr,
@@ -1133,7 +1163,7 @@ impl<'a> DsEngine<'a> {
                     n_embd: E,
                     ff: cfg.ff_exp,
                 };
-                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_wide_min: t.stage_wide_min, stage_cap: t.stage_cap, _stage: t.stage, slots_all, slots_stg, stg_ready, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
+                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_wide_min: t.stage_wide_min, stage_cap: t.stage_cap, _stage: t.stage, _pred_stage: t.pred_stage, prestaged: t.prestaged, slots_all, slots_stg, stg_ready, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
                 abufs.step.zero();
                 place_threads();
                 let d = driver::Driver::start(host, cpus.clone());
@@ -1169,6 +1199,7 @@ impl<'a> DsEngine<'a> {
             max_ctx,
             exact_experts: false,
             tiers: tiers.map(std::cell::RefCell::new),
+            pred_seq: Default::default(),
             driver,
             abufs,
             engram_ring: engram_pack.as_ref().map(|_| std::cell::RefCell::new(io_uring::IoUring::new(128).expect("engram io_uring"))),
@@ -1269,6 +1300,9 @@ impl<'a> DsEngine<'a> {
     /// dense phase ahead of the real routing.
     fn predict_pre(&self, l: usize, t: usize) {
         let Some(d) = self.driver.as_ref() else { return };
+        if prefetch_k() > 0 && t > 8 {
+            return;
+        }
         let (c, w, s) = (&self.cfg, &self.layers[l], &self.s);
         let hcd = c.hc * E;
         self.rms(s.r.ptr, s.ones.ptr, s.rn_p.ptr, hcd, t);
@@ -1279,6 +1313,12 @@ impl<'a> DsEngine<'a> {
         self.mgt(&w.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l) as u64;
         self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale)]);
+        if prefetch_k() > 0 {
+            // tell the driver: layer, tokens, and a counter so every prediction is seen once
+            let n = self.pred_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let hdr = l as u64 | ((t as u64) << 8) | (n << 32);
+            self.k("qx_ds_pred_post", 1, (1, 1, 1), &[d.shared.mb.dptr, hdr]);
+        }
     }
 
     /// `next`: layer `l + 1`'s router on layer `l`'s FFN input (`xpre`, before `l`'s experts; what is missing is
@@ -1376,12 +1416,17 @@ impl<'a> DsEngine<'a> {
             let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
             let calls = g(&sh.tl_calls).max(1) as f64;
             let us = |a: &std::sync::atomic::AtomicU64| g(a) as f64 / 1e3 / calls;
+            let pre = if g(&sh.pre_issued) > 0 || g(&sh.pre_used) > 0 {
+                format!(" | prefetch issued {} used {} nvme {}", g(&sh.pre_issued), g(&sh.pre_used), g(&sh.pre_nvme))
+            } else {
+                String::new()
+            };
             let pred = if g(&sh.pred_total) > 0 {
                 format!(" | pred6 {}/{} pred8 {} pred12 {} non-vram pred6 {}/{} pred8 {} pred12 {}", g(&sh.pred_hits[0]), g(&sh.pred_total), g(&sh.pred_hits[1]), g(&sh.pred_hits[2]), g(&sh.pred_miss_hits[0]), g(&sh.pred_miss_total), g(&sh.pred_miss_hits[1]), g(&sh.pred_miss_hits[2]))
             } else {
                 String::new()
             };
-            return Some(format!("  vram {} staged {} pcie {} ram {} nvme {} promos vram {} ram {} ({:.0} ms, pool {:.0} ms of which fetch {:.0}, stage wait {:.0}) spec {}/{} non-vram {}/{} | serve {} calls: read {:.0} us, issue {:.0}, total {:.0}, gap {:.0}{pred}", g(&sh.vram_hits), g(&sh.staged_hits), g(&sh.mapped_hits), g(&sh.ram_hits), g(&sh.nvme_misses), g(&sh.vram_promos), g(&sh.ram_promos), g(&sh.promo_ns) as f64 / 1e6, g(&sh.pool_ns) as f64 / 1e6, g(&sh.fetch_ns) as f64 / 1e6, g(&sh.stage_ns) as f64 / 1e6, g(&sh.spec_hits), g(&sh.spec_total), g(&sh.spec_miss_hits), g(&sh.spec_miss_total), g(&sh.tl_calls), us(&sh.tl_read_ns), us(&sh.tl_issue_ns), us(&sh.tl_total_ns), us(&sh.tl_gap_ns)));
+            return Some(format!("  vram {} staged {} pcie {} ram {} nvme {} promos vram {} ram {} ({:.0} ms, pool {:.0} ms of which fetch {:.0}, stage wait {:.0}) spec {}/{} non-vram {}/{} | serve {} calls: read {:.0} us, issue {:.0}, total {:.0}, gap {:.0}{pred}{pre}", g(&sh.vram_hits), g(&sh.staged_hits), g(&sh.mapped_hits), g(&sh.ram_hits), g(&sh.nvme_misses), g(&sh.vram_promos), g(&sh.ram_promos), g(&sh.promo_ns) as f64 / 1e6, g(&sh.pool_ns) as f64 / 1e6, g(&sh.fetch_ns) as f64 / 1e6, g(&sh.stage_ns) as f64 / 1e6, g(&sh.spec_hits), g(&sh.spec_total), g(&sh.spec_miss_hits), g(&sh.spec_miss_total), g(&sh.tl_calls), us(&sh.tl_read_ns), us(&sh.tl_issue_ns), us(&sh.tl_total_ns), us(&sh.tl_gap_ns)));
         }
         self.tiers.as_ref().map(|t| {
             let t = t.borrow();
@@ -2572,7 +2617,7 @@ impl<'a> DsEngine<'a> {
             let mb = d.shared.mb.dptr;
             let stage_share = if t >= ab.stage_wide_min { ab.stage_share } else { ab.stage_share_decode };
             self.trace("qx_moe_post");
-            gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (tt, 1, 1), &[mb, ab.table_dev.ptr, (l * c.n_expert) as u64, self.s.ids.ptr, self.s.wts.ptr, self.s.x.ptr, ab.step.ptr, l as u64, k as u64, E as u64, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, t as u64 | ((self.warm as u64) << 32), ab.rtable_dev.ptr, ab.gpu_share, stage_share, ab.slots_all.ptr, ab.slots_stg.ptr, ab.stage_cap as u64]);
+            gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (tt, 1, 1), &[mb, ab.table_dev.ptr, (l * c.n_expert) as u64, self.s.ids.ptr, self.s.wts.ptr, self.s.x.ptr, ab.step.ptr, l as u64, k as u64, E as u64, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, t as u64 | ((self.warm as u64) << 32), ab.rtable_dev.ptr, ab.gpu_share, stage_share, ab.slots_all.ptr, ab.slots_stg.ptr, ab.stage_cap as u64, ab.prestaged.ptr]);
             self.trace_done();
             self.dsync("post");
             self.launch_resident(l, k, t, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, ab.gu.ptr, ab.gpu_out.ptr);

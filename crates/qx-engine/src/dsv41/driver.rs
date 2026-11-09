@@ -55,6 +55,10 @@ pub struct Shared {
     pub pred_total: AtomicU64,
     pub pred_miss_hits: [AtomicU64; 3],
     pub pred_miss_total: AtomicU64,
+    /// The prefetch: speculative copies issued, selections the post kernel served from them, NVMe records read early.
+    pub pre_issued: AtomicU64,
+    pub pre_used: AtomicU64,
+    pub pre_nvme: AtomicU64,
     pub stage_ns: AtomicU64,
     /// Set by the host after each token (the sampled token is known): the driver may run its promotions.
     pub tokens_done: AtomicU64,
@@ -129,6 +133,12 @@ pub struct Host {
     /// and the device array the staged slot addresses go to.
     pub stage_base: u64,
     pub stage_cap: usize,
+    /// The prefetch's speculative slots (`pre_slots` per layer parity, records of `rec_max` bytes) and the device
+    /// table of prestaged addresses the post kernel reads (`QX_DS_PREFETCH`).
+    pub pred_stage_base: u64,
+    pub pre_slots: usize,
+    pub prestaged_dev: u64,
+    pub rec_max: usize,
     pub slots_stg_dev: u64,
     pub slots_all_dev: u64,
     /// The staged-ready words (u64 per stage stream; `stage_ready_by_words`): the job's sequence number is written
@@ -192,6 +202,9 @@ impl Driver {
             pred_total: Default::default(),
             pred_miss_hits: Default::default(),
             pred_miss_total: Default::default(),
+            pre_issued: Default::default(),
+            pre_used: Default::default(),
+            pre_nvme: Default::default(),
             tokens_done: Default::default(),
             profile_req: AtomicBool::new(false),
             profile: std::sync::Mutex::new(None),
@@ -264,6 +277,12 @@ struct Loop {
     stg_words: bool,
     /// When the previous `serve` call returned (for the timeline's gap).
     last_serve_end: Option<std::time::Instant>,
+    /// The prefetch: predicted experts per token to fetch (0: off), the last prediction header seen, and per layer
+    /// parity the live speculative slots (record, slot) and the free ones.
+    pref_k: usize,
+    pref_last: u64,
+    pre_live: [Vec<(usize, u64)>; 2],
+    pre_free: [Vec<u64>; 2],
 }
 
 impl Loop {
@@ -440,6 +459,9 @@ impl Loop {
         let nm = *mb.slice::<u32>(MB_NMISS, 1).first().unwrap() as usize;
         let nmap = *mb.slice::<u32>(mailbox::MB_NMAP, 1).first().unwrap() as usize;
         let nstage = *mb.slice::<u32>(mailbox::MB_NSTAGE, 1).first().unwrap() as usize;
+        if self.pref_k > 0 {
+            sh.pre_used.fetch_add(*mb.slice::<u32>(mailbox::MB_NPRE, 1).first().unwrap() as u64, Ordering::Relaxed);
+        }
         let ntok = (*mb.slice::<u32>(MB_NTOK, 1).first().unwrap() as usize).max(1);
         let kpt = (*mb.slice::<u32>(MB_KPT, 1).first().unwrap() as usize).max(1);
         let mut ids: Vec<i32> = mb.slice::<i32>(MB_IDS, nm).to_vec();
@@ -799,6 +821,93 @@ impl Loop {
         sh.flex_ack.store(req, Ordering::Release);
     }
 
+    /// The prefetch (`QX_DS_PREFETCH=K`): on a new router prediction for layer `l` (posted by the GPU at the top of
+    /// the layer, before its attention), copies the predicted top-K experts per token that are in RAM but not in
+    /// VRAM into this parity's speculative slots on the copy stream and writes their addresses into the prestaged
+    /// table behind the copies, so `qx_moe_post` finds them resident when the real routing arrives ~0.5 ms later.
+    /// The slots of layer `l - 2` (same parity) are recycled first: their kernels ran before the post of `l - 1`,
+    /// which precedes this prediction on the GPU's stream; their table entries are cleared (the next lookup of
+    /// those experts is the next token's layer `l - 2`). Predicted experts on NVMe only are queued for a RAM
+    /// promotion. True when it did anything.
+    fn prefetch_check(&mut self, sh: &Shared) -> bool {
+        if self.pref_k == 0 || self.host.pre_slots == 0 {
+            return false;
+        }
+        let hdr = sh.mb.atomic_u64(mailbox::MB_PRED_HDR).load(Ordering::Acquire);
+        if hdr == self.pref_last {
+            return false;
+        }
+        self.pref_last = hdr;
+        let l = (hdr & 0xff) as usize;
+        let ntok = ((hdr >> 8) & 0xffff) as usize;
+        let ne = self.host.n_expert;
+        if l >= self.host.layers.len() || ntok == 0 {
+            return true;
+        }
+        let par = l & 1;
+        // recycle the parity's slots and clear the table entries they held
+        let live = std::mem::take(&mut self.pre_live[par]);
+        for &(g, slot) in &live {
+            self.write_entry_pre(g, 0);
+            self.pre_free[par].push(slot);
+        }
+        // the predicted experts of this layer, distinct, hottest-ranked first (token order, then rank)
+        let pk = mailbox::PRED_K;
+        let pred: Vec<i32> = sh.mb.slice::<i32>(mailbox::mb_pred(self.host.n_embd, l), ntok * pk).to_vec();
+        let mut want: Vec<usize> = Vec::with_capacity(ntok * self.pref_k);
+        for r in 0..self.pref_k.min(pk) {
+            for tok in 0..ntok {
+                let e = pred[tok * pk + r];
+                if e >= 0 && (e as usize) < ne {
+                    let g = l * ne + e as usize;
+                    if !want.contains(&g) {
+                        want.push(g);
+                    }
+                }
+            }
+        }
+        // the speculative copies join the promotion copies' in-flight set and event (the set keeps their RAM places
+        // from being evicted until the event, which is re-recorded after the newest copy); never block here: the
+        // driver must be free to answer the real post that follows the prediction by ~0.5 ms
+        self.finish_copies(sh, false);
+        let mut issued = 0u64;
+        for g in want {
+            if self.host.table[g] != 0 {
+                continue;  // resident already
+            }
+            if !self.host.store.in_ram(g) {
+                // NVMe only: a RAM promotion now, for the next time this expert is predicted or routed
+                if !self.pending_ram.contains(&g) {
+                    self.pending_ram.push(g);
+                    sh.pre_nvme.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+            let Some(slot) = self.pre_free[par].pop() else { break };
+            let ptr = self.host.store.place[g] as *const u8;
+            let nb = self.host.store.record_bytes(g);
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(slot, ptr as *const _, nb, self.stream).result().expect("prefetch copy");
+            }
+            self.write_entry_pre(g, slot);
+            self.inflight.push(g);
+            self.pre_live[par].push((g, slot));
+            issued += 1;
+        }
+        if issued > 0 {
+            unsafe { cudarc::driver::result::event::record(self.copy_event, self.stream).expect("event record") };
+            sh.pre_issued.fetch_add(issued, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// Writes the prestaged table's entry for `g` on the copy stream (behind the record's copy when nonzero).
+    fn write_entry_pre(&mut self, g: usize, v: u64) {
+        let dst = self.host.prestaged_dev + 8 * g as u64;
+        let st = self.stream;
+        self.write_word_on(st, dst, v);
+    }
+
     /// Clears the in-flight set once the copies landed (`wait` blocks for them).
     fn finish_copies(&mut self, sh: &Shared, wait: bool) {
         if self.inflight.is_empty() {
@@ -889,7 +998,10 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     let n_stage_streams = n_stage_streams();
     let stage_streams: Vec<cudarc::driver::sys::CUstream> = (0..n_stage_streams).map(|_| unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("stage stream")).collect();
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
-    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None };
+    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_last: 0, pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
+    for par in 0..2 {
+        lp.pre_free[par] = (0..lp.host.pre_slots).map(|i| lp.host.pred_stage_base + ((par * lp.host.pre_slots + i) * lp.host.rec_max) as u64).collect();
+    }
     // exercise every copy path once before a window can wait on this thread: whatever the CUDA driver
     // loads or allocates on a stream's first copy then happens while the device is idle
     let scratch = qx_gpu::mem::DeviceBuf::new(64);
@@ -919,6 +1031,9 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
         }
         let mut worked = false;
         lp.flex_check(&sh);
+        if lp.prefetch_check(&sh) {
+            worked = true;
+        }
         let seq = sh.mb.atomic_u64(MB_SEQ).load(Ordering::Acquire);
         if seq != last_job {
             last_job = seq;
