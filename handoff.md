@@ -1,5 +1,45 @@
 # Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-09, midday)
 
+## Resume 2026-11-09: cold-width compressor corruption reproduced; server issue still open
+
+- Read this update before the older START HERE state. HEAD on resume was `61679b2`; the prefetch launch-module
+  fix is already committed (`28f3436`), so do not redo item 3 below.
+- Recovered the previous agent's finished chains from `~/qx-chains/` and copied their logs/dumps/scripts into
+  `perf/results/2026-11-09/identity-resume/`. Frozen tiers x3, staging share 3 x3 and baseline x2 all compare
+  identical with the stricter comparator. Narrow mixed-sequence checks: 128/128 and 512/512 adapting, 512/512
+  frozen. These clean controls do not explain the intermittent server difference; promotion remains blocked.
+- Expanded `qx-ds-multi` with configurable widths, rotating row positions, and `QX_DS_MULTI_CHECK_ALL=1`.
+  The old checker only checked row-zero A at widths 2,3,5,7,4,6. A-only broad rotated check passed 128/128.
+  **All-row cold-width reproducer failed:** N=26, widths `2,3,4,6,8,12,16,24,32,48,64,96,128`, rotation on:
+  A 26/26, B **1/834**, C 26/26; first B difference position 1, width 4, row 0. Same run with
+  `QX_DS_MULTI_WARM=1` (server-style startup warm-up) passes **26/26, 834/834, 26/26**.
+- Cause: a dry window covering positions 1,2 at compression ratio 2 overwrites pending position 0 with dry
+  position 2 before real position 1 consumes it. Candidate fix in `warm_width`: snapshot pending buffers before
+  the dry pass, restore after synchronization. No CUDA kernel change. **This does not explain the server flip**:
+  the server warms every scheduler width before requests. Its short identity prompts also run zero chunk steps.
+  Review found a separate opt-in concern: prediction can publish a prefetch job during a dry pass. This fix and
+  its validation use prefetch disabled; make publication dry-aware before resuming prefetch experiments.
+- Tooling fixes: join the checker's driver before shutdown (old exit skipped cleanup and logged a CUDA shutdown
+  panic); reject extra/missing/malformed/empty dump records and reasoning/text boundary changes; validate all
+  named ds-checks results in `check_ds_log.py` (bench.sh still expected two window lines, now there are four).
+  CPU regression tests and release build pass. Breaker review: `perf/ideation/2026-11-09-breaker-identity-tools.md`.
+- Candidate binaries are isolated in `~/qx-bins/resume-20261109/`; installed production binaries are unchanged.
+  Validation unit `qx-pending-warmup-fix.service` completed: cold all-row reproduction **886/886**, then all nine
+  ds-checks results **pass**, including the new three-slot cold-width regression. Logs:
+  `perf/results/2026-11-09/pending-warmup-fix/`. Server identity on the fixed binary reproduced the original
+  issue: **7/8 identical**, French Revolution at concurrency 3 differs in reasoning at character 400. Logs:
+  `perf/results/2026-11-09/pending-warmup-server/`. The paired `--window 1` run passed **8/8 identical**,
+  including French Revolution. Its scheduler used only widths 1,2,3; logs:
+  `perf/results/2026-11-09/pending-warmup-server-window1/`. Both validation units have finished and their
+  servers have stopped. One clean control does not isolate a cause; repeat paired runs before attributing it
+  to wide prompt kernels rather than placement/timing. The cold-width fix is not a server-identity fix.
+- Score remains **30.047**, no promotion or performance claim. Belief tested: a dry window's state writes are
+  harmless because the real window overwrites them—false for pending compressor history. This session is
+  correctness diagnosis, not a speed experiment. Changes are uncommitted; no baseline or installed binary was
+  replaced. Next: repeat the window-1/default server pair; make a teacher-forced all-row reproducer from the
+  actual French Revolution prompt and reference continuation (rather than route16k); then test frozen tiers
+  in that reproducer. Only after server identity is resolved resume placement promotion and prefetch work.
+
 ## START HERE (2026-11-09): everything needed to resume, in order
 
 This section is self-contained. The dated updates below it are history; read them only for detail.

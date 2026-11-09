@@ -76,6 +76,13 @@ prompts is structural (chunk size, tensor cores, launch count), not tuning.
 
 ## Correctness rules learned the hard way
 
+- **Dry first-use windows must preserve incoming compressor pending pairs (2026-11-09).** At ratio 2, a dry
+  window spanning positions 1,2 replaces pending position 0 with dry position 2; real position 1 then pools the
+  wrong pair. The all-row mixed-sequence checker gives B 1/834 exact before the fix, 834/834 after saving and
+  restoring pending buffers around the dry pass, and 834/834 with startup warm-up on the unfixed engine. The
+  old checker inspected only one decode row per window and missed this. Rings have enough spare cells and
+  committed rows are recomputed before use; the circular pending history is the exception. Server identity is
+  still an open issue because its scheduler widths are already warmed at startup.
 - **Never upload with `DeviceBuf::upload` into memory a queued kernel reads.** It runs on the legacy stream,
   unordered with CubeCL's stream. Use a mapped buffer plus a copy kernel, or sync first. This caused the
   Engram race in 2026-11-03.

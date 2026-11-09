@@ -6,6 +6,7 @@
 #   3b. windows of 3 with the tiers adapting (promotions on) against the same steps: expect 128/128
 #   4. tokenization against llama.cpp's llama-tokenize (when QX_LLAMA_TOKENIZE points at it): expect identical
 #   5. rewind to 64 and park + unpark to 64 of route1k 128 against the straight pass: expect 64 / 64 twice
+#   6. mixed sequences with cold widths 2,3,4: every slot's 3 rows match single steps (pending-pair regression)
 # Heavy (the pack's RAM tier): run alone, under a memory cap: `tools/capped.sh 112 tools/ds-checks.sh`.
 set -u
 cd "$(dirname "$0")/.."
@@ -14,8 +15,10 @@ D=${QX_DS_DIR:-$HOME/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS}
 M=${QX_DS_MODEL:-$D/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf}
 export QX_DS_PACK=${QX_DS_PACK:-$D/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp}
 T=${TMPDIR:-/tmp}/ds-checks.$$; mkdir -p "$T"; trap 'rm -rf "$T"' EXIT
-B=target/release/qx-ds-check
-[ -x $B ] || cargo build --release -p qx-engine --bin qx-ds-check --bin qx-tok >/dev/null
+B=${QX_DS_CHECK_BIN:-target/release/qx-ds-check}
+BM=$(dirname "$B")/qx-ds-multi
+[ -x "$B" ] || cargo build --release -p qx-engine --bin qx-ds-check --bin qx-ds-multi --bin qx-tok >/dev/null
+[ -x "$BM" ] || { echo "missing $BM; build qx-ds-multi beside qx-ds-check" >&2; exit 1; }
 # a process that pinned the RAM tier takes 10-30 s to tear down after it exits and holds its VRAM meanwhile
 gpu_free() { until [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)" -lt 1000 ]; do sleep 2; done; }
 gpu_free
@@ -46,3 +49,10 @@ fi
 # straight pass: every later row bit-identical (the replay-based rewind, 2026-11-06)
 gpu_free
 echo "5. rewind and park vs straight: $(env $B0 QX_DS_REWIND=64 QX_DS_PARK=64 $B "$M" golden/data/route1k.tokens 128 2>/dev/null | grep -E '^(rewind|park)' | sed -E 's/ \(restore.*//; s/ then positions 64..128//' | tr '\n' ' ')"
+gpu_free
+if ! env QX_DS_VRAM=20 QX_DS_RAM=60 QX_DS_MULTI_WIDTHS=2,3,4 QX_DS_MULTI_ROTATE=1 QX_DS_MULTI_CHECK_ALL=1 QX_DS_MULTI_WARM=0 \
+    "$BM" "$QX_DS_PACK" golden/data/route1k.tokens 3 > "$T/multi.log" 2>&1; then
+  cat "$T/multi.log"
+  exit 1
+fi
+echo "6. mixed sequences, cold widths: $(grep '^multi-sequence' "$T/multi.log" | tr '\n' ' ')"

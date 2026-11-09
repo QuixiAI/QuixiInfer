@@ -101,7 +101,7 @@ fi
 
 if [ $BUILD = 1 ]; then
   set +e
-  cargo build --release -p qx-engine -p qx-serve --bin qx-ds-check --bin quixiinfer > /tmp/qx-perf-build.$$ 2>&1
+  cargo build --release -p qx-engine -p qx-serve --bin qx-ds-check --bin qx-ds-multi --bin quixiinfer > /tmp/qx-perf-build.$$ 2>&1
   rc=$?
   set -e
   if [ $rc != 0 ]; then tail -30 /tmp/qx-perf-build.$$ >&2; rm -f /tmp/qx-perf-build.$$; echo "build failed ($rc)" >&2; exit 1; fi
@@ -121,18 +121,16 @@ git diff HEAD -- . ':!tools/golden/golden-dsv41' > "$RUN/working-tree.diff"
 check=skipped
 if [ $CHECK = 1 ]; then
   echo "correctness: tools/ds-checks.sh"
-  if tools/ds-checks.sh > "$RUN/logs/ds-checks.log" 2>&1 && ! grep -q "^[0-9]\..*: *$" "$RUN/logs/ds-checks.log"; then
+  if QX_DS_CHECK_BIN="$B" tools/ds-checks.sh > "$RUN/logs/ds-checks.log" 2>&1 && ! grep -q "^[0-9]\..*: *$" "$RUN/logs/ds-checks.log"; then
     check=pass
   else
     check=fail
   fi
   cat "$RUN/logs/ds-checks.log"
-  # exact-match expectations of the regression set (perf/perf.md, "Correctness gate")
+  # Validate each named check, including width 3 and adapting tiers; counting two matching rows became stale.
   if [ $check = pass ]; then
-    grep -q "top-1 agreement 6/6, KLD mean 0.000000" "$RUN/logs/ds-checks.log" || check=fail
-    [ "$(grep -c 'bit-identical rows: 128 / 128' "$RUN/logs/ds-checks.log")" = 2 ] || check=fail
-    grep -q "^4\. .*identical" "$RUN/logs/ds-checks.log" || check=incomplete   # tokenizer line missing: no llama-tokenize
-    [ "$(grep -o '64 / 64' "$RUN/logs/ds-checks.log" | wc -l)" -ge 2 ] || check=fail   # rewind and park (line 5)
+    check=$(python3 perf/harness/check_ds_log.py "$RUN/logs/ds-checks.log") || true
+    case "$check" in pass|fail|incomplete) ;; *) check=fail ;; esac
   fi
   echo "correctness: $check"
 fi

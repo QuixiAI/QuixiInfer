@@ -464,6 +464,42 @@ fn static_name(s: String) -> &'static str {
     n
 }
 
+/// `QX_DS_SCHED_TRACE=path`: every engine call that advances or rewinds a slot is appended to `path` (`R slot`,
+/// `W slot pos`, `F kv slot:tok,...`, `C slot kv tok,...`, `L` for a chunk release), each forward followed by `H` and
+/// one FNV-1a hash per returned logits row. `qx-ds-replay` re-executes such a file and compares the hashes: a server
+/// run's exact schedule, replayed deterministically (2026-11-09, for the late-token flip under three streams).
+pub fn sched_trace_on() -> bool {
+    sched_trace_file().is_some()
+}
+
+fn sched_trace_file() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    F.get_or_init(|| std::env::var("QX_DS_SCHED_TRACE").ok().map(|p| std::sync::Mutex::new(std::fs::File::create(&p).expect("QX_DS_SCHED_TRACE")))).as_ref()
+}
+
+pub fn sched_trace(line: &str) {
+    if let Some(f) = sched_trace_file() {
+        use std::io::Write;
+        let mut f = f.lock().unwrap();
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// One FNV-1a hash (hex) per row of `rows` equal rows of `out` (empty when `out` is).
+pub fn row_hashes(out: &[f32], rows: usize) -> String {
+    if out.is_empty() || rows == 0 {
+        return String::new();
+    }
+    let nv = out.len() / rows;
+    out.chunks(nv.max(1)).map(|r| {
+        let mut h = 0xcbf29ce484222325u64;
+        for v in r {
+            h = (h ^ v.to_bits() as u64).wrapping_mul(0x100000001b3);
+        }
+        format!("{h:016x}")
+    }).collect::<Vec<_>>().join(" ")
+}
+
 /// `QX_DS_PREDICT`: 0 off, 1 `pre` (the layer's router on the pre-attention residual), 2 `next` (the next layer's
 /// router on this layer's FFN input). Scored in the stats line. `pre` is also what the prefetch (`QX_DS_PREFETCH`)
 /// consumes, so it is on whenever the prefetch is.
@@ -1597,6 +1633,7 @@ impl<'a> DsEngine<'a> {
     /// Starts slot `slot` anew at position 0 (its ring, stores and pending pairs are overwritten as positions
     /// recur; the captured graphs stay valid).
     pub fn reset(&mut self, slot: usize) {
+        sched_trace(&format!("R {slot}"));
         self.gpu.sync();
         self.st.pos[slot] = 0;
         self.st.tokens[slot].clear();
@@ -1624,6 +1661,7 @@ impl<'a> DsEngine<'a> {
     /// slot's own tokens (`replay_to`). This replaced a per-position host copy of every latent, 21.5 GB per slot
     /// at 256k (2026-11-06).
     pub fn rewind(&mut self, slot: usize, p: usize) {
+        sched_trace(&format!("W {slot} {p}"));
         assert!(p <= self.st.pos[slot], "rewind past the end");
         let max_ratio = self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
         assert!(p % max_ratio == 0, "rewind to a group boundary");
@@ -1798,6 +1836,12 @@ impl<'a> DsEngine<'a> {
     /// the real pass runs next (the dry pass writes the same ring and store positions, which the real pass rewrites).
     fn warm_width(&mut self, t: usize, pos_min: usize, pos_max: usize) {
         if self.driver.is_some() && !self.warmed[t] {
+            // A dry window can cross a compressor-group boundary. Its later tokens overwrite pending
+            // entries that the real window's first token still needs (e.g. positions 1,2 at ratio 2).
+            // Preserve the incoming pairs; rings and committed store rows are rewritten by the real pass.
+            self.gpu.sync();
+            let pending: Vec<Option<Vec<u8>>> = self.st.stores.iter()
+                .map(|s| s.as_ref().map(|(_, _, p, _)| p.download(p.bytes))).collect();
             let max_ratio = self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
             if let Some(d) = &self.driver {
                 d.shared.mb.slice::<f32>(crate::mailbox::mb_y(E), crate::mailbox::AMAX * E).fill(0.0);
@@ -1807,6 +1851,11 @@ impl<'a> DsEngine<'a> {
             self.launch_window(t, pos_min.max(p), pos_max.max(p), None, false);
             self.warm = false;
             self.gpu.sync();
+            for (store, saved) in self.st.stores.iter().zip(&pending) {
+                if let (Some((_, _, p, _)), Some(bytes)) = (store, saved) {
+                    p.upload(bytes);
+                }
+            }
             self.warmed[t] = true;
         }
     }
@@ -1876,6 +1925,7 @@ impl<'a> DsEngine<'a> {
     /// Gives the arena's flex tail back to the tiers (the chunk buffers are dead): call once a prompt's chunks are
     /// done and no other prompt is about to run its chunks. The driver applies it at its next turn.
     pub fn chunk_release(&self) {
+        sched_trace("L");
         if let Some(d) = self.driver.as_ref() {
             let sh = &d.shared;
             if sh.flex_want.swap(false, std::sync::atomic::Ordering::AcqRel) {
@@ -1947,6 +1997,16 @@ impl<'a> DsEngine<'a> {
     /// `prompt_keep` positions before its prompt's end): layers up to the last KV source, whose slab passes stop
     /// after the ring, store and index-key writes, and no experts there; returns no logits.
     pub fn forward_chunk_opt(&mut self, slot: usize, toks: &[u32], kv_only: bool) -> Vec<f32> {
+        let out = self.forward_chunk_inner(slot, toks, kv_only);
+        if sched_trace_on() {
+            let t: Vec<String> = toks.iter().map(|t| t.to_string()).collect();
+            sched_trace(&format!("C {slot} {} {}", kv_only as u8, t.join(",")));
+            sched_trace(&format!("H {}", row_hashes(&out, 1)));
+        }
+        out
+    }
+
+    fn forward_chunk_inner(&mut self, slot: usize, toks: &[u32], kv_only: bool) -> Vec<f32> {
         let tf = std::time::Instant::now();
         self.t_experts = 0.0;
         let rows = toks.len();
@@ -2294,6 +2354,16 @@ impl<'a> DsEngine<'a> {
     /// above), and returns no logits. Only for prompt windows at least `prompt_keep` positions before the end of
     /// their slot's prompt, all tokens in one slot's prompt; the caller decides.
     pub fn forward_segments_opt(&mut self, toks: &[(usize, u32)], act: Option<&mut dyn FnMut(&str, Vec<f32>)>, kv_only: bool) -> Vec<f32> {
+        let out = self.forward_segments_inner(toks, act, kv_only);
+        if sched_trace_on() {
+            let segs: Vec<String> = toks.iter().map(|&(s, t)| format!("{s}:{t}")).collect();
+            sched_trace(&format!("F {} {}", kv_only as u8, segs.join(",")));
+            sched_trace(&format!("H {}", row_hashes(&out, toks.len())));
+        }
+        out
+    }
+
+    fn forward_segments_inner(&mut self, toks: &[(usize, u32)], act: Option<&mut dyn FnMut(&str, Vec<f32>)>, kv_only: bool) -> Vec<f32> {
         let tf = std::time::Instant::now();
         self.t_experts = 0.0;
         let t = toks.len();

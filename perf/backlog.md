@@ -9,6 +9,16 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Correctness prerequisite (2026-11-09; promotion still blocked)
+
+The expanded all-row `qx-ds-multi` exposes cold-width compressor corruption: B 1/834 exact becomes 834/834 when
+incoming pending buffers are preserved around the dry pass. A/C remain 26/26; the full updated checks pass.
+Startup-warmed control also passes without the fix, so this does not explain the intermittent server flip.
+Fixed-binary server pair: default window 7/8 identical (French Revolution, reasoning char 400), window 1
+8/8 identical. Repeat the pair, then build a teacher-forced reproducer from that actual prompt/continuation
+and compare every row across widths and tiers. One clean control is inconclusive. `--window 1` still allows
+a width-3 batch of concurrent decoders. See notebook and presupposition 26.
+
 ### 1. Harness coverage: long context and serving (prerequisite)
 
 - **Parent result:** the standard benchmark covers forced decode and prefill at 1k only. Recorded costs grow with

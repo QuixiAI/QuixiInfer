@@ -38,9 +38,13 @@ regression set `tools/ds-checks.sh` reproduces these lines exactly:
 ```
 1. exact f32 vs reference:      positions 6: top-1 agreement 6/6, KLD mean 0.000000
 2. production vs reference:     positions 59: top-1 agreement 57/59, KLD mean 0.128643
+3. windows of 3 vs single steps: bit-identical rows: 128 / 128
 3. windows of 8 vs single steps: bit-identical rows: 128 / 128
 3. windows of 64 vs single steps: bit-identical rows: 128 / 128
+3b. windows of 3, tiers adapting, vs single steps: bit-identical rows: 128 / 128
 4. tokenizer vs llama.cpp:      identical: 20 tokens decode round trip: exact
+5. rewind and park vs straight: rewind to 64: bit-identical rows: 64 / 64 park/unpark to 64: bit-identical rows: 64 / 64
+6. mixed sequences, cold widths: multi-sequence windows vs A alone: bit-identical rows: 3 / 3 multi-sequence slot 1 vs alone: bit-identical rows: 3 / 3 multi-sequence slot 2 vs alone: bit-identical rows: 3 / 3
 ```
 
 Line 2's 57/59 and 0.128643 are the production path's own fixed point, so any change in them is a numerics
@@ -228,10 +232,11 @@ token.
 QX_LLAMA_TOKENIZE=$HOME/git/llama.cpp-dsv41/build-tok/bin/llama-tokenize tools/ds-checks.sh
 ```
 
-The gate takes about 6 minutes and prints six lines: the exact-f32 agreement (6/6, KLD 0.000000), the production
-agreement (57/59, KLD 0.128643), windows of 8 and of 64 against single steps (128 / 128 each), the tokenizer
-(identical), and since 2026-11-06 a rewind and a park + unpark against the straight pass (64 / 64 each: the
-replay-based rewind). Run it in a capped unit, alone on the box. `bench.sh --check` runs it first and records
+The gate prints nine result lines: exact-f32 agreement, production agreement, windows of 3/8/64, adapting
+width-3 windows, tokenizer identity, rewind/park, and mixed sequences with cold widths 2/3/4. The last check
+compares every slot's rows and covers compressor history across a first-use warm-up. Build `qx-ds-multi` beside
+`qx-ds-check`; `QX_DS_CHECK_BIN` selects an isolated build of both tools. `check_ds_log.py` validates every named
+result exactly once, including production numerics. Run in a capped unit, alone on the box. `bench.sh --check` runs it first and records
 `pass` or `fail` in `run.json`. A run without a pass can be measured, but it cannot be landed, promoted
 or put on the scoreboard. For changes to slots, serving, prefix reuse or parking, also run the server smoke test:
 three concurrent requests, a repeat for prefix reuse, and a `json_object` request. An example is in
