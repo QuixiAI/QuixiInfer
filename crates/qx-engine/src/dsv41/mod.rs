@@ -1376,7 +1376,8 @@ impl<'a> DsEngine<'a> {
         self.mgt(&w.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l) as u64;
         self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale)]);
-        if prefetch_k() > 0 {
+        if prefetch_k() > 0 && !self.warm {
+            // (never from a dry pass: its routing is not a real job's)
             // tell the driver: layer and tokens; the kernel adds a device-side counter so every prediction is
             // distinct, also when this launch is replayed from a window's CUDA graph
             if let Some(ab) = self.abufs.as_ref() {
