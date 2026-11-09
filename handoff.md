@@ -37,8 +37,10 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   (29.316) is HOLD by the adjudicator for this very check.
 - **Operational:** at 18:35 systemd-oomd killed the tmux scope (the Claude Code session and every chain started from
   it: `setsid nohup` does not leave the session's cgroup) and at 18:41 the bench's own scope (104 GB peak). Chains now
-  start under their own `systemd-run --user --scope -p MemoryMax=4G` (`qx-chain-resume`), so a session kill does not
-  take the GPU work with it; the lesson belongs with "one heavy job at a time": check for a leftover engine before
+  start under their own `systemd-run --user --scope` WITHOUT a MemoryMax (`qx-chain-resume2`, `qx-chain-pref2`): a
+  capped chain scope stops bench.sh from re-execing into its own 112G scope (it checks for an existing cgroup cap)
+  and the engine then runs inside the small cap and is OOM-killed, which happened once at 20:01; uncapped, a session
+  kill still does not take the GPU work with it; the lesson belongs with "one heavy job at a time": check for a leftover engine before
   starting another (a hung arm killed by the bench timeout can still hold 100 GB).
 
 ## Update 2026-11-08, night (new session under the updated goal prompt): roles in use; placement reworked; prediction measurement queued
