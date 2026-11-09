@@ -284,10 +284,13 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
 }
 
 /// Posts a router prediction's header to the mailbox after its ids landed (same stream): info: [0] mailbox,
-/// [1] the header word (layer | tokens << 8 | counter << 32). One thread.
+/// [1] layer | tokens << 8, [2] a device counter (u64) this kernel increments: the header is
+/// layer | tokens << 8 | counter << 32, so every prediction is distinct even when the launch is replayed from a
+/// CUDA graph (the counter lives on the device, not in the arguments). One thread.
 extern "C" __global__ void qx_ds_pred_post(const u64* info) {
+    const u64 n = atomicAdd(reinterpret_cast<unsigned long long*>(info[2]), 1ull) + 1;
     __threadfence_system();
-    st_release_sys(reinterpret_cast<u64*>(reinterpret_cast<u8*>(info[0]) + MB_PRED_HDR), info[1]);
+    st_release_sys(reinterpret_cast<u64*>(reinterpret_cast<u8*>(info[0]) + MB_PRED_HDR), info[1] | (n << 32));
 }
 
 /// Waits until the driver has staged the current job's records into VRAM and written their slot addresses,

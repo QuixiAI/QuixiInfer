@@ -367,6 +367,8 @@ pub struct AsyncBufs {
     _stage: DeviceBuf,
     _pred_stage: DeviceBuf,
     prestaged: DeviceBuf,
+    /// The prediction header counter (device side, see `qx_ds_pred_post`).
+    pred_ctr: DeviceBuf,
     slots_all: DeviceBuf,
     slots_stg: DeviceBuf,
     /// The staged-ready words, one per stage stream (`driver::stage_ready_by_words`).
@@ -415,8 +417,6 @@ pub struct DsEngine<'a> {
     pub exact_experts: bool,
     /// The tiers when loaded from a pack; else the experts are read from the GGUF by the pool.
     pub tiers: Option<std::cell::RefCell<Tiers>>,
-    /// Router predictions posted so far (the prefetch's header counter).
-    pred_seq: std::sync::atomic::AtomicU64,
     /// The asynchronous mode (`QX_DS_ASYNC`, default on with a pack): the driver thread and the device buffers.
     pub driver: Option<driver::Driver>,
     abufs: Option<AsyncBufs>,
@@ -1163,7 +1163,7 @@ impl<'a> DsEngine<'a> {
                     n_embd: E,
                     ff: cfg.ff_exp,
                 };
-                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_wide_min: t.stage_wide_min, stage_cap: t.stage_cap, _stage: t.stage, _pred_stage: t.pred_stage, prestaged: t.prestaged, slots_all, slots_stg, stg_ready, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
+                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_wide_min: t.stage_wide_min, stage_cap: t.stage_cap, _stage: t.stage, _pred_stage: t.pred_stage, prestaged: t.prestaged, pred_ctr: DeviceBuf::new(8), slots_all, slots_stg, stg_ready, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
                 abufs.step.zero();
                 place_threads();
                 let d = driver::Driver::start(host, cpus.clone());
@@ -1199,7 +1199,6 @@ impl<'a> DsEngine<'a> {
             max_ctx,
             exact_experts: false,
             tiers: tiers.map(std::cell::RefCell::new),
-            pred_seq: Default::default(),
             driver,
             abufs,
             engram_ring: engram_pack.as_ref().map(|_| std::cell::RefCell::new(io_uring::IoUring::new(128).expect("engram io_uring"))),
@@ -1314,10 +1313,11 @@ impl<'a> DsEngine<'a> {
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l) as u64;
         self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale)]);
         if prefetch_k() > 0 {
-            // tell the driver: layer, tokens, and a counter so every prediction is seen once
-            let n = self.pred_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let hdr = l as u64 | ((t as u64) << 8) | (n << 32);
-            self.k("qx_ds_pred_post", 1, (1, 1, 1), &[d.shared.mb.dptr, hdr]);
+            // tell the driver: layer and tokens; the kernel adds a device-side counter so every prediction is
+            // distinct, also when this launch is replayed from a window's CUDA graph
+            if let Some(ab) = self.abufs.as_ref() {
+                self.k("qx_ds_pred_post", 1, (1, 1, 1), &[d.shared.mb.dptr, l as u64 | ((t as u64) << 8), ab.pred_ctr.ptr]);
+            }
         }
     }
 
