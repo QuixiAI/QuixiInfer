@@ -477,6 +477,14 @@ fn sched_trace_file() -> Option<&'static std::sync::Mutex<std::fs::File>> {
     F.get_or_init(|| std::env::var("QX_DS_SCHED_TRACE").ok().map(|p| std::sync::Mutex::new(std::fs::File::create(&p).expect("QX_DS_SCHED_TRACE")))).as_ref()
 }
 
+/// `QX_DS_TRACE_LAYERS=1` (with `QX_DS_SCHED_TRACE`): windows run eagerly and every layer appends `Y layer` with a
+/// hash of each row's residual streams, and the driver appends `S layer` with the selections it served on the pool
+/// and by staging: enough to name the layer and the expert where two runs of one schedule part ways.
+pub fn layer_trace_on() -> bool {
+    static L: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *L.get_or_init(|| sched_trace_on() && std::env::var("QX_DS_TRACE_LAYERS").is_ok_and(|v| v == "1"))
+}
+
 pub fn sched_trace(line: &str) {
     if let Some(f) = sched_trace_file() {
         use std::io::Write;
@@ -1485,7 +1493,7 @@ impl<'a> DsEngine<'a> {
             } else {
                 String::new()
             };
-            return Some(format!("  vram {} staged {} pcie {} ram {} nvme {} promos vram {} ram {} ({:.0} ms, pool {:.0} ms of which fetch {:.0}, stage wait {:.0}) spec {}/{} non-vram {}/{} | serve {} calls: read {:.0} us, issue {:.0}, total {:.0}, gap {:.0}{pred}{pre}", g(&sh.vram_hits), g(&sh.staged_hits), g(&sh.mapped_hits), g(&sh.ram_hits), g(&sh.nvme_misses), g(&sh.vram_promos), g(&sh.ram_promos), g(&sh.promo_ns) as f64 / 1e6, g(&sh.pool_ns) as f64 / 1e6, g(&sh.fetch_ns) as f64 / 1e6, g(&sh.stage_ns) as f64 / 1e6, g(&sh.spec_hits), g(&sh.spec_total), g(&sh.spec_miss_hits), g(&sh.spec_miss_total), g(&sh.tl_calls), us(&sh.tl_read_ns), us(&sh.tl_issue_ns), us(&sh.tl_total_ns), us(&sh.tl_gap_ns)));
+            return Some(format!("  vram {} staged {} pcie {} ram {} nvme {} promos vram {} ram {} ({:.0} ms, pool {:.0} ms of which fetch {:.0}, stage wait {:.0}) spec {}/{} non-vram {}/{} | serve {} calls: read {:.0} us, issue {:.0}, total {:.0}, gap {:.0}{pred}{pre}{}", g(&sh.vram_hits), g(&sh.staged_hits), g(&sh.mapped_hits), g(&sh.ram_hits), g(&sh.nvme_misses), g(&sh.vram_promos), g(&sh.ram_promos), g(&sh.promo_ns) as f64 / 1e6, g(&sh.pool_ns) as f64 / 1e6, g(&sh.fetch_ns) as f64 / 1e6, g(&sh.stage_ns) as f64 / 1e6, g(&sh.spec_hits), g(&sh.spec_total), g(&sh.spec_miss_hits), g(&sh.spec_miss_total), g(&sh.tl_calls), us(&sh.tl_read_ns), us(&sh.tl_issue_ns), us(&sh.tl_total_ns), us(&sh.tl_gap_ns), if g(&sh.stage_fallbacks) > 0 { format!(" | stage fallbacks {}", g(&sh.stage_fallbacks)) } else { String::new() }));
         }
         self.tiers.as_ref().map(|t| {
             let t = t.borrow();
@@ -2423,7 +2431,7 @@ impl<'a> DsEngine<'a> {
         // each kernel bounds itself by the true positions in `s.pos`) with the expert job replaced by zeroed slot
         // lists, then the device is drained. It writes the same ring and store positions the real pass rewrites.
         self.warm_width(t, pos_min, pos_max);
-        let eligible = self.driver.is_some() && act.is_none() && pos_min + 1 >= max_ratio && !self.replaying && !std::env::var("QX_GRAPH").is_ok_and(|v| v == "0") && std::env::var("QX_DS_SYNC").is_err() && std::env::var("QX_DS_TRACE").is_err();
+        let eligible = self.driver.is_some() && act.is_none() && pos_min + 1 >= max_ratio && !self.replaying && !layer_trace_on() && !std::env::var("QX_GRAPH").is_ok_and(|v| v == "0") && std::env::var("QX_DS_SYNC").is_err() && std::env::var("QX_DS_TRACE").is_err();
         let captured = if kv_only { &self.graphs_kv[t] } else { &self.graphs[t] };
         if !eligible {
             self.launch_window(t, pos_min, pos_max, act, kv_only);
@@ -2500,6 +2508,13 @@ impl<'a> DsEngine<'a> {
             self.layer_ffn_pre(l, t, &mut act);
             let (combine_gpu, cpu_rows, slots_ptr) = self.layer_moe_window(l, t, &mut act);
             self.layer_ffn_post(l, t, combine_gpu, cpu_rows, slots_ptr, self.s.shy.ptr, &mut act);
+            if layer_trace_on() && !self.warm {
+                // `Y layer hash...`: the residual streams of every row after this layer (eager windows only)
+                self.gpu.sync();
+                let hcd = self.cfg.hc * E;
+                let r: Vec<f32> = self.s.r.download(t * hcd);
+                sched_trace(&format!("Y {l} {}", row_hashes(&r, t)));
+            }
             std::mem::swap(&mut self.s.pre_prev, &mut self.s.pre_f);
         }
         self.layer_head(t, &mut act);

@@ -226,11 +226,15 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
             }
             __threadfence();
         }
-        s_n = vst[6];
+        // the host-served selections of this job: the pool's own misses plus the staged ones, any of which the driver
+        // may hand to the pool when its record left RAM between this post and the serve (then the pool needs x)
+        s_n = vst[6] + vst[11];
     }
     __syncthreads();
     const float* x = reinterpret_cast<const float*>(info[5]) + (u64)tk * E;
-    // x crosses PCIe only when the CPU has experts to compute
+    // x crosses PCIe only when the host serves something: until 2026-11-09 only for the pool's own misses, so a
+    // staged selection that fell back to the pool (its record evicted from RAM in between) was computed on the x of
+    // an earlier job: one wrong expert output, deterministic, the late-token flip under three streams
     if (s_n > 0) {
         float* mx = reinterpret_cast<float*>(mb + MB_X) + (u64)tk * E;
         for (u32 i = threadIdx.x; i < E; i += blockDim.x) mx[i] = x[i];
@@ -323,7 +327,9 @@ extern "C" __global__ void qx_moe_wait_staged2(const u64* info) {
 /// Waits until the CPU has answered the current MoE job, unless the job has no misses. info: [0] mailbox,
 /// [1] step state. One thread.
 extern "C" __global__ void qx_moe_wait(const u64* info) {
-    if (reinterpret_cast<const u32*>(info[1])[6] == 0) return;
+    // nothing host-served: no answer to wait for (a staged selection can become a pool one in the driver, so the
+    // staged count matters here too)
+    if (reinterpret_cast<const u32*>(info[1])[6] == 0 && reinterpret_cast<const u32*>(info[1])[11] == 0) return;
     const u64 seq = *reinterpret_cast<const u64*>(reinterpret_cast<const u32*>(info[1]) + 4);
     const u64* done = reinterpret_cast<const u64*>(reinterpret_cast<const u8*>(info[0]) + MB_DONE);
     while (ld_acquire_sys(done) < seq) {

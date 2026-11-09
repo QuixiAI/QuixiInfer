@@ -56,6 +56,8 @@ pub struct Shared {
     pub pred_miss_hits: [AtomicU64; 3],
     pub pred_miss_total: AtomicU64,
     /// The prefetch: speculative copies issued, selections the post kernel served from them, NVMe records read early.
+    /// Staged selections that fell back to the pool because their record left RAM between the post and the serve.
+    pub stage_fallbacks: AtomicU64,
     pub pre_issued: AtomicU64,
     pub pre_used: AtomicU64,
     pub pre_nvme: AtomicU64,
@@ -202,6 +204,7 @@ impl Driver {
             pred_total: Default::default(),
             pred_miss_hits: Default::default(),
             pred_miss_total: Default::default(),
+            stage_fallbacks: Default::default(),
             pre_issued: Default::default(),
             pre_used: Default::default(),
             pre_nvme: Default::default(),
@@ -543,6 +546,7 @@ impl Loop {
             // one copy per distinct record (a window selects an expert for several tokens): (slot, its stream)
             let mut placed: std::collections::HashMap<usize, (u64, usize)> = Default::default();
             let mut next_stream = 0usize;
+            let mut fallbacks = 0u64;
             for (&e, &a) in sids.iter().zip(&skidx) {
                 let g = l * ne + e as usize;
                 let (dst, si) = match placed.get(&g) {
@@ -553,6 +557,7 @@ impl Loop {
                             ids.push(e);
                             kidx.push(a);
                             self.write_word(self.host.slots_all_dev + 8 * a as u64, 0);
+                            fallbacks += 1;
                             continue;
                         }
                         let nb = self.host.store.record_bytes(g);
@@ -587,8 +592,26 @@ impl Loop {
                 }
             }
             self.missed.extend_from_slice(&staged);
+            if fallbacks > 0 {
+                // The fallback's slot words are asynchronous writes on the copy stream, and the combine kernel reads
+                // them as soon as this job is acknowledged: they must have landed first. Until 2026-11-09 nothing
+                // waited, and a combine that ran ahead of the write took the GPU's output row for a selection no
+                // GPU kernel had computed (stale but deterministic bits: the late-token flip under three streams,
+                // found by replaying a server run's schedule, `qx-ds-replay`).
+                let _not_capturing = sh.capture.lock().unwrap();
+                unsafe { cudarc::driver::result::stream::synchronize(self.stream).expect("fallback slot words") };
+                drop(_not_capturing);
+                sh.stage_fallbacks.fetch_add(fallbacks, Ordering::Relaxed);
+            }
         }
         sh.tl_issue_ns.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if crate::dsv41::layer_trace_on() {
+            // the lanes of this layer's host-served selections: (expert, selection index); the rest ran from VRAM
+            let st: Vec<(i32, i32)> = if nstage > 0 { mb.slice::<i32>(mailbox::MB_SIDS, nstage).iter().copied().zip(mb.slice::<i32>(mailbox::MB_SKIDX, nstage).iter().copied()).collect() } else { Vec::new() };
+            let pl: Vec<(i32, i32)> = ids.iter().copied().zip(kidx.iter().copied()).collect();
+            let ram: Vec<bool> = ids.iter().map(|&e| self.host.store.in_ram(l * ne + e as usize)).collect();
+            crate::dsv41::sched_trace(&format!("S {l} kpt {kpt} pool {pl:?} inram {ram:?} staged {st:?} all {all:?}"));
+        }
         let nm = ids.len();
         if nm > 0 {
             let t0 = std::time::Instant::now();
