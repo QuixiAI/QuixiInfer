@@ -1,4 +1,4 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, night, second session)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, evening, third session)
 
 ## Goal
 
@@ -19,6 +19,27 @@ three tiers: VRAM, pinned RAM and the NVMe pack.
   lossy opt-in option by the goal's rules, not taken; exact forms first.
 - Landed since noon: `qx_ds_topk2` (decode256k 45.4 -> 43.5-44.2, 8fae0e7), the server's 4096 chunk default
   (42c23e7), README on today's facts (53a86c8). Set D row 31.470 (d6cfb45).
+
+## Update 2026-11-08, evening (third session): presupposition 5 overturned; placement root cause; an OOM took the session down
+
+- **The layer's routing is predictable before its attention runs** (`QX_DS_PREDICT=pre`, notebook 100): the top-6 / 8 /
+  12 of the layer's own router on the pre-attention residual contain 78 / 85 / 89% of the real selections and 76 /
+  83 / 88% of the host-served ones at 256k. Presupposition row 5 overturned. Build next: speculative staging of the
+  predicted non-resident records during the attention + dense phase, consumed by `qx_moe_post` through a
+  device-side `prestaged[g]` table (design in notebook 100). Expected decode256k 42 -> ~30-33 ms. The `next`
+  variant (one layer further ahead) is being measured for the NVMe prefetch.
+- **Placement root cause** (notebook 98): the gain needs the pin BEFORE CUDA initialises (its worker thread then stays
+  idle during decode); pinned late it spins beside the engine thread (44.2-44.7 vs 42.5-42.7). chunk41 (176f115):
+  `pin_engine_early()` builds rayon wide, pins, then CUDA starts; `place_threads` tidies the rest. Its arms, the
+  identity bisect and (if clean) its set D run are in `chain-resume.sh`.
+- **Server identity on chunk40: 1 of 8 generations differs late under concurrency** (notebook 99): bisect over
+  chunk41 / chunk34 / chunk38 queued; nothing from chunk33 on is promoted until resolved. The chunk36 set D run
+  (29.316) is HOLD by the adjudicator for this very check.
+- **Operational:** at 18:35 systemd-oomd killed the tmux scope (the Claude Code session and every chain started from
+  it: `setsid nohup` does not leave the session's cgroup) and at 18:41 the bench's own scope (104 GB peak). Chains now
+  start under their own `systemd-run --user --scope -p MemoryMax=4G` (`qx-chain-resume`), so a session kill does not
+  take the GPU work with it; the lesson belongs with "one heavy job at a time": check for a leftover engine before
+  starting another (a hung arm killed by the bench timeout can still hold 100 GB).
 
 ## Update 2026-11-08, night (new session under the updated goal prompt): roles in use; placement reworked; prediction measurement queued
 
