@@ -522,6 +522,11 @@ fn parse_cpu_list(spec: &str) -> Vec<usize> {
 /// The machine's physical cores this process may use, as the lowest allowed CPU id of each core (sysfs
 /// `thread_siblings_list`, SMT siblings folded; offline CPUs and CPUs outside the affinity mask skipped), ascending.
 pub fn physical_cores() -> Vec<usize> {
+    static C: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    C.get_or_init(physical_cores_uncached).clone()
+}
+
+fn physical_cores_uncached() -> Vec<usize> {
     let allowed = allowed_cpus();
     let mut cores: Vec<usize> = Vec::new();
     for &cpu in &allowed {
@@ -543,6 +548,11 @@ pub fn physical_cores() -> Vec<usize> {
 /// this box that cost the pool 7% of decode256k, 2026-11-08). Default: the last physical core, which `pool_cpus`
 /// leaves out; `QX_DS_MAIN_CPU=N` picks another, `QX_DS_MAIN_CPU=none` leaves the thread unpinned.
 pub fn main_cpu() -> Option<usize> {
+    static M: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *M.get_or_init(main_cpu_uncached)
+}
+
+fn main_cpu_uncached() -> Option<usize> {
     match std::env::var("QX_DS_MAIN_CPU") {
         Ok(v) if v == "none" || v == "-1" => None,
         Ok(v) => v.parse().ok(),
@@ -559,6 +569,13 @@ pub fn main_cpu() -> Option<usize> {
 /// more barrier waiters, not more bandwidth); one worker per physical core, never the SMT siblings (measured 1.5x
 /// slower, 2026-11-08). The first is the driver thread, which is pool thread 0.
 pub fn pool_cpus() -> Vec<usize> {
+    // cached at first use: the topology is read from the calling thread's affinity, and `pin_engine_early` narrows
+    // that to one CPU before the engine loads (a pool computed after the pin was one core, 2026-11-08)
+    static P: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    P.get_or_init(pool_cpus_uncached).clone()
+}
+
+fn pool_cpus_uncached() -> Vec<usize> {
     let spec = std::env::var("QX_DS_CPUS").unwrap_or_else(|_| {
         let cores = physical_cores();
         let n = if cores.len() >= 4 { (cores.len() - 1).min(16) } else { cores.len() };
@@ -604,8 +621,11 @@ fn set_affinity(tid: i32, cpus: &[usize]) -> bool {
 /// decodes (decode256k 42.0-42.7); created with the wide mask and moved later, it spins beside the engine thread
 /// (44.2-44.7). The rayon workers spawned here keep the wide mask (threads inherit affinity at creation).
 pub fn pin_engine_early() {
-    let Some(main) = main_cpu() else { return };
+    // read (and cache) the topology, the pool's CPUs and the engine's CPU before the mask narrows
     let cores = physical_cores();
+    let pool = pool_cpus();
+    let Some(main) = main_cpu() else { return };
+    debug_assert!(!pool.contains(&main));
     let _ = rayon::ThreadPoolBuilder::new().num_threads(cores.len().max(1)).build_global();
     let ok = pin_thread(main);
     if std::env::var("QX_DS_VERBOSE").is_ok() || !ok {
