@@ -1,4 +1,119 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-08, evening, third session)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-09, midday)
+
+## START HERE (2026-11-09): everything needed to resume, in order
+
+This section is self-contained. The dated updates below it are history; read them only for detail.
+
+### 1. What the work is
+- **Directive:** `goal-prompt.md` (repo root). Maximize the DeepSeek-V4.1-Flash UD-IQ2_XXS engine at 256k context
+  (set D: `decode256k`, `prefill256k`, `serve256k3` scored; `decode`, `prefill128`, `serve3` guards), exact: windows
+  bit-identical to single steps, GPU/CPU/chunk paths bit-identical, the server's generations identical. Lossy ideas only
+  as opt-in knobs. Started as a loop with `/goal ./goal-prompt.md`.
+- **Read first every session:** `perf/perf.md` (rules), `perf/presuppositions.md` (beliefs + killing tests; the source of
+  long shots), `perf/findings.md`, `perf/backlog.md`, the last ~10 entries of `perf/optimization_status.md` (the
+  notebook, 102 entries), `perf/scoreboard.md`, `perf/ideation/` (agent reports of 2026-11-08).
+- **Roles (`.claude/agents/`, loaded at session start):** `perf-breaker` (adversarial review of a diff + claimed number,
+  before any landing), `perf-adjudicator` (PROMOTE/HOLD/REJECT on a run directory; nothing is promoted without it),
+  `perf-conjecturer` (fresh-context ideation from the facts; after every 3rd experiment or 2 flat results),
+  `perf-outsider` (no project context, physics only; at least daily). Their 2026-11-08 reports are in `perf/ideation/`.
+
+### 2. Where things stand (numbers)
+- **Promoted baseline: set D 30.047** (`perf/scoreboard.md` last row; `perf/baselines/rtx-5090_ryzen-9-9950x_121g/` =
+  `perf/results/2026-11-08/setd-flex-145532`, tree 328338b): decode256k 45.10, prefill256k 5.60, serve256k3 107.41,
+  decode 34.60, prefill128 11.00, serve3 96.81.
+- **Not promoted:** set D on chunk36 (first placement, df104c7) = **29.316** (decode256k 42.20), adjudicator **HOLD**
+  for a missing server identity check (`perf/ideation/2026-11-08-adjudicator-setd-pin.md`). It is superseded by chunk43.
+- **Head:** 4f79971 (all pushed; tree clean except `tools/golden/golden-dsv41`, modified on purpose, never commit).
+  **Installed in `target/release`: chunk43** (= head minus the ds-checks edit; `~/qx-bins/chunk43`).
+- **Where 256k decode time goes (~42 ms with the placement fix):** ~28 ms waiting for host-served experts. Per token
+  ~240 selections: ~179 VRAM, ~21 DMA-staged (bus 0.19 ms per 9.5 MB record), ~35 CPU pool (0.23 ms/record alone on 15
+  cores, ~0.27 in the engine; DRAM floor ~0.19), ~5-7 NVMe (~5 ms of fetch waits). serve256k3 is within 10-20% of
+  DRAM-bandwidth-bound: only fewer bytes move it.
+
+### 3. Open items, in priority order (do these)
+1. **Exactness hole under concurrency (BLOCKS ALL PROMOTION).** The server identity check (8 temperature-0 prompts at
+   262144 ctx / 3 slots, `tools/loadgen.py --dump`, compared with `tools/compare_dumps.py` against the no-chunk
+   reference `perf/results/2026-11-07/srv2-chunk32/srv2-0.dump.jsonl`) flips ONE late token in ONE prompt at
+   concurrency 3, intermittently, in several builds: chunk38 1/1 runs, chunk40 2 of 3 runs, chunk43 1 of 4 runs
+   (French Revolution prompt at char 400; hash-map prompt at 872 / 909); chunk34 1/1 clean. Concurrency 1 is always
+   identical. qx-ds-check's width-3 windows WITH the tiers adapting (new ds-checks line 3b) are 128/128 identical on
+   chunk43, so it does not reproduce in single-sequence windows. By the contract (results independent of scheduling)
+   this is a bug. Candidate causes to test, cheapest first: (a) the scheduler forms windows that mix a sequence's
+   decode with another's prompt or chunk step, and a path there is not width-invariant (compare `sched:` lines /
+   window widths around the divergent token; force `--window 1` or disable chunking and re-run the identity check);
+   (b) a tier race visible only with three streams (promotion/eviction/quarantine of a slot while another stream's
+   window reads it: re-run with `QX_DS_ADAPT=0` in the server; if the flip disappears, it is the tiers); (c) the flex
+   tail at a prompt's end (`QX_DS_CHUNK=0`); (d) the prediction/prefetch code is OFF by default, so not it. Each arm
+   = one server run (~8 min); run the check 3-4 times per arm since the flip is intermittent. Fix, add a regression
+   line, then everything below can be promoted. Script pattern: `chain-stress.sh` in the scratchpad (see section 6).
+2. **Promote the thread placement (chunk43, 176f115 + c1fea47).** decode256k 42.40 / 42.10 vs 45.0-45.1 unpinned,
+   same session as chunk36's 42.0. Mechanism (notebook 98): pin the engine thread BEFORE CUDA initialises
+   (`pin_engine_early`: build rayon's pool wide, cache topology, pin), so CUDA's worker thread stays idle during decode;
+   moving threads after the load leaves it spinning (44.2-44.7). Its set D run (`perf/results/2026-11-08/setd-pin3-211200`)
+   was killed by systemd-oomd during the `decode` case at 21:31 (exit 137; ds-checks inside it all passed, incl. 3b;
+   serve256k1/3 were ~38.5/105 ms). Cause of the OOM not established (no other engine was meant to run; check
+   `journalctl --user` around 21:31 for a second process). Re-run `bench.sh --label setd-pin3 --no-build --check` on
+   chunk43 after item 1, then breaker + adjudicator, then `perf_diff.py promote` + `score <run> --record perf/scoreboard.md --note ...`.
+3. **The speculative prefetch (`QX_DS_PREFETCH=K`, 21a9e0b/b45f9ec, off by default) has a launch bug:** every run with
+   it on panics `kernels/dsv41.cu has no entry point qx_ds_pred_post` because `self.k()` launches from the DSV41 module
+   and the kernel lives in `kernels/step.cu`. Fix: in `predict_pre` (crates/qx-engine/src/dsv41/mod.rs) launch it with
+   `self.gpu.run(STEP.kernel("qx_ds_pred_post", CubeDim::new_1d(1)), (1,1,1), &[...])`. Then ds-checks with
+   `QX_DS_PREFETCH=8` (must stay exact: same records, same kernels, earlier) and decode256k off/8/off/8/12 + decode at
+   1k (`chain-pref3.sh` does exactly this; point it at the fixed binary). Expectation from the measured recall
+   (presupposition row 5 overturned: the layer's own router on the pre-attention residual predicts 76/83/88% of
+   host-served selections at top-6/8/12): decode256k 42 -> ~30-33 ms. Watch the counters `prefetch issued/used/nvme` in
+   the stats line; if `used` is far below `issued` x recall, the slots are recycled too early or the post races the copies.
+   Then the breaker on the prefetch diff (copy ordering, slot reuse two layers later, width > 8 off, graph replay).
+4. **Then, by expected value** (details in `perf/ideation/2026-11-08-conjecturer.md` and backlog family 15 re-rank):
+   the `next`-layer prediction for NVMe-only records (58/67/75% recall; a 9.5 MB NVMe read needs ~1.4 ms of lead);
+   the 256-slot staging area as an LRU cache of staged records (simulated 25% of host-served hits single-stream, 37%
+   at 1024 slots under 3 streams; the byte lever for serve256k3); per-layer timeline with GPU `%globaltimer` stamps;
+   latent KV rows in host memory (a serve lever); staggered slot streams in the server; DSpark acceptance measured
+   with the local Strata binary before any build.
+
+### 4. Knobs added 2026-11-08 (all measured; defaults in brackets)
+`QX_DS_CPUS` / `QX_DS_MAIN_CPU` [pool = physical cores minus the last (max 16), engine thread on the last, pinned
+before CUDA]; `QX_DS_HELPERS=same|sibling|free` [same]; `QX_CUDA_SCHED=spin|yield|blocking` [driver default;
+blocking deadlocks the engine, yield no gain]; `QX_DS_PREDICT=pre|next` [off; scoring only]; `QX_DS_PREFETCH=K` [0;
+broken, item 3]; `QX_DS_STG_WAIT=words` [off, equal]; `QX_DS_CHUNK` [server 8192 at ctx >= 32k]; `QX_NVCC_ARCHS`
+[sm_120a; add sm_86,sm_89 before landing kernel changes, ~20 min each for mgemv].
+
+### 5. Correctness tooling
+- `tools/ds-checks.sh` (now also: windows of 3, and 3b = width-3 windows with the tiers adapting). Run under the cap:
+  `tools/capped.sh 112 tools/ds-checks.sh` with `QX_LLAMA_TOKENIZE=$HOME/git/llama.cpp-dsv41/build-tok/bin/llama-tokenize`.
+- Server identity: start the server (command in section 6), `python3 tools/loadgen.py --url http://127.0.0.1:8097/v1
+  --levels 1,3 --rounds 2 --max-tokens 256 --temperature 0 --warmup 6 --dump X.jsonl`, then
+  `python3 -I tools/compare_dumps.py perf/results/2026-11-07/srv2-chunk32/srv2-0.dump.jsonl X.jsonl` -> "identical".
+  Compare dumps, never whole-file hashes (completion order differs).
+
+### 6. How to run (and the traps)
+- Build: `CARGO_TARGET_DIR=$HOME/qx-targets/chunk QX_SKIP_NVCC=1 cargo build --release -p qx-engine -p qx-serve
+  --bin qx-ds-check --bin quixiinfer` under `systemd-run --user --scope -p MemoryMax=10G` with `-j4` if an engine runs;
+  copy binaries to `~/qx-bins/chunkNN`; install into `target/release` atomically (cp to a dotfile, mv) only when no
+  chain uses them. Gate on cargo's exit status.
+- Bench: `perf/harness/bench.sh --label L --no-build [--cases ...] [--check] -- KNOB=V`. Gate: `perf_diff.py gate <run>`.
+- Server: `QX_DS_PACK=$PACK QX_DS_RAM=95 target/release/quixiinfer serve --model $M --pack $PACK --ctx 262144 --slots 3
+  --window 128 --port 8097` under `systemd-run --user --scope -p MemoryMax=112G -p MemorySwapMax=0`.
+  M = `~/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf`,
+  PACK = same dir, `DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp`.
+- **Long chains:** write a script, launch with `systemd-run --user --scope --unit qx-chain-NAME -- setsid nohup bash
+  script.sh` — NO MemoryMax on the chain scope (bench.sh caps itself only when it finds no cap; a 4G chain scope got the
+  engine OOM-killed), and never from inside the Claude Code session's cgroup alone (systemd-oomd killed the whole tmux
+  scope once). Log one marker line per result to a file and watch it with a Monitor on `tail -F | grep`.
+  Old scratchpad (tmpfs, may be gone): `/tmp/claude-1000/-home-eric-git-QuixiInfer/7b27a076-c316-432c-a7a6-fc085686af11/scratchpad/`
+  (chain-*.sh, chain-ab.out). Durable copies of identity dumps: `perf/results/2026-11-07/srv2-chunk32/`.
+- One heavy job at a time; check `pgrep -x qx-ds-check; pgrep -x quixiinfer` before starting an engine (a timed-out arm
+  can still hold 100 GB). `export CUDA_CACHE_MAXSIZE=4294967296` (bench.sh does): a changed kernel file costs 10-20 min
+  of JIT on first use. Never `pkill -f`/`pgrep -f` with a pattern that matches your own shell; kill by PID or use `[x]`.
+- Never touch nvme1n1 (the Windows VM's disk); DeepSeek only (no Qwen, no quixiinfer.service); the user owns the box.
+- Commits: one-line summary, numbers in the body, end with the attribution the harness specifies (currently
+  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`); commit + push landed wins and docs-only records.
+
+### 7. Side work done and closed (do not redo)
+Portability to RTX 30/40 (compile matrix passes sm_86/sm_89, software E4M3 bit-verified; untested on real cards);
+Big-MoE-Small-Box reviewed twice (backlog family 15) and five design issues filed there (#1-#5); EXL3 vs GGUF quality
+comparison is a sanctioned secondary objective, not started (see goal-prompt); presupposition rows 1, 2, 5, 11 overturned
+or closed, 3, 17-25 measured.
 
 ## Goal
 
