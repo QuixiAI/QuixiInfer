@@ -5,13 +5,33 @@ measurement and adventurous about ideas.
 ## The objective, in order
 1. **Performance at 256k context**: the server at `--ctx 262144`. What counts, in ms per token: decode at a 256k
    position; prefill of the last stretch of a 256k prompt (the position curve, not just the mean); per-request
-   decode and time to first token under concurrency at 256k. These are the standard cases ("set D") once the
-   tooling below exists; the scoreboard follows them.
+   decode and time to first token under concurrency at 256k. These are the standard cases ("set D"); the scoreboard follows them. Time to first token on a long prompt is
+   part of this objective but not yet a scored case: adding a `ttft256k` case (the 13.5k-token prompt at
+   `--ctx 262144 --slots 3`, median of 3) is sanctioned work and a case-set change to note in the scoreboard.
 2. **No regression at short contexts**: decode and prefill128 at 1k, and serve3 at 8k, stay within noise of the
    promoted baseline's values (`perf/scoreboard.md`, last row; `perf/baselines/.../summary.md`). They are guards,
    not targets.
 3. **Capability**: 256k must work with at least one slot on this box (it does: 15.4 GiB tier at one slot, 12.2 at
    three) and must not grow host memory with context (it does not since `39c3bc0`).
+
+## Priority order (stated, because it was only implied)
+1. **Exactness bugs first.** A failing ds-checks line or a server identity mismatch stops all performance work until
+   it is fixed and has a regression check. On an intermittent mismatch: record the run's schedule
+   (`QX_DS_SCHED_TRACE`), replay it (`qx-ds-replay`, then `QX_DS_TRACE_LAYERS=1` against a frozen-tier replay) and
+   read the lanes BEFORE running statistical arms (a morning of arms said nothing on 2026-11-09; the replay named
+   the expert in one run).
+2. **Then promote what has landed** (set D, breaker, adjudicator).
+3. **Then new experiments.**
+
+## Benchmark preflight (no scored run without it)
+Scores are only comparable on a quiet box. Before any set D run, and recorded in the notebook entry: the win10 VM
+is shut off (`virsh -c qemu:///system domstate win10`; never start it, never force it off: ask the user), swap is
+mostly free (`free -g`), memory pressure is near zero (`/proc/pressure/memory` some avg10 < 1), no `kcompactd` /
+`ksmd` / compile job is burning a core, tmpfs holds no stale scratch (`df -h /tmp`), no other engine is alive
+(`pgrep -x qx-ds-check; pgrep -x quixiinfer`). If the box is not clean, do not run scored cases: fix what is ours,
+ask the user for the rest. Relative A/B arms may run at a smaller RAM tier (same in every arm) meanwhile, labelled
+as such, never gated against the baseline. (2026-11-09: with the VM up, the standard 100 GB tier overcommitted the
+box; decode256k flipped between 42.0 and 44-45 ms on one binary and systemd-oomd killed four runs.)
 
 ## The standard set (done 2026-11-06/07; do not rebuild)
 Set D exists: `perf/states/` holds the 262,144- and 245,760-token states, `perf/harness/bench.sh` runs `decode256k`
@@ -54,7 +74,8 @@ gate` compares against `perf/baselines/rtx-5090_ryzen-9-9950x_121g/`. Measured s
     "cannot be predicted") are presuppositions until measured. QuixiCore ran NVFP4 on hardware that "could not":
     the math of any format can be implemented exactly anywhere; the question is only cost.
   - A long shot's cost is bounded by its cheapest killing measurement, not by the build: measure first, build only
-    what survives.
+    what survives. Before building, write its kill criterion and a budget (builds and GPU hours) in the notebook;
+    at the budget, record the outcome and stop or re-justify (the prefetch took five builds to reach 2.6%).
 
   Budget: at least one in four experiments is a long shot (a bigger structural idea or a measurement of something unknown); the rest are the best-expected-value items. Record long shots honestly as INCONCLUSIVE or REJECTED when they fail; that is a win for the next agent, not a loss.
 
@@ -63,7 +84,7 @@ gate` compares against `perf/baselines/rtx-5090_ryzen-9-9950x_121g/`. Measured s
   2. Change ONE factor. Behind a knob when cheap.
   3. Build: cargo build --release -p qx-engine -p qx-serve --bin qx-ds-check --bin quixiinfer. Gate on cargo's exit status, never on a grep pipeline. step.cu/dsv41.cu builds can take ~10 min.
   4. Measure: perf/harness/bench.sh --check --label <slug>. Then python3 perf/harness/perf_diff.py gate <run-dir> against perf/baselines/rtx-5090_ryzen-9-9950x_121g.
-  5. Decide by the bars: keep only if the gain beats 3% (low-risk: a default, a placement, a knob flip, a config) or 8% (complexity-adding) AND is outside the repeats' spread AND all five tools/ds-checks.sh lines are exact AND, for anything touching the server, the chunk buffers or the tiers, the server-level identity check passes (`tools/loadgen.py --dump` against a reference run, `tools/compare_dumps.py` identical: ds-checks never exercise the server's warm-up or scheduler, which is how a corruption passed every check on 2026-11-08). Inside the noise is INCONCLUSIVE, not a win. A big idea that lands at 2% may be kept as CANDIDATE if you can name the follow-up that would unlock more; say so in the entry.
+  5. Decide by the bars, on the score OR on the targeted scored case (the geometric mean moves 2.4% when decode256k moves 6%, so name the case the change aims at before measuring): keep only if the gain beats 3% (low-risk: a default, a placement, a knob flip, a config) or 8% (complexity-adding) AND is outside the repeats' spread AND all five tools/ds-checks.sh lines are exact AND, for anything touching the server, the chunk buffers or the tiers, the server-level identity check passes THREE runs out of three (`tools/loadgen.py --dump` against the reference `perf/results/2026-11-07/srv2-chunk32/srv2-0.dump.jsonl`, `tools/compare_dumps.py` identical; one run is not evidence: the 2026-11-09 bug flipped a token in about one run in three), and `qx-ds-multi` passes with all rows checked (ds-checks never exercise the server's warm-up, scheduler or the driver's fallback paths). Inside the noise is INCONCLUSIVE, not a win. A big idea that lands at 2% may be kept as CANDIDATE if you can name the follow-up that would unlock more; say so in the entry.
      Before landing: run the `perf-breaker` agent on the diff and the claimed result and act on its tests; then the `perf-adjudicator` agent on the run directory. Nothing is LANDED or promoted without the adjudicator's verdict (PROMOTE) quoted in the notebook entry. Both run in fresh context and are never shown your reasoning.
   6. Record every outcome: perf_diff.py entry, then perf_diff.py index. LANDED: perf_diff.py promote the run as the new baseline, perf_diff.py score --record --note "...", update perf/findings.md (Wins) and perf/backlog.md, commit and push to master. REJECTED/INCONCLUSIVE: revert the code, add the reason and the re-open condition to perf/findings.md, commit the docs only. New ideas discovered along the way go into perf/backlog.md with a one-line rationale, even if you do not pursue them now.
   7. Update handoff.md with a dated line when something lands, a belief changes, or a family closes.
@@ -80,24 +101,20 @@ gate` compares against `perf/baselines/rtx-5090_ryzen-9-9950x_121g/`. Measured s
 - The chunk path's buffers are views into the VRAM arena's tail: nothing writes them without holding the flex tail (`assert_flex_held`); any new writer takes the tail first and the caller releases it.
 - Thread placement: no spinning thread (engine thread, CUDA helpers) on a physical core a pool worker uses. Defaults come from `pool_cpus()` / `main_cpu()` (sysfs topology); `QX_DS_CPUS`, `QX_DS_MAIN_CPU` override. Confining the whole process with taskset deadlocks the engine; do not.
 - Kernels must keep compiling for the RTX 30 and 40 series: `QX_NVCC_ARCHS=sm_86,sm_89,sm_120a` before landing a kernel change (mgemv takes ~20 min per target; run it in the background).
-- Commits are pre-authorized ONLY for landed wins and their records, and docs-only rejection/backlog records. One-line summary, body with the numbers, trailer "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>".
+- Commits are pre-authorized for correctness fixes (with their validation), landed wins and their records, tools and knobs that are off by default, and docs-only rejection/backlog records. One-line summary, body with the numbers, ending with the attribution line the harness specifies for the session.
+- Long jobs: scripts live in `~/qx-chains/` (on disk, never /tmp), are launched with `systemd-run --user --scope --unit qx-chain-NAME -- setsid nohup bash script.sh` (no MemoryMax on the chain scope: bench.sh caps itself), log one marker line per result to `~/qx-chains/log.out`, and are never edited while they run (write a new file).
 
-## Where to start (2026-11-08 state)
-1. Read `handoff.md`'s latest update and the last ten notebook entries; check `chain-ab.out` results named there.
-2. The 256k levers, by expected value: the pool's own structure (barriers and row split: 0.23 ms per record on
-   15 cores against 0.16 ideal; backlog family 15 item 9, dataflow units; measure one record on one core first,
-   `qx-poolbw` does the sweep); the staged/NVMe shares re-tuned under the new thread placement (the balance may
-   have moved); the server's HTTP and scheduler threads kept off the pool cores (they float today; measure
-   serve256k3 first); NVMe-fetched records computed on the pool as their pieces land (4.8 ms of fetch waits per
-   256k token, family 15 item 12); the per-layer DMA/pool split by a cost model (item 11).
-3. Long shots at one in four: a routing predictor measured offline from dumped traces before anything is built;
-   DSpark drafting only with a measured acceptance; latent rows of the compressed store in host memory to free
-   VRAM for experts.
+## Where to start
+State lives in `handoff.md`, not here: read its top section (the latest dated "Resume" / "START HERE"), the last ten
+notebook entries and the marker lines in `~/qx-chains/log.out`. Then follow the priority order above. The ranked
+experiment list is in the handoff and `perf/backlog.md`; the long-shot candidates are the untested rows of
+`perf/presuppositions.md`.
 
 ## Stop and report (do not ask otherwise)
 - Five consecutive REJECTED/INCONCLUSIVE experiments, excluding deliberate measurements.
 - The next step would change the exactness contract, the standard settings or the case set (beyond item 1 above), or needs sudo beyond gdb attach, another disk, or more than the memory cap.
 - Any ds-checks line stops matching and a revert does not restore it.
+- The box cannot be made benchmark-clean without the user (the VM is up, another user's job holds memory or the GPU): report it with the evidence; keep relative arms going if they are meaningful.
 When stopping, give: current score vs the promoted baseline (scoreboard last row), what landed, what was rejected and why, which presupposition rows were tested and how they changed, the long-shot count against the one-in-four rule, and the next three experiments ranked by expected value.
 
 ## Secondary objectives (sanctioned, the 256k objective still orders the GPU queue)
