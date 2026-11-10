@@ -1401,6 +1401,14 @@ impl<'a> DsEngine<'a> {
         self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l + 1) as u64;
         self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w1.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale)]);
+        if prefetch_k() > 0 && !self.warm && t <= 8 {
+            // the prefetch on the cheap predictor: one norm and one router GEMV, a whole expert phase of lead
+            if let Some(ab) = self.abufs.as_ref() {
+                self.trace("qx_ds_pred_post");
+                self.gpu.run(STEP.kernel("qx_ds_pred_post", CubeDim::new_1d(1)), (1, 1, 1), &[d.shared.mb.dptr, (l + 1) as u64 | ((t as u64) << 8), ab.pred_ctr.ptr]);
+                self.trace_done();
+            }
+        }
     }
 
     /// Runs the routed experts for the token on the CPU pool (or exactly in f32) from the GGUF and uploads the k
