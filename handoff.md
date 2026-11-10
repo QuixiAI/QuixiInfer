@@ -1,5 +1,29 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-09, evening)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-09, late evening)
 
+
+
+## Resume 2026-11-09, late evening: VM off, the user's NVIDIA driver fork installed (620.70.06), re-baseline in flight
+
+- **Host changed, at the user's instruction:** the win10 VM was forced off (`virsh destroy`; definition intact, do not
+  start it) and the GPU driver is now the user's fork `~/git/quixi-nvidia-driver` (`main` = upstream 620.70.06 +
+  the fork's P2P / pool-trim / ATS patches), built for 7.0.0-38, signed with the enrolled key
+  (`MOK_PRIV=/etc/refind.d/keys/nocturne.key MOK_DER=~/qx-chains/nocturne.der ./install.sh`), with NVIDIA's
+  620.70.06 userspace from the .run installer (`--no-kernel-modules`). The Ubuntu 595.99.02 packages were removed
+  (list: `~/qx-chains/nvidia-595-packages.txt`; rollback: `sudo nvidia-uninstall`, then
+  `sudo apt install nvidia-driver-595-open linux-modules-nvidia-595-open-generic-hwe-26.04`). Kernel 7.0.0-42 is
+  installed but not booted and has NO NVIDIA modules now: after a reboot into it, rerun `install.sh`.
+- **Every score before this is on driver 595.99.02 with (latterly) the VM up.** The baseline 30.047 is not
+  comparable any more. `~/qx-chains/chain-rebase.sh` (unit `qx-chain-rebase`, `REBASE` lines in
+  `~/qx-chains/log.out`) warms the JIT cache, records the preflight, runs set D `--check` on HEAD binaries
+  (chunk51, label `setd-620`) and three server identity runs. When it lands: adjudicator, then promote it as the
+  NEW baseline with a scoreboard note (driver 620.70.06 fork, VM off, exactness fix + placement); expected
+  decode256k ~42.
+- **Prefetch (QX_DS_PREFETCH, off by default), measured at QX_DS_RAM=86 in every arm, control 46.7 ms:** full
+  predictor with 1 copy per layer 45.5-45.8 (K=6) and 45.3-45.6 (K=12): -2.4%; K=3 46.5; 2 copies 47.1; cheap
+  `next` predictor 46.1 at 2 copies, 47.0 at 1; 3-4 copies worse. Predictor cost alone: pre +1.3 ms, next +0.7.
+  CANDIDATE below the 3% bar; next step is a cheaper `pre` predictor (it recomputes the pre-FFN mix: share it) and
+  a re-measure at the standard tier on the clean box.
+- goal-prompt.md and the agents were revised (3996e00): priority order, benchmark preflight, identity 3 of 3.
 
 ## Resume 2026-11-09, evening: the server exactness bug is FIXED; set D rerun and the first prefetch measurement are in flight
 
