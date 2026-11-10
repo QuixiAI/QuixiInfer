@@ -2670,3 +2670,16 @@ Strata (`strata-dsv41` as built 2026-11-06, same pack and ids as the 2026-11-07 
 bench, warm), prefill128 95 tok/s, prefill256k 175 tok/s (the last 16k of a 256k prompt; no 16k cold prompt run
 today). Decode: ahead by about 20% on unlike shapes (their run is cold and includes its adaptation); prefill:
 4-8x behind, as before. The DSpark drafter GGUF is on the box (`~/models/DeepSeek-V4.1-Flash-1017-GGUF/dspark/`).
+
+## 2026-11-10: The economics of a verify window at 256k — MEASURED: drafting does not pay here (long shot, backlog family 6)
+
+decode256k's 64 tokens after the 262k state in windows of W of the same stream, chunk60, one run each, ms per
+token (harness value, last 32 tokens; then the per-8-token lines): W=1 38.3; W=2 33.5 (36.4, 41.1, 24.6, 28.1);
+W=4 33.2 (61.1, 36.8, 41.9, 25.4); W=6 (23.0-51.4; the harness value 71.3 includes a 1.36 s first-use window of
+4 at the end); W=8 31.3 (49.7, 26.7). A window's cost per position falls only from 38 to 25-33 ms between width 1
+and 8: the host-served expert bytes scale with the positions. A verify round of T positions accepting `a` drafts
+costs T x w_T for 1 + a tokens: at T=8 and w=27-31 that is 213-250 ms, so break-even against 38.3 ms needs
+a >= 4.6-5.5 accepted of 7 (66-79%); at T=4 (w 25-33) a >= 1.6-2.5 of 3 (55-82%). colibri's guard sits at 60% and
+Strata's DSpark measured 26.9 against 27.5 tok/s on this box: consistent. Verdict: REJECTED for this hardware at
+256k. Re-open if a window's cost per position at width 4-8 falls under ~12 ms (it is the experts: 0.9 GB of host
+bytes per position), e.g. with a much larger VRAM tier or a second card.

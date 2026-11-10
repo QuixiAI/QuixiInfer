@@ -189,6 +189,9 @@ Read for the "bridge the gap" plan (families 11-13). Numbers are theirs, on thei
   (75% at confidence 0.5), serving hardening and a disk tier for parked states.
 
 ## Rejected: with the reason, so they are not retried
+- 2026-11-10: draft-and-verify at 256k (long shot): windows of 2/4/8 of one stream cost 33.5 / 33.2 / 31.3 ms per
+  position against 38.3 for single steps; break-even acceptance 66-79% of 7 drafts. Host expert bytes scale with
+  positions. Re-open under ~12 ms per position at width 4-8 (bigger VRAM tier, second card).
 - 2026-11-10: prefetch at width 3 in the server (`mix` K=6): 95.6-96.1 against 97.2-97.4 with one copy, 99.7 with
   three: the copies are not free in the gap. Re-open: a predictor that costs nothing (parallel to the wait kernel).
 - 2026-11-10: NVMe write-back of VRAM victims (mode 1): halves the NVMe-served records but not the fetch wait
