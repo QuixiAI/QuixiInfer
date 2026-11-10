@@ -21,6 +21,11 @@ Read this first; it supersedes item 1 of START HERE (the exactness hole) and upd
 - **Also committed (119cbd0), from the previous resume:** the cold-width compressor fix in `warm_width`, stricter
   `compare_dumps.py`, ds-checks log validation (`perf/harness/check_ds_log.py`), expanded `qx-ds-multi`.
 - **Binaries:** `~/qx-bins/chunk49` = HEAD (52a992f) and is installed in `target/release`.
+- **BLOCKER for promotion (needs the user):** the win10 VM is running and the box is overcommitted at the standard
+  RAM tier (kcompactd at 91% on a pool core's sibling, swap full, oomd kills; notebook 106). decode256k flips
+  between 42.0 (quiet) and 44-45 (pressure) on the same binary. No set D at standard settings is trustworthy
+  until the VM is stopped for benchmarks or the RAM tier is lowered and re-baselined. A/B arms meanwhile run at
+  QX_DS_RAM=86 in both arms (`~/qx-chains/chain-pref3.sh`: the reworked prefetch, chunk50, `PREF3` lines).
 - **Memory trap found today:** two set D runs were killed by systemd-oomd at the engine's normal 104 GB peak. The
   win10 VM is RUNNING (16 GB allotted, ~8 GB resident; the standard settings assumed it off) and the old session
   scratchpad held 5.7 GB of tmpfs. The scratchpad was moved to `~/qx-chains/old-scratchpad`. Do not touch the VM.
