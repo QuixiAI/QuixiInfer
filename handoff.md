@@ -1,4 +1,39 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-09, midday)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-09, evening)
+
+
+## Resume 2026-11-09, evening: the server exactness bug is FIXED; set D rerun and the first prefetch measurement are in flight
+
+Read this first; it supersedes item 1 of START HERE (the exactness hole) and updates items 2 and 3.
+
+- **Root cause of the late-token flip under three streams (notebook 104, commit 165a674):** `qx_moe_post` copied a
+  token's x to the mailbox only when its own pool-miss count was non-zero. When a staged selection's record was
+  evicted from RAM between the post and the serve, the driver fell back to the pool for it; if that was the job's
+  only pool work, the pool computed the right expert on the x of an earlier job. Fix in `kernels/step.cu` (x copied
+  whenever anything is host-served; `qx_moe_wait` waits then too) and `driver.rs` (fallback slot words synchronized
+  before the job is acknowledged; `stage fallbacks N` counter). Validation on chunk48/49: replays of the failing
+  schedule 6/6 identical to the frozen-tier reference (2/6 before), server identity 8/8 identical (3 runs exercised
+  the fallback), ds-checks pass.
+- **How it was found, and the tools to reuse:** `QX_DS_SCHED_TRACE=path` records a run's engine calls with a hash
+  per logits row; `qx-ds-replay PACK TRACE CTX SLOTS` re-executes it (`QX_DS_REPLAY_SPLIT=1` as single steps;
+  `QX_DS_TRACE_LAYERS=1` adds per-layer row hashes and the driver's lane lists); `~/qx-chains/flat.py` and
+  `layers.py` compare traces (copies in `perf/results/2026-11-09/sched-trace/`). For any future intermittent
+  identity failure: record a failing run, replay it, compare against a frozen-tier replay, read the lanes.
+- **Also committed (119cbd0), from the previous resume:** the cold-width compressor fix in `warm_width`, stricter
+  `compare_dumps.py`, ds-checks log validation (`perf/harness/check_ds_log.py`), expanded `qx-ds-multi`.
+- **Binaries:** `~/qx-bins/chunk49` = HEAD (52a992f) and is installed in `target/release`.
+- **Memory trap found today:** two set D runs were killed by systemd-oomd at the engine's normal 104 GB peak. The
+  win10 VM is RUNNING (16 GB allotted, ~8 GB resident; the standard settings assumed it off) and the old session
+  scratchpad held 5.7 GB of tmpfs. The scratchpad was moved to `~/qx-chains/old-scratchpad`. Do not touch the VM.
+  If set D dies again with exit 137, ask the user (stop the VM for benchmarks, or lower QX_DS_RAM and re-baseline).
+  Chains and logs now live in `~/qx-chains/` (on disk; marker lines in `~/qx-chains/log.out`), never in /tmp.
+- **In flight (`~/qx-chains/chain-promote2.sh`, unit `qx-chain-promote2`):** set D `--check` on chunk49 (label
+  `setd-fix2`, `PROMO2` line), then the prefetch arms (`PREF` lines: ds-checks with `QX_DS_PREFETCH=8`, decode256k
+  off/8/off/8/12, decode at 1k with 8). When PROMO2 lands: `perf-breaker` on the placement + fix diff, then
+  `perf-adjudicator` on the run directory, then `perf_diff.py promote` and `score <run> --record perf/scoreboard.md`.
+  Expected about 29.3 (decode256k ~42 vs 45.1). The prefetch has never produced a number yet.
+- **Side task done for the user (separate repo):** `~/git/quixi-nvidia-driver` branch `merge-620.70.06` (38c44948)
+  merges NVIDIA upstream 620.70.06 into the fork; builds clean; not pushed, not installed. Nothing in QuixiInfer
+  touches the kernel driver.
 
 ## Resume 2026-11-09: cold-width compressor corruption reproduced; server issue still open
 
