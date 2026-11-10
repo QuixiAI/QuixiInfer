@@ -742,10 +742,17 @@ fn chunk_gemm() -> bool {
     *V.get_or_init(|| std::env::var("QX_DS_CHUNK_GEMM").is_ok_and(|v| v == "1"))
 }
 
-/// `QX_DS_CHUNK_STREAMS=N`: the chunk path's experts over N side streams (1: the main stream only; at most 16).
+/// Rows of expert scratch per side stream: an eighth of the chunk, at least 256.
+fn chunk_side_rows(rows_max: usize) -> usize {
+    (rows_max / 8).max(256)
+}
+
+/// `QX_DS_CHUNK_STREAMS=N`: the chunk path's experts over N side streams (default 8; 1: the main stream only; at
+/// most 16). Measured 2026-11-10 on a 16k prompt in 4096-row chunks: 2.77 ms per token at 1, 2.38 at 2, 2.17 at 8,
+/// 2.18 at 12 and 16, the logits after the prompt bit-identical at every count; prefill256k 5.8 -> 5.1.
 fn chunk_streams() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("QX_DS_CHUNK_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 16))
+    *V.get_or_init(|| std::env::var("QX_DS_CHUNK_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(8).clamp(1, 16))
 }
 
 fn bits(f: f32) -> u64 {
@@ -2160,7 +2167,10 @@ impl<'a> DsEngine<'a> {
             let ff = self.cfg.ff_exp;
             let b = |n: usize| DeviceBuf::new((n * 4 + 255) / 256 * 256);
             while self.chunk_side.len() < chunk_streams() {
-                self.chunk_side.push([b(rows_max * 2 * ff), b(rows_max * ff / 4), b(rows_max * (ff / 256))]);
+                // (an expert's scratch is indexed by the row's place in its list: `chunk_side_rows` rows per stream;
+                // an expert with more rows runs on the main stream with the chunk's own scratch)
+                let cap = chunk_side_rows(rows_max);
+                self.chunk_side.push([b(cap * 2 * ff), b(cap * ff / 4), b(cap * (ff / 256))]);
             }
         }
         for l in 0..n_layers_run {
@@ -2322,10 +2332,29 @@ impl<'a> DsEngine<'a> {
                 qx_gpu::raw::side_begin(ns);
             }
             let mut pending: Option<u64> = None;
+            let side_cap = chunk_side_rows(rows_max);
+            let mut n_side = 0usize;
             for &(e, ord) in &launch {
                 let m = lists[e].len() as u32;
+                if m > 0 && ns > 1 && m as usize > side_cap {
+                    // too many rows for a side stream's scratch: on the main stream, after the side streams
+                    n_used += 1;
+                    let word = cb.slots_tbl[l % 2].ptr + 8 * e as u64;
+                    let sl = cb.sel.ptr + (offs[e] * 4) as u64;
+                    let passes = m.div_ceil(64);
+                    qx_gpu::raw::side_join(ns);
+                    self.gpu.run(MOE.kernel("qx_moe_wait_word", CubeDim::new_1d(1)), (1, 1, 1), &[word, generation]);
+                    self.gpu.run(MOE.kernel(kg, CubeDim::new_1d(128)), (((2 * ff) as u32).div_ceil(64), passes, 1), &[word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, m as u64, sl]);
+                    self.gpu.run(MOE.kernel("qx_moe_quant_h_sel", CubeDim::new_1d(256)), (m, 1, 1), &[cb.gu.ptr, bits(clamp_exp[l]), cb.hq.ptr, cb.hd.ptr, ff as u64, sl, m as u64]);
+                    self.gpu.run(MOE.kernel(kd, CubeDim::new_1d(128)), ((E as u32).div_ceil(64), passes, 1), &[word, cb.hq.ptr, cb.hd.ptr, 0, cb.out.ptr, ff as u64, E as u64, (2 * gb) as u64, ex.down_row_bytes as u64, sl, m as u64]);
+                    self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, ord]);
+                    pending = None;
+                    n_side = 0;
+                    continue;
+                }
                 if m > 0 && ns > 1 {
-                    let si = n_used % ns;
+                    let si = n_side % ns;
+                    n_side += 1;
                     n_used += 1;
                     let word = cb.slots_tbl[l % 2].ptr + 8 * e as u64;
                     let sl = cb.sel.ptr + (offs[e] * 4) as u64;
@@ -2338,7 +2367,7 @@ impl<'a> DsEngine<'a> {
                     self.gpu.run(MOE.kernel(kd, CubeDim::new_1d(128)), ((E as u32).div_ceil(64), passes, 1), &[word, hq, hd, 0, cb.out.ptr, ff as u64, E as u64, (2 * gb) as u64, ex.down_row_bytes as u64, sl, m as u64]);
                     qx_gpu::raw::side_use(None);
                     pending = Some(ord);
-                    if n_used % ns == 0 {
+                    if n_side % ns == 0 {
                         qx_gpu::raw::side_join(ns);
                         self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, ord]);
                         pending = None;

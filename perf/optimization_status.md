@@ -2738,3 +2738,36 @@ most of the 10.6 s) and the experts (12.9 s). Not verified: that the wide path w
 counter was added). Next, in order: (1) experts batched across the layer (36% of kernel time, one launch per
 expert today); (2) `tile` attention inside the chunk path only, then wider attention slabs; (3) `g_x` and
 `wo_a` chunk-wide (needs an x-stride argument in `qx_gemm2` and a split of `layer_attn` at the KV commit).
+
+## 2026-11-10: Match Strata, experts: each expert's launch set on one of N side streams — CANDIDATE default N=8 (16k prompt 2.77 -> 2.17 ms per token, 361 -> 461 tok/s, bit-identical; prefill256k 5.8 -> 5.1); validation pending
+
+The kernel table put 36% of a 16k prompt's GPU time in the experts: one launch set per expert (wait for the
+staged record, gate/up, quantize, down), each ~130 blocks, in series on one stream. Change: `qx_gpu::raw` gets
+side streams (`side_begin` / `side_use` / `side_join`: each side stream starts behind the main stream's work so
+far; the main stream joins them by events); the chunk path's expert loop sends expert i to side stream i mod N
+with that stream's own gate/up and hidden scratch (indexed by the row's place in the expert's list: an eighth
+of the chunk's rows per stream; an expert with more rows runs on the main stream with the chunk's scratch); the
+progress mark the staging ring waits for is written on the main stream after a join, every N experts, so it
+still means "every expert up to this ordinal is done". Same kernels, same inputs.
+First attempt (chunk63): N=2 ran (2.38 ms per token); N=4 and N=8 hung in layer 2 of the first chunk, N=4 with
+the expert prefetch off in layer 0 (and sat on bench.sh's 2400 s timeout twice: 80 minutes against the user's
+10-minute rule; every chain run now carries its own `timeout 200`). With `CUDA_DEVICE_MAX_CONNECTIONS=32` N=4, 8,
+12, 16 run: my reading (not proven) is that the context's default 8 work queues are shared by the streams, so a
+kernel waiting in place for a staged record can sit in front of the copy that stages it. `Gpu::new` now sets the
+variable at start-up when it is unset (chunk64).
+16k prompt, 4096-row chunks, one run each (chunks in ms; the 233 GiB download had finished at 07:51):
+
+| arm | chunk 0 / 1 / 2 / 3 | ms per token | tail logits vs the exact run |
+|---|---|--:|---|
+| control (chunk61) | 13,139 / 8,064 / 7,799 / 15,822 | 2.77 | |
+| N=2 (chunk63) | 11,725 / 6,874 / 6,602 / 13,747 | ~2.38 | not compared |
+| N=8 (chunk64) | 11,217 / 6,192 / 5,881 / 12,475 | 2.17 | 4096 / 4096 rows bit-identical |
+| N=12 (chunk64) | 11,207 / 6,206 / 5,886 / 12,482 | 2.18 | bit-identical |
+| N=8, small scratch (chunk65) | 11,161 / 6,208 / 5,951 / 12,501 | 2.16 | bit-identical |
+| N=16, small scratch (chunk65) | 11,210 / 6,219 / 5,909 / 12,466 | 2.18 | bit-identical |
+| N=8 + `QX_DS_ATTN=tile` + `QX_DS_CHUNK_GEMM=1` (chunk64) | 11,156 / 5,995 / 5,711 / 11,248 | 2.14 | KL 0.0077, top-1 95.2% (63 positions) |
+
+prefill256k (8192-row chunks, one run each): control 5.8 (22,611 / 47,126 ms); N=4 5.1 (20,045 / 41,891); N=8
+with full-size scratch: out of device memory (8 x 151 MB); N=8 with the small scratch 20,475 / 42,459 ms.
+Flat from N=8 up: the experts no longer bind; what is left is attention and the attention-side dense groups.
+Strata: 765 tok/s. Default N=8 from chunk66; to validate: ds-checks, the promotion run, identity.
