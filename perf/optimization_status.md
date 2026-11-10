@@ -2771,3 +2771,49 @@ prefill256k (8192-row chunks, one run each): control 5.8 (22,611 / 47,126 ms); N
 with full-size scratch: out of device memory (8 x 151 MB); N=8 with the small scratch 20,475 / 42,459 ms.
 Flat from N=8 up: the experts no longer bind; what is left is attention and the attention-side dense groups.
 Strata: 765 tok/s. Default N=8 from chunk66; to validate: ds-checks, the promotion run, identity.
+
+## 2026-11-10: Strata's 16k prompt under nsys against ours — MEASURED: Strata spends 6.6 s of GPU kernel time, we spend 38.4 s
+
+The user's request: understand deeply how Strata reaches its prefill rate. Same prompt (`route16k`, 16,384
+tokens), same box, both under `nsys profile -t cuda`; Strata as built 2026-11-06 (`--prefill-chunk 8192`), ours
+chunk67 (4096-row chunks, expert side streams on). Strata's own `DS4_PROF` stage table crashed (exit 139) on the
+chunked prompt, so the table below is nsys only. Strata: 18.1 s wall (905 tok/s this run; 765 earlier today
+cold), **6.6 s of kernel time in 115,539 launches**: its GPU idles two thirds of the prompt (expert streaming
+from the files and host work bound it). Ours: 36.8 s of chunks, **38.4 s of kernel time in 328,682 launches**
+(overlapping streams): GPU-bound. Row-layers are alike (Strata 16,384 x 20 + 2,668 x 20 = 381k; ours 12,288 x 20
++ 4,032 x 40 = 407k), so per row-layer Strata's kernels cost about a sixth of ours, in every class:
+
+| class | Strata | ours | ratio |
+|---|---|---|--:|
+| attention | `sparse_attn_packed_kernel<8>`: 1.50 s, 1,500 launches of ~1.0 ms (256 queries per launch) | `qx_ds_attn_part` 7.43 s + `_merge` 2.01 s, 13,040 launches each (32 queries per launch) | 6.3x |
+| dense products | cuBLAS half-precision tensor-core GEMMs (`nvjet_..._hss_mma_*`): 0.64 s in ~29,000 calls of 17-23 us, + `splitKreduce` 0.09, + weights dequantized to FP16 by `q8_rows_kernel` 0.45 s (26,159 calls), + the router in f32 (`gemv_f32_kernel`) 0.45 s, + `sgemm` for the hyper-connection mixes 0.05 | `qx_mgemv_t8z` 5.97 + `_t8zt` 3.99 + `_t8zf` 0.75 = 10.7 s in 47,663 launches | 6x |
+| routed experts | `set_tc_kernel<type>` (FP16 WMMA tiles, weights decoded in-kernel, a batch of experts per launch): 1.94 s in ~1,730 launches of 0.5-1.6 ms, + `wait_seq_kernel` 0.40, + `moe_combine` 0.15 | gate/up 11.1 s + down 4.7 s in ~78,000 launches + quantize 0.47 | 6-8x |
+| the rest | `hc_post_inplace` 0.09, `finish` 0.08, `index_score` 0.08, `compress` 0.05 | `hc_mixes` 0.56, `idx_score2` 0.54, `rms` 0.15, `compress` 0.13 | |
+
+What Strata does differently, by weight:
+1. **Half precision on tensor cores for every product.** Dense: each matrix is dequantized to FP16 once per
+   chunk and multiplied by one cuBLAS `GemmEx` over all the chunk's rows (FP16 x FP16, f32 accumulation): 17 us a
+   call. Our exact int8/f32 GEMV reads each weight once per 8 tokens with per-group barriers; our own bf16 tile
+   kernel (`qx_gemm2`, decoding the quantized weights inside every tile) took 201 us per 128-token launch.
+2. **Experts in batched FP16 tiles.** One gate/up and one down launch for a set of experts (64 x 64 WMMA tiles,
+   the weights decoded to FP16 in shared memory), about 1,700 launches for the prompt against our 78,000 of exact
+   int8 tiles re-decoded per 64-row pass.
+3. **Attention at 256 queries per launch on packed keys** (BF16 window, FP4 compressed rows, each packed row decoded
+   once for 8 heads): 3.9 us per query-layer against our 22.6 on exact f32 rows.
+4. **The upper 20 layers on 2,668 rows** (`forward_chunks ... keep 2668 skip_rows 13716`); ours runs them on the
+   whole last chunk (4,032 rows at chunk 4096).
+5. More experts resident: 2,153 in VRAM (22.4 GB) against our 1,780 (17.0 GiB) on this prompt.
+Reading: the gap is not launch shape or scheduling, it is arithmetic: Strata's GPU work is ~6x cheaper because it
+is FP16 tensor-core GEMM throughout, and it then waits on its expert streaming. With the prefill contract now
+KL-bounded, the same arithmetic is open to us, and our tiers already stream experts faster than Strata's
+(Strata's GPU idles 11.5 of 18.1 s): an FP16 path could pass it, not merely match it. Order of work: (a) dense:
+FP16 dequant per chunk + a real GEMM (cuBLAS through cudarc, or a tile kernel without in-tile decode) chunk-wide;
+(b) experts: FP16 WMMA tiles over a batch of experts; (c) attention at 256+ queries per launch; (d) the upper
+layers on the kept rows only.
+Also from this session: `CUDA_DEVICE_MAX_CONNECTIONS` 8 / 16 / 32 on decode256k: 38.3, 38.5 / 38.9 / 38.3, 38.5:
+no cost. `QX_DS_ATTN_STREAMS` (a slab's four attention slices on side streams): 6,194 -> 6,129 ms per KV-only
+chunk, -1%: the attention kernels already fill the card; reverted (patch `~/qx-chains/attn-streams.patch`).
+Whole-slab pipelining across streams is blocked by `ring_w = n_swa + DS_TMAX` (the next slab's appends would
+overwrite cells the previous slab's attention still reads) and the saved 256k states carry that ring.
+Validation of the expert streams default (tree 7f7117f, `setd-promo2-085837`): ds-checks pass (two parts),
+identity 2 of 2, prefill256k 5.70 -> 5.20, decode256k 38.55, serve256k3 90.74, score 26.299; not yet adjudicated.
