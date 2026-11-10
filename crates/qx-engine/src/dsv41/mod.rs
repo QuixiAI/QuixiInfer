@@ -404,6 +404,8 @@ pub struct DsEngine<'a> {
     erows_row0: usize,
     /// The chunk jobs' generation counter (see `ChunkJob::gen`) and the global expert ordinal (`ChunkJob::ord0`).
     chunk_gen: u64,
+    /// Per side stream of `QX_DS_CHUNK_STREAMS`: the expert scratch (gate/up rows, quantized hidden rows, scales).
+    chunk_side: Vec<[DeviceBuf; 3]>,
     chunk_ord: u64,
     /// Set while `replay_to` rebuilds the rings: the windows skip the compressed-store and index-key writes (the
     /// stores already hold the exact rows; the replay's early positions are not exact and must not overwrite or
@@ -738,6 +740,12 @@ pub fn place_threads() {
 fn chunk_gemm() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("QX_DS_CHUNK_GEMM").is_ok_and(|v| v == "1"))
+}
+
+/// `QX_DS_CHUNK_STREAMS=N`: the chunk path's experts over N side streams (1: the main stream only; at most 16).
+fn chunk_streams() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QX_DS_CHUNK_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 16))
 }
 
 fn bits(f: f32) -> u64 {
@@ -1286,6 +1294,7 @@ impl<'a> DsEngine<'a> {
             erows_stride: DS_TMAX,
             erows_row0: 0,
             chunk_gen: 0,
+            chunk_side: Vec::new(),
             chunk_ord: 0,
             replaying: false,
             slots,
@@ -2147,6 +2156,13 @@ impl<'a> DsEngine<'a> {
         // QX_DS_CHUNK_PREFETCH=0 disables the prefetch job (the experts stream only after the routing is known)
         let prefetch_on = !std::env::var("QX_DS_CHUNK_PREFETCH").is_ok_and(|v| v == "0");
         let n_ring = self.abufs.as_ref().map(|ab| ab.stage_cap as usize).unwrap_or(0);
+        if chunk_streams() > 1 && self.chunk_side.len() < chunk_streams() {
+            let ff = self.cfg.ff_exp;
+            let b = |n: usize| DeviceBuf::new((n * 4 + 255) / 256 * 256);
+            while self.chunk_side.len() < chunk_streams() {
+                self.chunk_side.push([b(rows_max * 2 * ff), b(rows_max * ff / 4), b(rows_max * (ff / 256))]);
+            }
+        }
         for l in 0..n_layers_run {
             let te = std::time::Instant::now();
             let mut went_on = true;
@@ -2295,8 +2311,45 @@ impl<'a> DsEngine<'a> {
                     self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, ord]);
                 }
             } else {
+            // QX_DS_CHUNK_STREAMS=N (default 1): each expert's launch set on one of N side streams, so N experts
+            // overlap on the card (one expert's kernels are ~130 blocks: far too few to fill it). Each stream has its
+            // own gate/up and hidden scratch; the outputs are per selection. The progress mark is written on the
+            // main stream after it joined the side streams, every N used experts: it still means "every expert up
+            // to this ordinal is done". The same kernels on the same inputs: the same bits.
+            let ns = if mma && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) { chunk_streams() } else { 1 };
+            let side: Vec<[u64; 3]> = if ns > 1 { self.chunk_side[..ns].iter().map(|b| [b[0].ptr, b[1].ptr, b[2].ptr]).collect() } else { Vec::new() };
+            if ns > 1 {
+                qx_gpu::raw::side_begin(ns);
+            }
+            let mut pending: Option<u64> = None;
             for &(e, ord) in &launch {
                 let m = lists[e].len() as u32;
+                if m > 0 && ns > 1 {
+                    let si = n_used % ns;
+                    n_used += 1;
+                    let word = cb.slots_tbl[l % 2].ptr + 8 * e as u64;
+                    let sl = cb.sel.ptr + (offs[e] * 4) as u64;
+                    let [gu, hq, hd] = side[si];
+                    let passes = m.div_ceil(64);
+                    qx_gpu::raw::side_use(Some(si));
+                    self.gpu.run(MOE.kernel("qx_moe_wait_word", CubeDim::new_1d(1)), (1, 1, 1), &[word, generation]);
+                    self.gpu.run(MOE.kernel(kg, CubeDim::new_1d(128)), (((2 * ff) as u32).div_ceil(64), passes, 1), &[word, cb.xq.ptr, cb.xd.ptr, k as u64, gu, ff as u64, E as u64, ex.gate_row_bytes as u64, m as u64, sl]);
+                    self.gpu.run(MOE.kernel("qx_moe_quant_h_sel", CubeDim::new_1d(256)), (m, 1, 1), &[gu, bits(clamp_exp[l]), hq, hd, ff as u64, sl, m as u64]);
+                    self.gpu.run(MOE.kernel(kd, CubeDim::new_1d(128)), ((E as u32).div_ceil(64), passes, 1), &[word, hq, hd, 0, cb.out.ptr, ff as u64, E as u64, (2 * gb) as u64, ex.down_row_bytes as u64, sl, m as u64]);
+                    qx_gpu::raw::side_use(None);
+                    pending = Some(ord);
+                    if n_used % ns == 0 {
+                        qx_gpu::raw::side_join(ns);
+                        self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, ord]);
+                        pending = None;
+                    }
+                    continue;
+                }
+                if ns > 1 {
+                    // an unused pick: its ordinal is covered by the next mark
+                    pending = Some(ord);
+                    continue;
+                }
                 if m > 0 {
                     n_used += 1;
                     let word = cb.slots_tbl[l % 2].ptr + 8 * e as u64;
@@ -2318,6 +2371,13 @@ impl<'a> DsEngine<'a> {
                     }
                 }
                 self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, ord]);
+            }
+            if ns > 1 {
+                // the main stream runs on only after every side stream's experts (the combine reads their outputs)
+                qx_gpu::raw::side_join(ns);
+                if let Some(ord) = pending {
+                    self.gpu.run(MOE.kernel("qx_moe_signal", CubeDim::new_1d(1)), (1, 1, 1), &[d.chunk_done.dptr, ord]);
+                }
             }
             }
             let order_len = n_used;

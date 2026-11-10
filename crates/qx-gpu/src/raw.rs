@@ -40,6 +40,11 @@ struct Launcher {
     dev: u64,
     next: usize,
     launches: u64,
+    /// Side streams with an event each (`side_begin`), the event of the main stream they start behind, and the
+    /// side stream the next launches go to (None: the main stream).
+    side: Vec<(sys::CUstream, sys::CUevent)>,
+    main_ev: Option<sys::CUevent>,
+    cur: Option<usize>,
 }
 
 // SAFETY: the launcher is used from the engine thread only (the mutex serializes any other caller); the raw
@@ -65,7 +70,7 @@ fn launcher() -> std::sync::MutexGuard<'static, Option<Launcher>> {
         let bytes = SLOTS * WORDS * 8;
         let host = unsafe { result::malloc_host(bytes, 0) }.expect("pinned info ring") as *mut u64;
         let dev = unsafe { result::malloc_sync(bytes) }.expect("device info ring");
-        *g = Some(Launcher { stream, modules: HashMap::new(), host, dev, next: 0, launches: 0 });
+        *g = Some(Launcher { stream, modules: HashMap::new(), host, dev, next: 0, launches: 0, side: Vec::new(), main_ev: None, cur: None });
     }
     g
 }
@@ -106,11 +111,52 @@ pub fn launch(module: &crate::kernel::Module, entry: &'static str, threads: u32,
     let host = unsafe { std::slice::from_raw_parts_mut(l.host.add(slot * WORDS), WORDS) };
     host[..info.len()].copy_from_slice(info);
     let dev_slot = l.dev + (slot * WORDS * 8) as u64;
+    let stream = l.cur.map_or(l.stream, |i| l.side[i].0);
     unsafe {
-        result::memcpy_htod_async(dev_slot, &host[..info.len()], l.stream).expect("raw: info copy");
+        result::memcpy_htod_async(dev_slot, &host[..info.len()], stream).expect("raw: info copy");
         let mut arg = dev_slot;
         let mut params: [*mut c_void; 1] = [&mut arg as *mut u64 as *mut c_void];
-        result::launch_kernel(f, grid, (threads, 1, 1), 0, l.stream, &mut params).unwrap_or_else(|e| panic!("raw: launch of {entry}: {e:?}"));
+        result::launch_kernel(f, grid, (threads, 1, 1), 0, stream, &mut params).unwrap_or_else(|e| panic!("raw: launch of {entry}: {e:?}"));
+    }
+}
+
+/// Side streams for independent kernel sequences that should overlap on the GPU (the chunk path's experts: one
+/// launch set per expert, each far too small to fill the card). `side_begin(n)`: `n` side streams exist and each
+/// waits for everything launched on the main stream so far. `side_use(Some(i))`: the launches that follow go to side
+/// stream `i` (`None`: the main stream again). `side_join(n)`: the main stream waits for everything launched on the
+/// first `n` side streams so far, so a launch after it on the main stream runs after them.
+pub fn side_begin(n: usize) {
+    let mut g = launcher();
+    let l = g.as_mut().unwrap();
+    unsafe {
+        while l.side.len() < n {
+            let st = result::stream::create(result::stream::StreamKind::NonBlocking).expect("raw: side stream");
+            let ev = result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("raw: side event");
+            l.side.push((st, ev));
+        }
+        if l.main_ev.is_none() {
+            l.main_ev = Some(result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("raw: main event"));
+        }
+        let me = l.main_ev.unwrap();
+        result::event::record(me, l.stream).expect("raw: main event record");
+        for &(st, _) in &l.side[..n] {
+            result::stream::wait_event(st, me, sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT).expect("raw: side wait");
+        }
+    }
+}
+
+pub fn side_use(i: Option<usize>) {
+    launcher().as_mut().unwrap().cur = i;
+}
+
+pub fn side_join(n: usize) {
+    let mut g = launcher();
+    let l = g.as_mut().unwrap();
+    unsafe {
+        for &(st, ev) in &l.side[..n.min(l.side.len())] {
+            result::event::record(ev, st).expect("raw: side event record");
+            result::stream::wait_event(l.stream, ev, sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT).expect("raw: main wait");
+        }
     }
 }
 

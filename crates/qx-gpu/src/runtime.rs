@@ -14,6 +14,14 @@ pub struct Gpu {
 impl Gpu {
     /// Opens device 0. Call `qx_gpu::init()` first in `main`.
     pub fn new() -> Self {
+        // The engine runs kernels that wait in place for a word another stream writes (the experts' staged
+        // records). With the default 8 work queues per context, streams share queues, and a waiting kernel can sit
+        // in front of the very copy it waits for: with four side streams for the chunk path's experts the first
+        // layer hung (2026-11-10); with 32 queues 4 and 8 side streams run. Set before the context exists.
+        if std::env::var_os("CUDA_DEVICE_MAX_CONNECTIONS").is_none() {
+            // SAFETY: called at start-up, before any other thread of this process reads the environment
+            unsafe { std::env::set_var("CUDA_DEVICE_MAX_CONNECTIONS", "32") };
+        }
         let device = CudaDevice::default();
         let client = CudaRuntime::client(&device);
         Self { device, client }
