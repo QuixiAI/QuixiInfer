@@ -345,6 +345,10 @@ pub struct ChunkBufs {
     warm_desc: DeviceBuf,
     /// The batched kernels' per-expert descriptors (word address, selection list address, M, 0), n_expert of them.
     bdesc: DeviceBuf,
+    /// The chunk path's later scratch (the f16 weights and inputs of the dense GEMMs, the chunk-wide FFN rows, the
+    /// expert side streams' scratch), handed out by `cscratch`: in the flex tail like the rest, so it costs the
+    /// expert tier nothing outside a chunk.
+    extra: DeviceBuf,
     /// Whether every chunk kernel variant was compiled and loaded (`chunk_warm`).
     warmed: bool,
 }
@@ -404,6 +408,17 @@ pub struct DsEngine<'a> {
     erows_row0: usize,
     /// The chunk jobs' generation counter (see `ChunkJob::gen`) and the global expert ordinal (`ChunkJob::ord0`).
     chunk_gen: u64,
+    /// Bytes of `ChunkBufs::extra` handed out so far.
+    chunk_extra_off: usize,
+    /// The chunk-wide FFN scratch of `QX_DS_CHUNK_GEMM=1` (for `rows` rows): router logits, shared-expert gate, up and
+    /// hidden rows, then the f16 inputs and the f16 weights of one matrix.
+    chunk_ffn_bufs: Option<(usize, [DeviceBuf; 6])>,
+    /// `QX_DS_CHUNK_GEMM=1`: the f16 weights of the current chunk layer's dense groups (by group address: offset in
+    /// `blas_bufs.0`), decoded once per layer and chunk; `blas_bufs.1` holds a slab's f16 inputs.
+    blas_map: std::cell::RefCell<std::collections::HashMap<usize, u64>>,
+    blas_bufs: Option<(DeviceBuf, DeviceBuf)>,
+    /// Output scratch for the cuBLAS dry pass.
+    blas_y: Option<DeviceBuf>,
     /// Per side stream of `QX_DS_CHUNK_STREAMS`: the expert scratch (gate/up rows, quantized hidden rows, scales).
     chunk_side: Vec<[DeviceBuf; 3]>,
     chunk_ord: u64,
@@ -736,10 +751,33 @@ pub fn place_threads() {
     }
 }
 
-/// `QX_DS_CHUNK_GEMM=1`: the dense products of windows and slabs of 64 tokens or more as tile GEMMs (off by default).
+/// Whether the chunk path's dense products run as half-precision tensor-core GEMMs with f32 accumulation (cuBLAS;
+/// the weights decoded to f16 once per layer and chunk; the router and the vocabulary head stay f32): the default
+/// since 2026-11-10 (the user's contract change: prompt processing KL-bounded against the exact path, as Strata's
+/// is). `QX_DS_PREFILL_EXACT=1` (or `QX_DS_CHUNK_GEMM=0`) keeps the exact kernels, bit-identical to single steps.
+/// Windows (`QX_DS_WINDOW`, the server's short prompts) are always exact. 16k prompt in 4096-row chunks: 2.17 ->
+/// 1.78 ms per token (461 -> 562 tok/s); the 63 positions after the prompt: KL 0.0084, top-1 96.8%.
 fn chunk_gemm() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("QX_DS_CHUNK_GEMM").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| !std::env::var("QX_DS_PREFILL_EXACT").is_ok_and(|v| v == "1") && !std::env::var("QX_DS_CHUNK_GEMM").is_ok_and(|v| v == "0"))
+}
+
+/// The 4-byte units of `ChunkBufs::extra` for chunks of `rows` rows: the chunk-wide FFN rows and their f16 inputs
+/// and weights, one layer's attention-side dense weights as f16 with a slab's f16 inputs and outputs, and eight
+/// expert side streams' scratch (an estimate from the shapes, with slack; `cscratch` falls back to an allocation).
+fn chunk_extra_units(c: &Config, rows: usize) -> usize {
+    let ff = c.ff_exp;
+    let ffn = rows * (c.n_expert + 3 * ff) + rows * E.max(ff) / 2 + ff * E / 2;
+    let qd = c.n_head * c.head_dim;
+    let od = c.o_groups * c.o_lora;
+    let layer_halves = (c.q_lora + 2 * c.head_dim + 1024) * E + qd * c.q_lora + qd * c.o_lora + E * od;
+    let blas = layer_halves / 2 + DS_TMAX * qd.max(E).max(od) / 2 + DS_TMAX * qd;
+    let side = 8 * chunk_side_rows(rows) * (2 * ff + ff / 4 + ff / 256);
+    (ffn + blas + side) * 21 / 20 + 4096
+}
+
+fn verbose_types() -> bool {
+    std::env::var("QX_DS_VERBOSE").is_ok()
 }
 
 /// Rows of expert scratch per side stream: an eighth of the chunk, at least 256.
@@ -1025,6 +1063,7 @@ impl<'a> DsEngine<'a> {
                              rows * if chunk_sel_fallback { k } else { 1 } * 2 * cfg.ff_exp, rows * k * E, rows, rows, rows, rows * k, cfg.cand_blocks.max(1) * rows, rows,
                              rows * if chunk_sel_fallback { k } else { 1 } * cfg.ff_exp / 4, rows * if chunk_sel_fallback { k } else { 1 } * (cfg.ff_exp / 256)];
             for l in 0..cfg.n_layer { if cfg.topk_src[l] == l as i32 { v.push(cfg.idx_top_k * rows); v.push(rows); } }
+            v.push(chunk_extra_units(&cfg, rows));
             v.iter().map(|&n| (n * 4 + 255) / 256 * 256).collect()
         };
         let flex_bytes: usize = chunk_rows.map(|rows| chunk_sizes(rows).iter().sum()).unwrap_or(0);
@@ -1074,6 +1113,7 @@ impl<'a> DsEngine<'a> {
                 cand_count: fbuf(rows),
                 hq: fbuf(rows * if sel_fallback { k } else { 1 } * cfg.ff_exp / 4),
                 hd: fbuf(rows * if sel_fallback { k } else { 1 } * (cfg.ff_exp / 256)),
+                extra: fbuf(chunk_extra_units(&cfg, rows)),
                 warm_word: DeviceBuf::from_slice(&[1u64 << 48]),
                 warm_desc: DeviceBuf::new(32),
                 bdesc: DeviceBuf::new(rows * k * 32),
@@ -1096,6 +1136,10 @@ impl<'a> DsEngine<'a> {
                 // allocated by now), less headroom for the runtime's pools and the window graphs
                 // the staging area for DMA-staged experts comes first (its slots are of the largest record)
                 // the share for prompt windows (8 tokens and more) and for decode steps; both in eighths
+                // (cuBLAS's handle and workspace exist before the tier is sized: the chunk path's dense GEMMs)
+                if chunk_rows.is_some() && chunk_gemm() {
+                    qx_gpu::blas::init();
+                }
                 let knob = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d).min(8);
                 // 8/8 and 256 records since 2026-11-06 (were 6/8 and 96): at windows of 128 the GPU takes every RAM
                 // miss by DMA and the pool idles, 10.8 ms per token against 12.3 at the old 64-chunk; 6/8 at 96 made
@@ -1301,6 +1345,11 @@ impl<'a> DsEngine<'a> {
             erows_stride: DS_TMAX,
             erows_row0: 0,
             chunk_gen: 0,
+            chunk_extra_off: 0,
+            chunk_ffn_bufs: None,
+            blas_map: Default::default(),
+            blas_bufs: None,
+            blas_y: None,
             chunk_side: Vec::new(),
             chunk_ord: 0,
             replaying: false,
@@ -1376,10 +1425,9 @@ impl<'a> DsEngine<'a> {
             self.gpu.sync();
             eprintln!("  table {:x?} x {x:#x} stride {x_stride} t {t}", g.table_words());
         }
-        // QX_DS_CHUNK_GEMM=1: windows and slabs of 64 tokens or more take the tile GEMMs (bf16 tensor cores, f32
-        // accumulation; the vocabulary head stays exact). Prompt processing only, KL-bounded (goal prompt, 2026-11-10).
-        if t >= 64 && x_stride == g.tcols && what != "g_out" && chunk_gemm() && g.gemm_ok() {
-            g.run_gemm(&self.gpu, x, t);
+        if let Some(&base) = self.blas_map.borrow().get(&(g as *const MGemv as usize)) {
+            // the chunk path with QX_DS_CHUNK_GEMM=1: this layer's weights are in f16 already
+            g.run_blas_cached(&self.gpu, x, x_stride, t, self.blas_bufs.as_ref().unwrap().1.ptr, base);
             self.trace_done();
             return;
         }
@@ -2165,15 +2213,87 @@ impl<'a> DsEngine<'a> {
         let n_ring = self.abufs.as_ref().map(|ab| ab.stage_cap as usize).unwrap_or(0);
         if chunk_streams() > 1 && self.chunk_side.len() < chunk_streams() {
             let ff = self.cfg.ff_exp;
-            let b = |n: usize| DeviceBuf::new((n * 4 + 255) / 256 * 256);
             while self.chunk_side.len() < chunk_streams() {
                 // (an expert's scratch is indexed by the row's place in its list: `chunk_side_rows` rows per stream;
                 // an expert with more rows runs on the main stream with the chunk's own scratch)
                 let cap = chunk_side_rows(rows_max);
-                self.chunk_side.push([b(cap * 2 * ff), b(cap * ff / 4), b(cap * (ff / 256))]);
+                let bufs = [self.cscratch(cap * 2 * ff * 4), self.cscratch(cap * ff), self.cscratch(cap * (ff / 256) * 4)];
+                self.chunk_side.push(bufs);
             }
         }
+        // QX_DS_CHUNK_GEMM=1: the FFN's dense products once over the chunk's rows (cuBLAS f16 GEMMs), not per slab
+        let chunk_ffn_wide = chunk_gemm() && self.layers.iter().all(|w| w.g_ffn.blas_ok() && w.g_shd.blas_ok());
+        if verbose_types() && pos0 == 0 {
+            let w = &self.layers[0];
+            let t = |g: &MGemv| g.segs.iter().map(|s| format!("{}:{}x{}/{}", s.qx, s.rows, s.cols, s.stride)).collect::<Vec<_>>().join(" ");
+            eprintln!("dense groups (type:rows x cols/stride) g_x [{}] g_qr [{}] wo_a [{}] g_ob [{}] g_ffn [{}] g_shd [{}]; ffn wide {}", t(&w.g_x), t(&w.g_qr), t(&w.wo_a[0]), t(&w.g_ob), t(&w.g_ffn), t(&w.g_shd), chunk_ffn_wide);
+            let mut kinds = std::collections::BTreeMap::new();
+            for w in &self.layers { for g in [&w.g_x, &w.g_qr, &w.g_ob, &w.g_ffn, &w.g_shd] { for s in &g.segs { *kinds.entry(s.qx).or_insert(0usize) += 1; } } }
+            eprintln!("dense segment types over all layers: {kinds:?}");
+        }
+        if chunk_ffn_wide && self.blas_bufs.is_none() {
+            let groups = |w: &Layer| -> usize { [&w.g_x, &w.g_qr, &w.g_ob].iter().map(|g| g.w16_total()).sum::<usize>() + w.wo_a.iter().map(|g| g.w16_total()).sum::<usize>() };
+            let halves = self.layers.iter().map(groups).max().unwrap_or(0);
+            let kmax = self.layers.iter().flat_map(|w| [w.g_x.tcols, w.g_qr.tcols, w.g_ob.tcols].into_iter().chain(w.wo_a.iter().map(|g| g.tcols))).max().unwrap_or(E);
+            let bufs = (self.cscratch(halves * 2 + 256), self.cscratch(DS_TMAX * kmax * 2 + 256));
+            self.blas_bufs = Some(bufs);
+        }
+        if chunk_ffn_wide {
+            // cuBLAS loads a kernel library the first time a GEMM shape needs it, and that load must never happen
+            // while an expert job is posted (a kernel waiting for a staged record keeps the card busy, the driver
+            // thread sits behind the load's lock: the run stopped in layer 2 on 2026-11-10). So every shape this
+            // chunk will use runs once here, on scratch, before any job exists: the standing dry-pass rule.
+            self.chunk_ffn_alloc(rows_max);
+            let (w16, x16s) = { let b = self.blas_bufs.as_ref().unwrap(); (b.0.ptr, b.1.ptr) };
+            let [_, gate_scratch, _, _, x16c, w16c] = { let (_, b) = self.chunk_ffn_bufs.as_ref().unwrap(); [b[0].ptr, b[1].ptr, b[2].ptr, b[3].ptr, b[4].ptr, b[5].ptr] };
+            let mut seen = std::collections::HashSet::new();
+            let mut widths: Vec<usize> = slabs.iter().map(|&(_, t)| t).collect();
+            widths.sort_unstable();
+            widths.dedup();
+            let ymax = DS_TMAX * self.layers.iter().flat_map(|w| [&w.g_x, &w.g_qr, &w.g_ob].into_iter().chain(w.wo_a.iter())).flat_map(|g| g.segs.iter().map(|s| s.rows)).max().unwrap_or(1);
+            if self.blas_y.as_ref().is_none_or(|b| b.bytes < ymax * 4) {
+                let b = self.cscratch(ymax * 4);
+                self.blas_y = Some(b);
+            }
+            let ys = self.blas_y.as_ref().unwrap().ptr;
+            for w in &self.layers {
+                for g in [&w.g_x, &w.g_qr, &w.g_ob].into_iter().chain(w.wo_a.iter()) {
+                    for sg in g.segs.iter().filter(|sg| sg.qx != 0) {
+                        for &t in &widths {
+                            if seen.insert((sg.rows, sg.cols, t)) {
+                                qx_gpu::blas::gemm_hss(w16, sg.cols, sg.rows, x16s, t, ys, sg.rows);
+                            }
+                        }
+                    }
+                }
+                for g in [&w.g_ffn, &w.g_shd] {
+                    for sg in g.segs.iter().filter(|sg| sg.qx != 0) {
+                        if seen.insert((sg.rows, sg.cols, rows)) {
+                            // (the output lands in the gate scratch or, for the down product, would not fit it: E > ff)
+                            let y = if sg.rows <= self.cfg.ff_exp { gate_scratch } else { self.chunk.as_ref().unwrap().shy.ptr };
+                            qx_gpu::blas::gemm_hss(w16c, sg.cols, sg.rows, x16c, rows, y, sg.rows);
+                        }
+                    }
+                }
+            }
+            self.gpu.sync();
+        }
         for l in 0..n_layers_run {
+            if chunk_ffn_wide {
+                // this layer's attention-side dense groups as f16, once for the chunk (cuBLAS GEMMs per slab from them)
+                let base = self.blas_bufs.as_ref().unwrap().0.ptr;
+                let w = &self.layers[l];
+                let mut map = self.blas_map.borrow_mut();
+                map.clear();
+                let mut off = 0u64;
+                for g in [&w.g_x, &w.g_qr, &w.g_ob].into_iter().chain(w.wo_a.iter()) {
+                    if g.blas_ok() && g.w16_total() > 0 {
+                        g.prep_w16(&self.gpu, base + off);
+                        map.insert(g as *const MGemv as usize, base + off);
+                        off += (g.w16_total() * 2) as u64;
+                    }
+                }
+            }
             let te = std::time::Instant::now();
             let mut went_on = true;
             // the layer's hottest non-resident experts stream into the ring while the slab passes run (the layer
@@ -2201,6 +2321,14 @@ impl<'a> DsEngine<'a> {
                 if !went_on {
                     continue;
                 }
+                if chunk_ffn_wide {
+                    // the norm only: the router, the shared expert and the selections run once over the chunk below
+                    let w = &self.layers[l];
+                    self.hc_terms(&w.hc_ffn, &self.s.pre_f, t);
+                    self.hc_pre(&self.s.pre_a, t);
+                    self.rms(self.s.xpre.ptr, w.ffn_norm.ptr, self.s.x.ptr, E, t);
+                    continue;
+                }
                 self.layer_ffn_pre(l, t, &mut None);
                 if trace && l < 8 {
                     self.gpu.sync();
@@ -2217,6 +2345,9 @@ impl<'a> DsEngine<'a> {
             if !went_on {
                 // KV-only: the last KV source's ring, store and keys are written; nothing above runs
                 break;
+            }
+            if chunk_ffn_wide {
+                self.chunk_ffn(l, rows, rows_max);
             }
             // the experts of the whole chunk
             let cb = self.chunk.as_ref().unwrap();
@@ -2442,6 +2573,7 @@ impl<'a> DsEngine<'a> {
         self.gpu.sync();
         let logits = if kv_only { Vec::new() } else { self.s.logits.download_at::<f32>((t - 1) * n_vocab * 4, n_vocab) };
         // the window scratch back
+        self.blas_map.borrow_mut().clear();
         let [r, pre_prev, pre_f, post, comb, x, ids_b, wts, tok, pos, slot_b] = saved;
         self.s.r = r; self.s.pre_prev = pre_prev; self.s.pre_f = pre_f; self.s.post = post; self.s.comb = comb; self.s.x = x;
         self.s.ids = ids_b; self.s.wts = wts; self.s.tok = tok; self.s.pos = pos; self.s.slot = slot_b;
@@ -2845,6 +2977,47 @@ impl<'a> DsEngine<'a> {
         self.mgt(&w.g_ffn, self.s.x.ptr, E, t, "g_ffn");
         self.dump(format!("ffn_moe_logits-{l}"), &self.s.logits_r, c.n_expert, act);
         self.k("qx_ds_route", 32, (t as u32, 1, 1), &[self.s.logits_r.ptr, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, self.s.ids.ptr, self.s.wts.ptr, bits(c.w_scale)]);
+    }
+
+    /// The FFN's dense part for every row of a chunk at once (`QX_DS_CHUNK_GEMM=1`): the router logits (f32) and the
+    /// shared expert's gate and up from the chunk's normed rows, the selections, and the shared expert's down
+    /// product into the chunk's `shy`: half-precision tensor-core GEMMs with f32 accumulation over all the rows,
+    /// the weights decoded to f16 once per matrix. KL-bounded against the per-slab exact path.
+    /// `bytes` of chunk-path scratch: from the flex tail's spare region while it lasts, else its own allocation.
+    fn cscratch(&mut self, bytes: usize) -> DeviceBuf {
+        let bytes = bytes.div_ceil(256) * 256;
+        if let Some(cb) = self.chunk.as_ref() {
+            if self.chunk_extra_off + bytes <= cb.extra.bytes {
+                let v = DeviceBuf::view(cb.extra.ptr + self.chunk_extra_off as u64, bytes);
+                self.chunk_extra_off += bytes;
+                return v;
+            }
+        }
+        if std::env::var("QX_DS_VERBOSE").is_ok() {
+            eprintln!("chunk scratch: {} MiB outside the flex tail ({} of {} MiB of it handed out)", bytes >> 20, self.chunk_extra_off >> 20, self.chunk.as_ref().map_or(0, |c| c.extra.bytes >> 20));
+        }
+        DeviceBuf::new(bytes)
+    }
+
+    fn chunk_ffn_alloc(&mut self, rows_max: usize) {
+        let (ne, ff) = (self.cfg.n_expert, self.cfg.ff_exp);
+        if self.chunk_ffn_bufs.as_ref().is_none_or(|(n, _)| *n < rows_max) {
+            let w16 = self.layers.iter().map(|w| w.g_ffn.w16_halves().max(w.g_shd.w16_halves())).max().unwrap_or(0);
+            let bufs = [self.cscratch(rows_max * ne * 4), self.cscratch(rows_max * ff * 4), self.cscratch(rows_max * ff * 4), self.cscratch(rows_max * ff * 4), self.cscratch(rows_max * E.max(ff) * 2 + 4), self.cscratch(w16 * 2 + 4)];
+            self.chunk_ffn_bufs = Some((rows_max, bufs));
+        }
+    }
+
+    fn chunk_ffn(&mut self, l: usize, rows: usize, rows_max: usize) {
+        self.chunk_ffn_alloc(rows_max);
+        let [lg, g, u, h, x16, w16] = { let (_, b) = self.chunk_ffn_bufs.as_ref().unwrap(); [b[0].ptr, b[1].ptr, b[2].ptr, b[3].ptr, b[4].ptr, b[5].ptr] };
+        let c = &self.cfg;
+        let w = &self.layers[l];
+        let cb = self.chunk.as_ref().unwrap();
+        w.g_ffn.run_blas_to(&self.gpu, cb.x.ptr, rows, &[lg, g, u], x16, w16);
+        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr, cb.wts.ptr, bits(c.w_scale)]);
+        self.k("qx_ds_silu_mul_clamp", 256, (((c.ff_exp * rows) as u32).div_ceil(256), 1, 1), &[g, u, h, (c.ff_exp * rows) as u64, bits(c.clamp_shexp[l])]);
+        w.g_shd.run_blas_to(&self.gpu, h, rows, &[cb.shy.ptr], x16, w16);
     }
 
     /// The shared expert of layer `l` (`shg`, `shu` from the FFN GEMV group into `shy`).

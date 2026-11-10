@@ -2,6 +2,7 @@
 
 pub mod kernel;
 pub mod mem;
+pub mod blas;
 pub mod raw;
 pub mod reference;
 pub mod runtime;

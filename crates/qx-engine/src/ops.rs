@@ -326,6 +326,69 @@ impl MGemv {
         }
     }
 
+    /// The products for a chunk's `t` rows through cuBLAS: x (rows `tcols` floats apart) converted to f16 once into
+    /// `x16`, every non-F32 segment's weights decoded to f16 once into `w16` (`qx_w16`), then one half-precision
+    /// tensor-core GEMM with f32 accumulation per segment over all the rows; F32 segments (the router) stay in f32
+    /// (`qx_gemm_f32`). Segment i writes at `ys[i]` (rows `rows_i` floats apart). Prompt processing only.
+    pub fn run_blas_to(&self, gpu: &Gpu, x: u64, t: usize, ys: &[u64], x16: u64, w16: u64) {
+        let k = self.tcols;
+        gpu.run(modules::GEMM.kernel("qx_x16", CubeDim::new_1d(256)), (((t * k) as u32).div_ceil(256), 1, 1), &[x, k as u64, x16, t as u64, k as u64]);
+        for (i, s) in self.segs.iter().enumerate() {
+            let y = ys.get(i).copied().unwrap_or(s.y);
+            let (rows, cols) = (s.rows as u64, s.cols as u64);
+            if s.qx == 0 && s.rows < 128 && s.cols % 4 == 0 {
+                gpu.run(modules::GEMM.kernel("qx_gemm_f32_narrow", CubeDim::new_1d(256)), ((t as u32).div_ceil(8), s.rows as u32, 1), &[x, s.w, y, t as u64, rows, cols, rows]);
+            } else if s.qx == 0 {
+                gpu.run(modules::GEMM.kernel("qx_gemm_f32", CubeDim::new_1d(256)), ((s.rows as u32).div_ceil(64), (t as u32).div_ceil(64), 1), &[x, s.w, y, t as u64, rows, cols, rows]);
+            } else {
+                gpu.run(modules::GEMM.kernel("qx_w16", CubeDim::new_1d(256)), (((s.rows * s.cols / 8) as u32).div_ceil(256), 1, 1), &[s.w, w16, rows, cols, s.stride as u64, s.qx]);
+                qx_gpu::blas::gemm_hss(w16, s.cols, s.rows, x16, t, y, s.rows);
+            }
+        }
+    }
+
+    /// Halves needed to hold every non-F32 segment's weights as f16 (`prep_w16`).
+    pub fn w16_total(&self) -> usize {
+        self.segs.iter().filter(|s| s.qx != 0).map(|s| s.rows * s.cols).sum()
+    }
+
+    /// Decodes every non-F32 segment's weights to f16, one after the other from `base` (once per layer and chunk).
+    pub fn prep_w16(&self, gpu: &Gpu, base: u64) {
+        let mut off = 0u64;
+        for s in self.segs.iter().filter(|s| s.qx != 0) {
+            gpu.run(modules::GEMM.kernel("qx_w16", CubeDim::new_1d(256)), (((s.rows * s.cols / 8) as u32).div_ceil(256), 1, 1), &[s.w, base + off, s.rows as u64, s.cols as u64, s.stride as u64, s.qx]);
+            off += (s.rows * s.cols * 2) as u64;
+        }
+    }
+
+    /// The products for `t` rows (x rows `x_stride` floats apart) from the f16 weights `prep_w16` left at `base`: x
+    /// to f16 (`x16`), then one cuBLAS half-precision GEMM with f32 accumulation per segment; F32 segments in f32.
+    pub fn run_blas_cached(&self, gpu: &Gpu, x: u64, x_stride: usize, t: usize, x16: u64, base: u64) {
+        let k = self.tcols;
+        gpu.run(modules::GEMM.kernel("qx_x16", CubeDim::new_1d(256)), (((t * k) as u32).div_ceil(256), 1, 1), &[x, x_stride as u64, x16, t as u64, k as u64]);
+        let mut off = 0u64;
+        for s in &self.segs {
+            let (rows, cols) = (s.rows as u64, s.cols as u64);
+            if s.qx == 0 {
+                assert!(x_stride == k, "an F32 segment with strided inputs");
+                gpu.run(modules::GEMM.kernel("qx_gemm_f32", CubeDim::new_1d(256)), ((s.rows as u32).div_ceil(64), (t as u32).div_ceil(64), 1), &[x, s.w, s.y, t as u64, rows, cols, rows]);
+            } else {
+                qx_gpu::blas::gemm_hss(base + off, s.cols, s.rows, x16, t, s.y, s.rows);
+                off += (s.rows * s.cols * 2) as u64;
+            }
+        }
+    }
+
+    /// Whether `run_blas_to` can take this group: every segment's type decodes to f16 (`qx_w16`), F32 rows dense.
+    pub fn blas_ok(&self) -> bool {
+        self.segs.iter().all(|s| matches!(s.qx, 0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10 | 16) && (s.qx != 0 || s.stride == 0 || s.stride == s.cols * 4) && s.cols % 8 == 0)
+    }
+
+    /// The largest rows x cols among the non-F32 segments (the size of `run_blas_to`'s `w16`, in halves).
+    pub fn w16_halves(&self) -> usize {
+        self.segs.iter().filter(|s| s.qx != 0).map(|s| s.rows * s.cols).max().unwrap_or(0)
+    }
+
     /// Whether `run_gemm` can take this group: every segment's type has a tile decoder and dense F32 rows.
     pub fn gemm_ok(&self) -> bool {
         self.segs.iter().all(|s| matches!(s.qx, 0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10) && (s.qx != 0 || s.stride == 0 || s.stride == s.cols * 4))

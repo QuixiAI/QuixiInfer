@@ -725,6 +725,39 @@ extern "C" __global__ void __launch_bounds__(256, TMV_Q8_BLOCKS) qx_tmv_q8_2(con
 extern "C" __global__ void __launch_bounds__(256, TMV_Q8_BLOCKS) qx_tmv_q8_3(const u64* info) { tmv<3>(info); }
 extern "C" __global__ void __launch_bounds__(256, TMV_Q8_BLOCKS) qx_tmv_q8_4(const u64* info) { tmv<4>(info); }
 
+/// A weight matrix decoded to f16 rows (for cuBLAS half-precision GEMMs: once per matrix and chunk, instead of once
+/// per tile). info: [0] W, [1] out (N x K u16), [2] N, [3] K, [4] row stride in bytes, [5] type. Grid
+/// ceil(N * K / 8 / 256), 256 threads.
+template <int TY>
+QX_DEV void w16_t(const u64* info) {
+    const u32 N = (u32)info[2], K = (u32)info[3];
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (u64)N * (K / 8)) return;
+    const u32 n = (u32)(i / (K / 8)), c8 = (u32)(i % (K / 8)) * 8;
+    float v[8];
+    dec_t<TY>(reinterpret_cast<const u8*>(info[0]) + (u64)n * info[4], K, c8, v);
+    u16* o = reinterpret_cast<u16*>(info[1]) + (u64)n * K + c8;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) o[j] = f32_to_f16(v[j]);
+}
+extern "C" __global__ void qx_w16(const u64* info) {
+    switch ((u32)info[5]) {
+#define X(t) case t: w16_t<t>(info); break;
+        QX_TYPE_CASES(X)
+        X(QX_Q5_K)
+#undef X
+    }
+}
+
+/// f32 rows to contiguous f16 rows. info: [0] x, [1] x stride per row (floats), [2] out (T x K u16), [3] T, [4] K.
+/// Grid ceil(T * K / 256), 256 threads.
+extern "C" __global__ void qx_x16(const u64* info) {
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x, K = info[4];
+    if (i >= info[3] * K) return;
+    const u64 t = i / K, k = i % K;
+    reinterpret_cast<u16*>(info[2])[i] = f32_to_f16(reinterpret_cast<const float*>(info[0])[t * info[1] + k]);
+}
+
 /// The products' input for qx_tmv: xb[n][k] = bf16 of x[n][k] transformed as qx_mgemv's modes do, for n < 32 (zero
 /// from T on). info: [0] x, [1] x stride per token, [2] argument, [3] mode (0 plain, 1 silu(x * s), 2 silu(x) * x2),
 /// [4] T, [5] K, [6] out (u32 pairs). Grid ceil(32 * K / 2 / 256).
