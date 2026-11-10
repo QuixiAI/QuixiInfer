@@ -9,6 +9,26 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-10 (after the conjecturer pass, `perf/ideation/2026-11-10-conjecturer.md`)
+1. **Narrow staged share (widths 2-3 at 4/8)**: candidate default in 0bc58dc, serve256k3 -10.4%; set D, breaker,
+   adjudicator pending.
+2. **RAM dedup / exclusive tiers** (`QX_DS_RAM_DEDUP=1`, written, off): over half of decode256k's NVMe fetches are
+   promotion churn (row 30). First arm queued (`qx-chain-dedup`). If it pays, the fuller form: a VRAM victim takes
+   its replacement's RAM place (write-back), and flex-tail residents too.
+3. **NVMe read-ahead from the `next` predictor** on a branch parallel to the wait kernel (E4): 7.0 ms per token of
+   fetch wait on decode256k (halved if 2 lands). Two builds.
+4. **Counter repair** (E6): the `serve`/gap counters are cumulative over 64 tokens incl. warm-up; print them for
+   the scored window; per-kernel split of the gap. Also the dry pass's phantom jobs in them.
+5. **Chunk "slab enqueue": host cost or GPU back-pressure?** (E8) one nsys run decides rows 10/21.
+6. **First real use of a wide window costs ~2 s of launch/replay in a server** (width 96 formed by three prompts
+   arriving together: TTFT 3.6-4.4 s instead of 1.2-2.1): see what the warm-up's dry pass leaves undone.
+7. Width-1 GEMV fusion (family 8), prefetch as default (candidate -3.0% decode256k, flat on serve), pool cache
+   pre-touch kill test (`qx-poolbw` warm vs cold), 32k-row chunks sweep.
+8. Slow first repeat of decode256k after a different process shape (44.5 / 47.9 against 42-44): not kcompactd by
+   the sampler; cause open. `vm.compaction_proactiveness=0` needs sudo (the user's call).
+9. Breaker leftovers: Qwen caller of `qx_moe_post` passes 14 words where info[20] is read (pass explicit zeros;
+   do not run Qwen); `QX_DS_STG_WAIT=words` unsafe; placement portability; bench.sh records only its own knobs.
+
 ### Correctness prerequisite (2026-11-09; promotion still blocked)
 
 The expanded all-row `qx-ds-multi` exposes cold-width compressor corruption: B 1/834 exact becomes 834/834 when

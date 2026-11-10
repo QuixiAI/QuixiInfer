@@ -2525,3 +2525,31 @@ session the second round's three prompts were admitted into one 96-wide window (
 (a timing matter that the faster decode steps shift), and the first real use of that width in the session costs
 about 2 s of launch/replay: the scheduler's behaviour, not the share. Backlog: first real use of a wide window
 after warm-up should not cost 2 s (see what the dry pass leaves undone for width 96).
+
+## 2026-11-10: Promotion churn and the tier leak (conjecturer E1/E5), and the prefetch at width 3 (E2) — MEASURED, zero builds
+
+`qx-chain-leak`, chunk54 binaries, clean box, three repeats. decode256k (ms; counters cumulative over 64 tokens):
+
+| arm | decode256k | vram / staged / pool / nvme records | fetch ms | VRAM promos |
+|---|---|---|---|---|
+| control | 44.5, 42.2, 42.0 | 9,413 / 2,034 / 3,394 / 560 | 536 | 1,467 |
+| `QX_DS_VRAM_PROMOS=0` | 49.0, 49.2, 49.0 | 5,806 / 3,502 / 5,835 / 257 | 162 | 0 |
+| `QX_DS_VRAM_PROMOS=4` | 47.9, 44.1, 44.0 | 7,200 / 2,946 / 4,905 / 349 | 259 | 254 |
+
+The promotions are worth 7 ms (VRAM hit rate 38% -> 61%), and they also cause more than half of the NVMe fetches:
+560 -> 257 records and 536 -> 162 ms of fetch wait per 64 tokens with them off (5.8 ms per token of fetch is churn).
+The mechanism is the code read of the conjecturer: the initial VRAM residents have no RAM copy; a VRAM victim is
+dropped, not written back, so it is NVMe-only; its replacement keeps its RAM place, and `promote_one` excludes
+VRAM residents from the RAM victims (`h.table[x] == 0`), so those duplicate copies are never reclaimed.
+Presupposition row 15's premise ("inclusive at the VRAM/RAM boundary") is false for the initial residents.
+Next (experiment, complexity class, 8% bar on decode256k or serve256k3 unless it proves trivial): `QX_DS_RAM_DEDUP=1`
+(written, off by default): RAM promotions evict the RAM copies of VRAM residents first (hottest resident first,
+no margin test, never a flex-tail resident: the refill after a chunk reads its copy).
+(The first repeat of each decode arm is slow again: 44.5 and 47.9 against 42-44. Three chains now show it on the
+first repeat after a different process shape; kcompactd in the sampler log is quiet in those minutes. To check.)
+
+Server, `QX_DS_STAGE_WIDE_MIN=4` (narrow share 3/8, the default of chunk54), serve256k3 / TTFT / tok/s:
+promotions off 139.9 / 2.57 / 19.99 (x3 within 0.4%; serve256k1 52.3-53.9): the promotions are worth 30% there.
+Prefetch `mix` K=6 one copy: 96.06, 95.69, 95.60 (28.5-28.7 tok/s) against 97.2-97.4 without (-1.5%, below the bar
+and smaller than the narrow share's own 4/8 step); three copies: 99.7 x3 (worse). The copies do not land in the
+gap for free: E2 is flat. No change.
