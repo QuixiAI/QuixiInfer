@@ -210,6 +210,17 @@ impl ExpertStore {
         Some((self.layer_class[g / self.n_expert], p))
     }
 
+    /// Gives expert `g` the place `p` (taken out by `evict_deferred`, already holding `g`'s bytes). False when `g`
+    /// got a place meanwhile.
+    pub fn adopt(&mut self, g: usize, p: usize) -> bool {
+        if self.place[g] != 0 {
+            return false;
+        }
+        self.place[g] = p;
+        self.holder.insert(p, g);
+        true
+    }
+
     /// Returns a place `evict_deferred` took out to its class's free list.
     pub fn free_place(&mut self, c: usize, p: usize) {
         self.classes[c].free.push(p);

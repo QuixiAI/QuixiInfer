@@ -2553,3 +2553,28 @@ promotions off 139.9 / 2.57 / 19.99 (x3 within 0.4%; serve256k1 52.3-53.9): the 
 Prefetch `mix` K=6 one copy: 96.06, 95.69, 95.60 (28.5-28.7 tok/s) against 97.2-97.4 without (-1.5%, below the bar
 and smaller than the narrow share's own 4/8 step); three copies: 99.7 x3 (worse). The copies do not land in the
 gap for free: E2 is flat. No change.
+
+## 2026-11-10: Exclusive tiers: VRAM victims copied back into the RAM places of duplicates — CANDIDATE default (decode256k -8.8%, serve256k3 -5.8% in the screens; validation pending)
+
+Row 30. Screens of at most 10 minutes each (the user's rule from today), `vm.compaction_proactiveness` 0 from
+04:33:49 (the user), clean box, binaries chunk56-58 over 0bc58dc; decode256k three repeats, serve256k one session
+at concurrency 3 (`SERVE_LEVELS=3`); counters cumulative over the 64 decode tokens:
+
+| arm | decode256k | NVMe records / fetch ms | RAM promos | serve256k3 (ms / TTFT / tok/s) |
+|---|---|---|---|---|
+| control | 42.0, 41.9, 42.0 | 557 / 534 | 537 | 93.02 / 2.18 / 29.11 |
+| `QX_DS_RAM_DEDUP=1` first form: RAM promotions evict the RAM copies of VRAM residents first | 41.1, 41.0, 40.9 | 529 / 488 | 512 | 91.07 / 2.45 / 29.60 |
+| + VRAM victims without a RAM copy queued for an NVMe read ahead of the candidates (now mode 1) | 41.3, 41.0, 41.2 | 309 / 470 | 1,634 | 88.34 / 1.96 / 30.79 |
+| + victims copied device-to-host from their quarantined slot into a duplicate's RAM place (mode 2) | **38.3, 38.2, 38.3** | 285 / 308 | 636 | **87.57** / 3.16 / 30.10 |
+
+The NVMe write-back halves the NVMe-served records but not the fetch wait (25 promotion reads per token contend
+with the demand fetches: 1.5 ms per record against 0.96); the device-to-host copy has no such cost: pool 1,642 ->
+1,391 ms, fetch 534 -> 308. prefill256k with mode 1: 5.7 (one run; unchanged). Mechanism of mode 2
+(`driver.rs`, the VRAM promotion plan): on evicting victim v with no RAM copy, pick the hottest VRAM resident x
+of the class that still has a RAM copy (not being copied, not prefetch-inflight, not in the flex tail), take x's
+place out of the store, `cuMemcpyDtoHAsync` v's slot -> that place on the copy stream (the slot is quarantined two
+ticks and any refill is queued behind on the same stream; a flex grant synchronizes the stream first), and adopt
+the place for v when the copy event fires (`finish_copies`); until then v is not in RAM and no new VRAM
+promotions are planned. Residency only: the weights are read-only and the same bytes come back.
+The serve session's TTFT 3.16 s is the 96-wide first-use window again (see the entry above), to confirm.
+`QX_DS_RAM_DEDUP` defaults to 2 from chunk59 (0 restores the old tiers).

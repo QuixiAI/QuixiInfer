@@ -39,7 +39,24 @@ Set D exists: `perf/states/` holds the 262,144- and 245,760-token states, `perf/
 8192-row chunks, last 32 scored), `serve256k` (the server at `--ctx 262144 --slots 3`, loadgen at concurrency 1 and
 3) and the guards `decode`, `prefill128`, `serve`. The scoreboard's last row is the promoted baseline; `perf_diff.py
 gate` compares against `perf/baselines/rtx-5090_ryzen-9-9950x_121g/`. Measured spreads (2026-11-08): decode256k
-0.2-3%, prefill256k 0-2%, serve256k3 0.2-1.7%, decode 1-4%: three repeats are enough; a knob flip needs no five.
+0.2-3%, prefill256k 0-2%, serve256k3 0.2-1.7%, decode 1-4%.
+
+## Test length: 10 minutes maximum (the user's rule, 2026-11-10; it overrides every older "three repeats" rule)
+No test, chain or validation run may take more than about 10 minutes of wall time. No 75-minute set D runs, ever.
+- **Screen** an experiment on the one or two cases it targets: `bench.sh --no-build --cases decode256k` (three
+  repeats, 45 s each), `--cases prefill256k --repeats 1` (2 min), `SERVE_LEVELS=3 ... --cases serve256k --repeats 1`
+  (one server session, 3 min). Control and arm back to back in one chain of at most 10 minutes.
+- **Promotion run**: `bench.sh --promo --no-build --label <slug>` (decode256k twice, prefill256k, serve256k, decode
+  and prefill128 once; about 9 minutes). The spread comes from the measured spreads above and from the screen's
+  repeats, not from three full rounds. The 8k `serve` guard is run as its own screen only when a change targets the
+  server.
+- **Exactness** is its own run of at most 10 minutes: `tools/ds-checks.sh` (if it takes longer, split or trim it
+  until it fits; never skip it for a change to engine code). `qx-ds-multi` with all rows only for changes to the
+  scheduler, windows or the driver's job paths, capped the same way.
+- **Server identity**: every `serve256k` session `bench.sh` runs at the standard levels is compared with the
+  reference dump (`identity.txt` in the run directory). All sessions on the candidate binary must read identical,
+  and there must be at least two (the promotion run's and one screen's, or two short runs); a mismatch in any one
+  stops performance work.
 
 ## Read first, every session
   perf/perf.md (rules), perf/presuppositions.md (the beliefs the design rests on and how each would be killed), perf/findings.md (what is known and what was rejected, with the conditions for re-opening), perf/backlog.md, the last entries of perf/optimization_status.md, handoff.md (constraints, how to run things).
@@ -83,8 +100,8 @@ gate` compares against `perf/baselines/rtx-5090_ryzen-9-9950x_121g/`. Measured s
   1. Choose: write the hypothesis, the counter that will confirm or refute it, the expected gain, and why it is better than the next-best idea. After every third experiment, or after two flat results in a row, run the `perf-conjecturer` agent (fresh context, given the facts and not your hypotheses) and re-rank against its list.
   2. Change ONE factor. Behind a knob when cheap.
   3. Build: cargo build --release -p qx-engine -p qx-serve --bin qx-ds-check --bin quixiinfer. Gate on cargo's exit status, never on a grep pipeline. step.cu/dsv41.cu builds can take ~10 min.
-  4. Measure: perf/harness/bench.sh --check --label <slug>. Then python3 perf/harness/perf_diff.py gate <run-dir> against perf/baselines/rtx-5090_ryzen-9-9950x_121g.
-  5. Decide by the bars, on the score OR on the targeted scored case (the geometric mean moves 2.4% when decode256k moves 6%, so name the case the change aims at before measuring): keep only if the gain beats 3% (low-risk: a default, a placement, a knob flip, a config) or 8% (complexity-adding) AND is outside the repeats' spread AND all five tools/ds-checks.sh lines are exact AND, for anything touching the server, the chunk buffers or the tiers, the server-level identity check passes THREE runs out of three (`tools/loadgen.py --dump` against the reference `perf/results/2026-11-07/srv2-chunk32/srv2-0.dump.jsonl`, `tools/compare_dumps.py` identical; one run is not evidence: the 2026-11-09 bug flipped a token in about one run in three), and `qx-ds-multi` passes with all rows checked (ds-checks never exercise the server's warm-up, scheduler or the driver's fallback paths). Inside the noise is INCONCLUSIVE, not a win. A big idea that lands at 2% may be kept as CANDIDATE if you can name the follow-up that would unlock more; say so in the entry.
+  4. Measure: a screen of at most 10 minutes on the targeted case(s) (see "Test length"); for a change that passes its bar, the promotion run `perf/harness/bench.sh --promo --label <slug>` and the exactness run. Then python3 perf/harness/perf_diff.py gate <run-dir> against perf/baselines/rtx-5090_ryzen-9-9950x_121g.
+  5. Decide by the bars, on the score OR on the targeted scored case (the geometric mean moves 2.4% when decode256k moves 6%, so name the case the change aims at before measuring): keep only if the gain beats 3% (low-risk: a default, a placement, a knob flip, a config) or 8% (complexity-adding) AND is outside the repeats' spread AND all five tools/ds-checks.sh lines are exact AND, for anything touching the server, the chunk buffers or the tiers, every `serve256k` session on the candidate binary reads identical against the reference `perf/results/2026-11-07/srv2-chunk32/srv2-0.dump.jsonl` (`identity.txt` in each run directory; at least two sessions, none mismatching: the 2026-11-09 bug flipped a token in about one run in three, so a single session is not evidence), and, for changes to the scheduler, windows or the driver's job paths, `qx-ds-multi` passes with all rows checked. Inside the noise is INCONCLUSIVE, not a win. A big idea that lands at 2% may be kept as CANDIDATE if you can name the follow-up that would unlock more; say so in the entry.
      Before landing: run the `perf-breaker` agent on the diff and the claimed result and act on its tests; then the `perf-adjudicator` agent on the run directory. Nothing is LANDED or promoted without the adjudicator's verdict (PROMOTE) quoted in the notebook entry. Both run in fresh context and are never shown your reasoning.
   6. Record every outcome: perf_diff.py entry, then perf_diff.py index. LANDED: perf_diff.py promote the run as the new baseline, perf_diff.py score --record --note "...", update perf/findings.md (Wins) and perf/backlog.md, commit and push to master. REJECTED/INCONCLUSIVE: revert the code, add the reason and the re-open condition to perf/findings.md, commit the docs only. New ideas discovered along the way go into perf/backlog.md with a one-line rationale, even if you do not pursue them now.
   7. Update handoff.md with a dated line when something lands, a belief changes, or a family closes.

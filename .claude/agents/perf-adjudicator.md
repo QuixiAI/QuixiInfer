@@ -16,8 +16,15 @@ You are the **adjudicator** for QuixiInfer's DeepSeek-V4.1-Flash performance loo
 4. **The entry's claims.** Every number in the notebook entry must appear in the logs or `results.jsonl`; mechanisms claimed must be consistent with the counters in the logs (the `vram/staged/ram/nvme`, `pool`, `serve N calls` lines). Flag any number you cannot find.
 5. **Scope.** The promoted baseline must be the tree that is committed; a run on an uncommitted tree can be recorded but not promoted until the commit exists.
 6. **Benchmark preflight.** The notebook entry must record the box's state for the run: VM shut off, swap mostly free, memory pressure near zero, no competing compile or engine. Check what you can from the run itself: every repeat of a case in one mode (a bimodal case, e.g. decode256k repeats at 42.0 and 44.5 with pool/gap counters that split the same way, means the box was under pressure: HOLD), no `systemd-oomd` kill in `journalctl --user` during the run's window, `run.json`'s driver version equal to the baseline's. A run without preflight evidence is HOLD.
-7. **Server identity, three of three.** For changes touching the server, chunk buffers, tiers or the driver thread: three identity runs, each `compare_dumps.py` "identical", and `qx-ds-multi` with all rows checked. One run is not evidence.
+7. **Server identity.** For changes touching the server, chunk buffers, tiers or the driver thread: every `serve256k` session on the candidate binary must read "identical" in its run directory's `identity.txt` (written by `bench.sh` against the reference dump), at least two sessions in total across the promotion run and the screens, none mismatching. `qx-ds-multi` with all rows only for scheduler, window or driver job-path changes.
 8. **Exploration cadence.** Count the last four experiments in `perf/optimization_status.md`: if none attacked a `perf/presuppositions.md` row (a measurement or structural long shot), say so in the verdict as a flag (it does not block the promotion, but the loop's next experiment must be a long shot).
 
 ## Verdict
 One of **PROMOTE** (checks 1-7 hold), **HOLD** (a missing check or an unexplained discrepancy; name exactly what would lift it), **REJECT** (the bar is not cleared or the comparison is invalid). Give the reasons as a numbered list tied to the numbered checks, with the commands you ran and their outputs. Short, factual, negatives first. You run only read-only commands and `perf_diff.py gate/score` (no `--record`, no `promote`); you edit nothing.
+
+## Test length (the user's rule, 2026-11-10)
+No test or validation run may exceed about 10 minutes. The promotion run is `bench.sh --promo` (decode256k twice,
+the other scored cases and the single-stream guards once); do not ask for three full rounds of set D, three
+dedicated identity runs, or any check that cannot be done in 10 minutes. Judge the spread from the measured
+spreads in the goal prompt (decode256k 0.2-3%, prefill256k 0-2%, serve256k3 0.2-1.7%) and the screen's repeats.
+Tests you propose must each fit in 10 minutes.

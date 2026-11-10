@@ -39,6 +39,7 @@ REPEATS=3
 CASES=decode256k,prefill256k,serve256k,decode,prefill128,serve
 CHECK=0
 BUILD=1
+ONCE=
 EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -46,6 +47,10 @@ while [ $# -gt 0 ]; do
     --repeats) REPEATS=$2; shift 2 ;;
     --cases) CASES=$2; shift 2 ;;
     --quick) CASES=decode256k,prefill256k; shift ;;
+    # the promotion run in under 10 minutes (2026-11-10, the user's cap): decode256k twice, the other scored cases
+    # and the single-stream guards once; every serve256k session is also a server identity check
+    --promo) CASES=decode256k,prefill256k,serve256k,decode,prefill128; REPEATS=2; ONCE=prefill256k,serve256k,decode,prefill128; shift ;;
+    --once) ONCE=$2; shift 2 ;;
     --check) CHECK=1; shift ;;
     --no-build) BUILD=0; shift ;;
     --) shift; EXTRA=("$@"); break ;;
@@ -160,6 +165,7 @@ for c in "${CASE_LIST[@]}"; do [ -n "${ARGS[$c]+x}" ] || { echo "unknown case $c
 # Greedy sampling, so the replies and their lengths repeat from run to run.
 # SERVE_LEVELS=2,3 (environment) drives other concurrency levels for an experiment; the standard cases are 1,3.
 SERVE_LEVELS_LIST=${SERVE_LEVELS:+${SERVE_LEVELS//,/ }}
+IDENTITY_REF=${IDENTITY_REF:-perf/results/2026-11-07/srv2-chunk32/srv2-0.dump.jsonl}
 serve_case() {
   # (two statements: `local` expands every word before it assigns any, so $name is unbound in the same one)
   local r=$1 name=${2:-serve} ctx=${3:-8192}
@@ -182,10 +188,16 @@ serve_case() {
   done
   if kill -0 "$pid" 2>/dev/null && grep -q "warm-up" "$slog"; then
     set +e
+    local dump=()
+    [ "$name" = serve256k ] && [ -z "${SERVE_LEVELS:-}" ] && [ -f "$IDENTITY_REF" ] && dump=(--dump "$RUN/logs/$name-$r.dump.jsonl")
     timeout 1500 python3 tools/loadgen.py --url "http://127.0.0.1:$PORT/v1" --levels ${SERVE_LEVELS:-1,3} --rounds 2 --max-tokens 256 \
-      --temperature 0 --warmup 6 > "$log" 2>&1
+      --temperature 0 --warmup 6 "${dump[@]}" > "$log" 2>&1
     rc=$?
     set -e
+    # server identity: this session's replies against the reference dump (same prompts, levels and settings)
+    if [ ${#dump[@]} -gt 0 ] && [ $rc = 0 ]; then
+      echo "$name-$r: $(python3 -I tools/compare_dumps.py "$IDENTITY_REF" "$RUN/logs/$name-$r.dump.jsonl" 2>&1 | tail -1)" | tee -a "$RUN/identity.txt"
+    fi
   fi
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
@@ -200,6 +212,7 @@ for r in $(seq 1 "$REPEATS"); do
   for c in "${CASE_LIST[@]}"; do
     gpu_free
     echo "[$c $r/$REPEATS] $(date +%T)"
+    case ",$ONCE," in *",$c,"*) [ "$r" -gt 1 ] && continue ;; esac
     if [ "$c" = serve ]; then serve_case "$r" serve 8192; continue; fi
     if [ "$c" = serve256k ]; then serve_case "$r" serve256k 262144; continue; fi
     log="$RUN/logs/$c-$r.log"

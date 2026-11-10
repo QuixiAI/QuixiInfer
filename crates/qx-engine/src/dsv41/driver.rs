@@ -26,6 +26,8 @@ pub struct Shared {
     pub nvme_misses: AtomicU64,
     pub vram_promos: AtomicU64,
     pub ram_promos: AtomicU64,
+    /// RAM copies of VRAM residents evicted to make room (`QX_DS_RAM_DEDUP`).
+    pub ram_dedups: AtomicU64,
     pub pool_ns: AtomicU64,
     /// Of `pool_ns`, the part spent fetching records (NVMe reads) before the pool runs.
     pub fetch_ns: AtomicU64,
@@ -186,6 +188,7 @@ impl Driver {
             nvme_misses: Default::default(),
             vram_promos: Default::default(),
             ram_promos: Default::default(),
+            ram_dedups: Default::default(),
             pool_ns: Default::default(),
             fetch_ns: Default::default(),
             promo_ns: Default::default(),
@@ -273,6 +276,10 @@ struct Loop {
     /// RAM places taken from evicted records, free again two ticks later (a window in flight may read them in
     /// place): (free at tick, class, place).
     ram_quarantine: std::collections::VecDeque<(u64, usize, usize)>,
+    /// VRAM victims without a RAM copy, waiting for a RAM place (`QX_DS_RAM_DEDUP`).
+    wb: Vec<usize>,
+    /// Victims being copied from their VRAM slot into a RAM place: (expert, place), adopted when the copies land.
+    d2h: Vec<(usize, usize)>,
     /// The staging copies' streams (round robin: one copy engine queue is 14 GB/s, several approach the link) and
     /// an event per stream.
     stage_streams: Vec<cudarc::driver::sys::CUstream>,
@@ -717,7 +724,7 @@ impl Loop {
         // quarantine had expired and the slot been refilled: the GPU would read a slot being overwritten.
         // While the previous tick's copies are still in flight no new ones are issued (the driver never blocks).
         self.finish_copies(sh, false);
-        let vram_ok = self.inflight.is_empty();
+        let vram_ok = self.inflight.is_empty() && self.d2h.is_empty();
         let mut plan: Vec<(usize, u64)> = Vec::new();
         for &g in cand.iter() {
             if !vram_ok || plan.len() >= n_vram {
@@ -737,6 +744,37 @@ impl Loop {
                         continue;
                     }
                     self.write_entry(v, 0);
+                    // a victim with no RAM copy (an initial resident, or one whose copy was deduplicated) would be
+                    // NVMe-only: queue it for RAM ahead of the candidates (QX_DS_RAM_DEDUP)
+                    if ram_dedup() && !self.host.store.in_ram(v) {
+                        // Swap: the victim's bytes go from its slot (quarantined two ticks, read here on the copy
+                        // stream ahead of any refill) into the RAM place of a duplicate: the hottest VRAM resident
+                        // of the class that still has a RAM copy nobody reads (not being copied, not in the flex
+                        // tail, whose refill reads it). The victim counts as in RAM once the copy landed
+                        // (`finish_copies`). No duplicate (or the GPU reads RAM in place): the NVMe queue.
+                        let mut swapped = false;
+                        if !self.host.gpu_reads_ram && swap_mode() {
+                            let h = &self.host;
+                            let (fp, fb) = (h.flex_ptr, h.flex_bytes);
+                            let (inflight, pre_inflight, d2h) = (&self.inflight, &self.pre_inflight, &self.d2h);
+                            let dup = h.holder.values().copied().filter(|&x| x != v && h.layer_class[x / ne] == c && h.table[x] != 0 && h.store.in_ram(x) && !(fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp) && !inflight.contains(&x) && !pre_inflight.contains(&x) && !d2h.iter().any(|d| d.0 == x)).max_by(|&p, &q| h.score[p].partial_cmp(&h.score[q]).unwrap());
+                            if let Some(x) = dup {
+                                if let Some((_, p)) = self.host.store.evict_deferred(x) {
+                                    self.write_rentry(x, 0);
+                                    let nb = self.host.store.record_bytes(v);
+                                    unsafe {
+                                        cudarc::driver::sys::cuMemcpyDtoHAsync_v2(p as *mut _, a, nb, self.stream).result().expect("victim copy");
+                                    }
+                                    self.d2h.push((v, p));
+                                    sh.ram_dedups.fetch_add(1, Ordering::Relaxed);
+                                    swapped = true;
+                                }
+                            }
+                        }
+                        if !swapped && self.wb.len() < 512 {
+                            self.wb.push(v);
+                        }
+                    }
                     self.host.holder.remove(&a);
                     self.quarantine.push_back((self.ticks + 2, c, a));
                     // the slot is in quarantine: take a free one if any, else wait for the next token
@@ -763,7 +801,7 @@ impl Loop {
             into_vram.push(g);
             sh.vram_promos.fetch_add(1, Ordering::Relaxed);
         }
-        if !into_vram.is_empty() {
+        if !into_vram.is_empty() || !self.d2h.is_empty() {
             unsafe { cudarc::driver::result::event::record(self.copy_event, self.stream).expect("event record") };
             self.inflight = into_vram;
         }
@@ -771,6 +809,14 @@ impl Loop {
         let in_vram = &self.inflight;
         self.pending_ram = cand.iter().copied().filter(|&g| !self.host.store.in_ram(g) && !in_vram.contains(&g)).take(n_ram).collect();
         self.pending_ram.reverse(); // pop from the back: hottest first
+        if !self.wb.is_empty() {
+            let h = &self.host;
+            let inflight = &self.inflight;
+            self.wb.retain(|&g| h.table[g] == 0 && !h.store.in_ram(g) && !inflight.contains(&g));
+            let wb = self.wb.clone();
+            self.pending_ram.retain(|g| !wb.contains(g));
+            self.pending_ram.extend(wb); // popped before the candidates
+        }
         sh.promo_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
@@ -966,7 +1012,7 @@ impl Loop {
 
     /// Clears the in-flight set once the copies landed (`wait` blocks for them).
     fn finish_copies(&mut self, sh: &Shared, wait: bool) {
-        if self.inflight.is_empty() {
+        if self.inflight.is_empty() && self.d2h.is_empty() {
             return;
         }
         let _not_capturing = sh.capture.lock().unwrap();
@@ -978,6 +1024,16 @@ impl Loop {
         };
         if done {
             self.inflight.clear();
+            // the swapped-out victims landed in their RAM places
+            for (v, p) in std::mem::take(&mut self.d2h) {
+                let c = self.host.layer_class[v / self.host.n_expert];
+                if self.host.store.adopt(v, p) {
+                    let a = self.host.store.ram_device_addr(v);
+                    self.write_rentry(v, a);
+                } else {
+                    self.host.store.free_place(c, p);
+                }
+            }
         }
     }
 
@@ -1009,9 +1065,25 @@ impl Loop {
             let inflight = &self.inflight;
             let pre_inflight = &self.pre_inflight;
             let victim = (0..h.table.len()).filter(|&x| h.store.in_ram(x) && h.layer_class[x / ne] == c && h.table[x] == 0 && !inflight.contains(&x) && !pre_inflight.contains(&x)).min_by(|&a, &b| h.score[a].partial_cmp(&h.score[b]).unwrap());
+            // QX_DS_RAM_DEDUP=1: a RAM copy of a record that is resident in VRAM serves nobody (the tiers are
+            // inclusive only for promoted records: the initial VRAM residents have no RAM copy, and a VRAM victim
+            // without one falls to NVMe while its replacement holds a slot and a place). Such a copy is evicted
+            // first, the hottest resident's first (the least likely to leave VRAM), without the margin test.
+            // Residents of the flex tail keep theirs: the refill after a chunk reads it.
+            let dup = if ram_dedup() {
+                let (fp, fb) = (h.flex_ptr, h.flex_bytes);
+                let in_tail = |x: usize| fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp;
+                (0..h.table.len()).filter(|&x| h.table[x] != 0 && h.layer_class[x / ne] == c && h.store.in_ram(x) && !inflight.contains(&x) && !pre_inflight.contains(&x) && !in_tail(x)).max_by(|&a, &b| h.score[a].partial_cmp(&h.score[b]).unwrap())
+            } else {
+                None
+            };
+            let victim = if dup.is_some() { dup } else { victim };
             let Some(v) = victim else { return true };
-            if h.score[g] <= h.score[v] * (1.0 + h.margin) {
+            if dup.is_none() && h.score[g] <= h.score[v] * (1.0 + h.margin) {
                 return true;
+            }
+            if dup.is_some() {
+                sh.ram_dedups.fetch_add(1, Ordering::Relaxed);
             }
             self.write_rentry(v, 0);
             if self.host.gpu_reads_ram {
@@ -1029,6 +1101,22 @@ impl Loop {
         sh.promo_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         true
     }
+}
+
+/// Whether the RAM copies of VRAM residents are reclaimed (`QX_DS_RAM_DEDUP`, default 2; 0 = the tiers as before
+/// 2026-11-10, when an evicted initial resident fell to NVMe and its replacement held a slot and a RAM place:
+/// over half of decode256k's NVMe fetches). Measured on decode256k / serve256k3: off 42.0 / 93.0, 1 (RAM
+/// promotions evict such copies first, victims queued for an NVMe read) 41.2 / 88.3, 2 (victims copied back
+/// from their slot) 38.3 / 87.6.
+pub fn ram_dedup() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QX_DS_RAM_DEDUP").map_or(true, |v| v != "0"))
+}
+
+/// `QX_DS_RAM_DEDUP=2` (the default): VRAM victims without a RAM copy are copied back from their slot (1: NVMe queue only).
+pub fn swap_mode() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QX_DS_RAM_DEDUP").map_or(true, |v| v == "2" || v == "swap"))
 }
 
 /// The mailbox offset of the "all routed experts" list (`MB_ALL` in qx_sys.cuh).
@@ -1057,7 +1145,7 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     let n_stage_streams = n_stage_streams();
     let stage_streams: Vec<cudarc::driver::sys::CUstream> = (0..n_stage_streams).map(|_| unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("stage stream")).collect();
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
-    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
+    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), wb: Vec::new(), d2h: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
     for par in 0..2 {
         lp.pre_free[par] = (0..lp.host.pre_slots).map(|i| lp.host.pred_stage_base + ((par * lp.host.pre_slots + i) * lp.host.rec_max) as u64).collect();
     }
