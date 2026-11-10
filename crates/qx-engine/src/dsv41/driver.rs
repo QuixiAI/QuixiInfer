@@ -801,7 +801,10 @@ impl Loop {
             into_vram.push(g);
             sh.vram_promos.fetch_add(1, Ordering::Relaxed);
         }
-        if !into_vram.is_empty() || !self.d2h.is_empty() {
+        // only when this call issued copies (`vram_ok`): with the previous tick's copies still in flight nothing
+        // was issued, and `inflight` must keep naming them (the breaker, 2026-11-10: overwritten with the empty
+        // plan, their RAM places passed for unread duplicates and were reused under the queued copies)
+        if vram_ok && (!into_vram.is_empty() || !self.d2h.is_empty()) {
             unsafe { cudarc::driver::result::event::record(self.copy_event, self.stream).expect("event record") };
             self.inflight = into_vram;
         }
@@ -812,7 +815,8 @@ impl Loop {
         if !self.wb.is_empty() {
             let h = &self.host;
             let inflight = &self.inflight;
-            self.wb.retain(|&g| h.table[g] == 0 && !h.store.in_ram(g) && !inflight.contains(&g));
+            // (a place already assigned means the read is pending or done: not queued again)
+            self.wb.retain(|&g| h.table[g] == 0 && h.store.place[g] == 0 && !inflight.contains(&g));
             let wb = self.wb.clone();
             self.pending_ram.retain(|g| !wb.contains(g));
             self.pending_ram.extend(wb); // popped before the candidates
@@ -1070,7 +1074,7 @@ impl Loop {
             // without one falls to NVMe while its replacement holds a slot and a place). Such a copy is evicted
             // first, the hottest resident's first (the least likely to leave VRAM), without the margin test.
             // Residents of the flex tail keep theirs: the refill after a chunk reads it.
-            let dup = if ram_dedup() {
+            let dup = if ram_dedup() && !h.gpu_reads_ram {
                 let (fp, fb) = (h.flex_ptr, h.flex_bytes);
                 let in_tail = |x: usize| fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp;
                 (0..h.table.len()).filter(|&x| h.table[x] != 0 && h.layer_class[x / ne] == c && h.store.in_ram(x) && !inflight.contains(&x) && !pre_inflight.contains(&x) && !in_tail(x)).max_by(|&a, &b| h.score[a].partial_cmp(&h.score[b]).unwrap())

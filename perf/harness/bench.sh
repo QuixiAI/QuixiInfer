@@ -259,7 +259,7 @@ info = {
              "vram": gpu[3] if len(gpu) > 3 else "", "cpu": cpu, "ram_gib": mem_gib, "kernel": platform.release(),
              "rustc": sh("rustc", "--version")},
     "settings": base, "experiment_env": extra, "cases": cases.split(","), "repeats": int(repeats),
-    "correctness": check, "commands": sorted(set(cmds)),
+    "correctness": check, "identity": rd("identity.txt").splitlines(), "commands": sorted(set(cmds)),
 }
 json.dump(info, open(os.path.join(run, "run.json"), "w"), indent=2)
 EOF
