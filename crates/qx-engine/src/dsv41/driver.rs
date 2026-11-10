@@ -61,6 +61,7 @@ pub struct Shared {
     pub pre_issued: AtomicU64,
     pub pre_used: AtomicU64,
     pub pre_nvme: AtomicU64,
+    pub pre_skipped: AtomicU64,
     pub stage_ns: AtomicU64,
     /// Set by the host after each token (the sampled token is known): the driver may run its promotions.
     pub tokens_done: AtomicU64,
@@ -208,6 +209,7 @@ impl Driver {
             pre_issued: Default::default(),
             pre_used: Default::default(),
             pre_nvme: Default::default(),
+            pre_skipped: Default::default(),
             tokens_done: Default::default(),
             profile_req: AtomicBool::new(false),
             profile: std::sync::Mutex::new(None),
@@ -283,7 +285,14 @@ struct Loop {
     /// The prefetch: predicted experts per token to fetch (0: off), the last prediction header seen, and per layer
     /// parity the live speculative slots (record, slot) and the free ones.
     pref_k: usize,
+    pref_cap: usize,
     pref_last: u64,
+    /// The speculative copies' own stream and event, whether a batch is still in flight, and the records it reads
+    /// (their RAM places must not be evicted until it lands).
+    pre_stream: cudarc::driver::sys::CUstream,
+    pre_event: cudarc::driver::sys::CUevent,
+    pre_busy: bool,
+    pre_inflight: Vec<usize>,
     pre_live: [Vec<(usize, u64)>; 2],
     pre_free: [Vec<u64>; 2],
 }
@@ -861,6 +870,23 @@ impl Loop {
             return false;
         }
         self.pref_last = hdr;
+        // No backlog, ever: a new batch (clears, copies, entries) is issued only once the previous one has fully
+        // landed, so everything issued here starts at once. That is what makes recycling safe (the clears land
+        // within microseconds, long before any later job can look those experts up; a backlog could let a job
+        // find an entry whose slot is then overwritten under it) and it keeps the copies inside the layer's idle
+        // bus time. A prediction that arrives while a batch is in flight is skipped: its slots stay as they are,
+        // still valid residents.
+        if self.pre_busy {
+            let _not_capturing = sh.capture.lock().unwrap();
+            let done = unsafe { cudarc::driver::result::event::query(self.pre_event).is_ok() };
+            drop(_not_capturing);
+            if !done {
+                sh.pre_skipped.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            self.pre_busy = false;
+            self.pre_inflight.clear();
+        }
         let l = (hdr & 0xff) as usize;
         let ntok = ((hdr >> 8) & 0xffff) as usize;
         let ne = self.host.n_expert;
@@ -868,13 +894,7 @@ impl Loop {
             return true;
         }
         let par = l & 1;
-        // recycle the parity's slots and clear the table entries they held
-        let live = std::mem::take(&mut self.pre_live[par]);
-        for &(g, slot) in &live {
-            self.write_entry_pre(g, 0);
-            self.pre_free[par].push(slot);
-        }
-        // the predicted experts of this layer, distinct, hottest-ranked first (token order, then rank)
+        // the predicted experts of this layer, distinct, best-ranked first (rank, then token)
         let pk = mailbox::PRED_K;
         let pred: Vec<i32> = sh.mb.slice::<i32>(mailbox::mb_pred(self.host.n_embd, l), ntok * pk).to_vec();
         let mut want: Vec<usize> = Vec::with_capacity(ntok * self.pref_k);
@@ -889,14 +909,26 @@ impl Loop {
                 }
             }
         }
-        // the speculative copies join the promotion copies' in-flight set and event (the set keeps their RAM places
-        // from being evicted until the event, which is re-recorded after the newest copy); never block here: the
-        // driver must be free to answer the real post that follows the prediction by ~0.5 ms
-        self.finish_copies(sh, false);
+        // keep what this parity already holds for this layer (an entry from an earlier token is a valid resident);
+        // recycle the rest, clears first
+        let live = std::mem::take(&mut self.pre_live[par]);
+        let mut issued_any = false;
+        for (g, slot) in live {
+            if want.contains(&g) {
+                self.pre_live[par].push((g, slot));
+            } else {
+                self.write_entry_pre(g, 0);
+                self.pre_free[par].push(slot);
+                issued_any = true;
+            }
+        }
         let mut issued = 0u64;
         for g in want {
-            if self.host.table[g] != 0 {
-                continue;  // resident already
+            if issued as usize >= self.pref_cap {
+                break;
+            }
+            if self.host.table[g] != 0 || self.pre_live[par].iter().any(|&(x, _)| x == g) {
+                continue; // resident already (in the tier or in a speculative slot)
             }
             if !self.host.store.in_ram(g) {
                 // NVMe only: a RAM promotion now, for the next time this expert is predicted or routed
@@ -910,15 +942,16 @@ impl Loop {
             let ptr = self.host.store.place[g] as *const u8;
             let nb = self.host.store.record_bytes(g);
             unsafe {
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(slot, ptr as *const _, nb, self.stream).result().expect("prefetch copy");
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(slot, ptr as *const _, nb, self.pre_stream).result().expect("prefetch copy");
             }
             self.write_entry_pre(g, slot);
-            self.inflight.push(g);
+            self.pre_inflight.push(g);
             self.pre_live[par].push((g, slot));
             issued += 1;
         }
-        if issued > 0 {
-            unsafe { cudarc::driver::result::event::record(self.copy_event, self.stream).expect("event record") };
+        if issued > 0 || issued_any {
+            unsafe { cudarc::driver::result::event::record(self.pre_event, self.pre_stream).expect("event record") };
+            self.pre_busy = true;
             sh.pre_issued.fetch_add(issued, Ordering::Relaxed);
         }
         true
@@ -927,7 +960,7 @@ impl Loop {
     /// Writes the prestaged table's entry for `g` on the copy stream (behind the record's copy when nonzero).
     fn write_entry_pre(&mut self, g: usize, v: u64) {
         let dst = self.host.prestaged_dev + 8 * g as u64;
-        let st = self.stream;
+        let st = self.pre_stream;
         self.write_word_on(st, dst, v);
     }
 
@@ -974,7 +1007,8 @@ impl Loop {
             }
             let h = &self.host;
             let inflight = &self.inflight;
-            let victim = (0..h.table.len()).filter(|&x| h.store.in_ram(x) && h.layer_class[x / ne] == c && h.table[x] == 0 && !inflight.contains(&x)).min_by(|&a, &b| h.score[a].partial_cmp(&h.score[b]).unwrap());
+            let pre_inflight = &self.pre_inflight;
+            let victim = (0..h.table.len()).filter(|&x| h.store.in_ram(x) && h.layer_class[x / ne] == c && h.table[x] == 0 && !inflight.contains(&x) && !pre_inflight.contains(&x)).min_by(|&a, &b| h.score[a].partial_cmp(&h.score[b]).unwrap());
             let Some(v) = victim else { return true };
             if h.score[g] <= h.score[v] * (1.0 + h.margin) {
                 return true;
@@ -1017,11 +1051,13 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     qx_gpu::mem::bind();
     let pool = Pool::new(&cpus);
     let stream = unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("copy stream");
+    let pre_stream = unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("prefetch stream");
+    let pre_event = cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("prefetch event");
     let copy_event = cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("copy event");
     let n_stage_streams = n_stage_streams();
     let stage_streams: Vec<cudarc::driver::sys::CUstream> = (0..n_stage_streams).map(|_| unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("stage stream")).collect();
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
-    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_last: 0, pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
+    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
     for par in 0..2 {
         lp.pre_free[par] = (0..lp.host.pre_slots).map(|i| lp.host.pred_stage_base + ((par * lp.host.pre_slots + i) * lp.host.rec_max) as u64).collect();
     }

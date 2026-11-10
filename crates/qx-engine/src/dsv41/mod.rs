@@ -1485,7 +1485,7 @@ impl<'a> DsEngine<'a> {
             let calls = g(&sh.tl_calls).max(1) as f64;
             let us = |a: &std::sync::atomic::AtomicU64| g(a) as f64 / 1e3 / calls;
             let pre = if g(&sh.pre_issued) > 0 || g(&sh.pre_used) > 0 {
-                format!(" | prefetch issued {} used {} nvme {}", g(&sh.pre_issued), g(&sh.pre_used), g(&sh.pre_nvme))
+                format!(" | prefetch issued {} used {} nvme {} skipped {}", g(&sh.pre_issued), g(&sh.pre_used), g(&sh.pre_nvme), g(&sh.pre_skipped))
             } else {
                 String::new()
             };
