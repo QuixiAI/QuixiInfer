@@ -509,13 +509,15 @@ pub fn row_hashes(out: &[f32], rows: usize) -> String {
 }
 
 /// `QX_DS_PREDICT`: 0 off, 1 `pre` (the layer's router on the pre-attention residual), 2 `next` (the next layer's
-/// router on this layer's FFN input). Scored in the stats line. `pre` is also what the prefetch (`QX_DS_PREFETCH`)
+/// router on this layer's FFN input), 3 `mix` (`pre` computed after the layer's own attention-side hc terms, whose
+/// pre-mix it reuses instead of recomputing: the same guess on engram-free layers, at `next`'s cost). Scored in the stats line. `pre` is also what the prefetch (`QX_DS_PREFETCH`)
 /// consumes, so it is on whenever the prefetch is.
 pub fn predict_mode() -> u8 {
     static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *M.get_or_init(|| match std::env::var("QX_DS_PREDICT").as_deref() {
         Ok("pre") | Ok("1") => 1,
         Ok("next") | Ok("2") => 2,
+        Ok("mix") | Ok("3") => 3,
         _ => if prefetch_k() > 0 { 1 } else { 0 },
     })
 }
@@ -669,6 +671,8 @@ pub fn pin_engine_early() {
     let cores = physical_cores();
     let pool = pool_cpus();
     let Some(main) = main_cpu() else { return };
+    // the host process's own threads (a server's main, HTTP and scheduler threads): `place_threads` leaves them alone
+    let _ = HOST_TIDS.set(task_tids());
     debug_assert!(!pool.contains(&main));
     let _ = rayon::ThreadPoolBuilder::new().num_threads(cores.len().max(1)).build_global();
     let ok = pin_thread(main);
@@ -684,11 +688,22 @@ pub fn pin_engine_early() {
 /// ran on every core, and before the pool exists, so pool workers (which pin themselves) are untouched. The old
 /// form pinned the engine thread before CUDA initialised, which confined CUDA's threads and the fill to one CPU
 /// (2026-11-08: the tier fill 8 -> 12 s, warm-up 15 -> 22 s).
+/// Threads that existed before `pin_engine_early` belong to the host process (in the server: the main thread and
+/// the HTTP runtime's workers) and are NOT moved unless `QX_DS_HELPERS=all`: on the engine's CPU they time-share
+/// with a thread that spins for the whole request, and the server's time to first token at concurrency 3 went
+/// bimodal (1.8 s or 2.8 s at 8k, 1.9 or 3.4 at 256k; 2026-11-09, the breaker's finding on the placement).
+static HOST_TIDS: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+
+fn task_tids() -> Vec<i32> {
+    std::fs::read_dir("/proc/self/task").map(|rd| rd.flatten().filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok()).collect()).unwrap_or_default()
+}
+
 pub fn place_threads() {
     let Some(main) = main_cpu() else { return };
     let pool = pool_cpus();  // before the pin narrows this thread's mask (physical_cores reads it)
     let mode = std::env::var("QX_DS_HELPERS").unwrap_or_default();
     let helpers_free = mode == "free";
+    let host: &[i32] = if mode == "all" { &[] } else { HOST_TIDS.get().map_or(&[], |v| v.as_slice()) };
     let sib = siblings_of(main);
     // `same` (default): the helpers time-share the engine's own CPU (what the first placement did by accident and
     // what measured best: the spinning CUDA thread and the engine thread throttle each other); `sibling`: on the
@@ -696,20 +711,22 @@ pub fn place_threads() {
     // measured 2026-11-08 (decode256k, three repeats each): same 42.0, sibling 44.2, free 44.5: `same` is the default
     let helper_cpus: Vec<usize> = if mode == "sibling" && !sib.is_empty() { sib } else { vec![main] };
     let me = unsafe { libc::gettid() };
-    let mut moved = 0usize;
+    let (mut moved, mut kept) = (0usize, 0usize);
     if !helpers_free {
-        if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
-            for e in rd.flatten() {
-                let Ok(tid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
-                if tid != me && set_affinity(tid, &helper_cpus) {
-                    moved += 1;
-                }
+        for tid in task_tids() {
+            if tid == me {
+                continue;
+            }
+            if host.contains(&tid) {
+                kept += 1;
+            } else if set_affinity(tid, &helper_cpus) {
+                moved += 1;
             }
         }
     }
     let ok = pin_thread(main);
     if std::env::var("QX_DS_VERBOSE").is_ok() || !ok {
-        eprintln!("cpus: pool on {pool:?}, engine thread on {main}{}, {moved} other threads on {:?}", if ok { "" } else { " (pin failed)" }, if helpers_free { vec![] } else { helper_cpus.clone() });
+        eprintln!("cpus: pool on {pool:?}, engine thread on {main}{}, {moved} other threads on {:?}, {kept} host threads left alone", if ok { "" } else { " (pin failed)" }, if helpers_free { vec![] } else { helper_cpus.clone() });
     }
 }
 
@@ -1361,17 +1378,24 @@ impl<'a> DsEngine<'a> {
     /// `pre`: layer `l`'s own router on the residual before `l`'s attention (the FFN pre-mix terms `pre_a` are
     /// computable there; what is missing is the attention's update of `r`). The guess is available one attention +
     /// dense phase ahead of the real routing.
-    fn predict_pre(&self, l: usize, t: usize) {
+    /// `shared` (`QX_DS_PREDICT=mix`): called from `layer_attn` right after the real `hc_terms` wrote `pre_a` (the
+    /// FFN input's pre-mix, computed on the residual before the attention's update): only the mix application, the
+    /// norm and the router are the predictor's own.
+    fn predict_pre(&self, l: usize, t: usize, shared: bool) {
         let Some(d) = self.driver.as_ref() else { return };
         if prefetch_k() > 0 && t > 8 {
             return;
         }
         let (c, w, s) = (&self.cfg, &self.layers[l], &self.s);
         let hcd = c.hc * E;
-        self.rms(s.r.ptr, s.ones.ptr, s.rn_p.ptr, hcd, t);
-        self.k("qx_ds_hc_mixes", 256, (24, HC_SPLIT as u32, t as u32), &[w.hc_attn.fn_.ptr, s.rn_p.ptr, s.mixes_p.ptr, hcd as u64, 24]);
-        self.k("qx_ds_hc_terms", 32, (t as u32, 1, 1), &[s.mixes_p.ptr, w.hc_attn.scale.ptr, w.hc_attn.base.ptr, s.pre_p.ptr, s.post_p.ptr, s.comb_p.ptr, bits(c.hc_eps), 20, HC_SPLIT as u64, s.mixsum_p.ptr]);
-        self.k("qx_ds_hc_pre", 256, ((E as u32).div_ceil(256), t as u32, 1), &[s.r.ptr, s.pre_p.ptr, s.xpre_p.ptr, E as u64, c.hc as u64]);
+        if shared {
+            self.k("qx_ds_hc_pre", 256, ((E as u32).div_ceil(256), t as u32, 1), &[s.r.ptr, s.pre_a.ptr, s.xpre_p.ptr, E as u64, c.hc as u64]);
+        } else {
+            self.rms(s.r.ptr, s.ones.ptr, s.rn_p.ptr, hcd, t);
+            self.k("qx_ds_hc_mixes", 256, (24, HC_SPLIT as u32, t as u32), &[w.hc_attn.fn_.ptr, s.rn_p.ptr, s.mixes_p.ptr, hcd as u64, 24]);
+            self.k("qx_ds_hc_terms", 32, (t as u32, 1, 1), &[s.mixes_p.ptr, w.hc_attn.scale.ptr, w.hc_attn.base.ptr, s.pre_p.ptr, s.post_p.ptr, s.comb_p.ptr, bits(c.hc_eps), 20, HC_SPLIT as u64, s.mixsum_p.ptr]);
+            self.k("qx_ds_hc_pre", 256, ((E as u32).div_ceil(256), t as u32, 1), &[s.r.ptr, s.pre_p.ptr, s.xpre_p.ptr, E as u64, c.hc as u64]);
+        }
         self.rms(s.xpre_p.ptr, w.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l) as u64;
@@ -2122,7 +2146,7 @@ impl<'a> DsEngine<'a> {
                     self.layer_init(t, &mut None);
                 }
                 if predict_mode() == 1 {
-                    self.predict_pre(l, t);
+                    self.predict_pre(l, t, false);
                 }
                 went_on = self.layer_attn(l, t, pos0 + r0, pos0 + r0 + t - 1, &mut None, kv_only);
                 if !went_on {
@@ -2509,7 +2533,7 @@ impl<'a> DsEngine<'a> {
         self.layer_init(t, &mut act);
         for l in 0..self.cfg.n_layer {
             if predict_mode() == 1 {
-                self.predict_pre(l, t);
+                self.predict_pre(l, t, false);
             }
             if !self.layer_attn(l, t, pos, last, &mut act, kv_only) {
                 return;
@@ -2570,6 +2594,9 @@ impl<'a> DsEngine<'a> {
         }
         // attention
         self.hc_terms(&w.hc_attn, &self.s.pre_a, t);
+        if predict_mode() == 3 {
+            self.predict_pre(l, t, true);
+        }
         self.dump(format!("hc_mixes-{l}"), &self.s.mixsum, 24, act);
         self.dump(format!("hc_pre-{l}"), &self.s.pre_a, hc, act);
         self.dump(format!("hc_post-{l}"), &self.s.post, hc, act);

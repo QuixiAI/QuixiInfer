@@ -2347,3 +2347,125 @@ behind each other and are skipped or late. The `pre` arm at one copy gains about
 predictor (which recomputes the layer's pre-FFN mix). ds-checks pass with the prefetch on in both builds. Verdict:
 CANDIDATE, off by default; the follow-up that would unlock more is a `pre` predictor at `next`'s cost (reuse the
 mix) and a re-measure at the standard tier on a clean box. Budget used: five builds; two more allowed.
+
+## 2026-11-09: Set D re-baselined on the clean box (VM off, driver 620.70.06 fork; HEAD f595c43 = chunk51: placement + exactness fix) — 29.514, correctness pass, identity 3/3; adjudicator HOLD (round 1 ran beside a driver install: re-run)
+
+Status: candidate for promotion as the NEW baseline (a host change: every earlier score is driver 595.99.02, latterly with the VM up).
+Preflight (22:17): win10 shut off; memory 3 GiB used / 105 free, swap 0 used; pressure some avg10 0.05 (avg60 4.25:
+the tail of the warm-up chunk pass that ran just before); tmpfs 61 MiB; no other engine; driver 620.70.06 (the
+user's fork), JIT cache warmed by a ds-checks pass and a 16k chunk pass on this driver first.
+Run: `perf/results/2026-11-09/setd-620-221741`, `--check` pass, 3 repeats, standard settings.
+
+| case | baseline 30.047 (595.99.02) | this run | change | spread |
+|---|--:|--:|--:|--:|
+| decode256k | 45.10 | 42.40 | -6.0% | 5.7% |
+| prefill256k | 5.60 | 5.70 | +1.8% | 0.0% |
+| serve256k1 | 44.39 | 40.24 | -9.3% | 11.5% |
+| serve256k3 | 107.41 | 106.38 | -1.0% | 3.0% |
+| decode | 34.60 | 31.50 | -9.0% | 7.9% |
+| prefill128 | 11.00 | 10.60 | -3.6% | 2.8% |
+| serve1 | 38.65 | 36.11 | -6.6% | 3.4% |
+| serve3 | 96.81 | 94.25 | -2.6% | 2.4% |
+
+Score 30.047 -> 29.514 (-1.8%). The gate warns that the driver differs: this is not a like-for-like A/B of a code
+change; it is the first row of a new host state, carrying the thread placement (df104c7 / 176f115: decode256k
+45.0 -> 42.0 in its own same-session A/B, notebook 97-98) and the exactness fix (165a674, no speed).
+Counters: decode256k repeats 44.6 / 42.4 / 42.2 with pool 1,825 / 1,677 / 1,641 ms per 64 tokens and serve gap
+1,463 / 1,177 / 1,181 us per layer: the first repeat is in the slow mode (the same signature as the memory-pressure
+mode of notebook 106), repeats 2 and 3 in the fast one; `decode` (33.8 / 31.5 / 31.3; pool 17,326 / 14,943 /
+14,931) and prefill128 (10.8 / 10.5 / 10.6) show the same. Cause (found by the adjudicator, not by me): the box
+was not quiet for round 1. A session in `~/git/quixi-nvidia-driver` ran `make modules_install -j8`, `depmod` and
+`update-initramfs -u` twice from 22:26:41 to 22:28:27, ending 29 s before decode256k-1, and `sar -B` shows reclaim
+active through 22:30 (pgscank 22,725/s, pgsteal 44,163/s) and gone by 22:50. The loaded module is still the build
+stamped Mon Nov 9 05:34:46 PM EST 2026 (`/proc/driver/nvidia/version`); the on-disk modules were reinstalled at 22:26:59.
+Server identity on the same binaries, three runs after the set D: identical x3 against
+`perf/results/2026-11-07/srv2-chunk32/srv2-0.dump.jsonl` (`perf/results/2026-11-09/rebase-620/`); the ds-checks'
+mixed-sequence line (cold widths, all rows) passes inside `--check`.
+prefill256k +1.8% at zero spread (5.6 -> 5.7, a 0.1 ms display step): below the bar; watch it on the next row.
+Decision: **adjudicator HOLD** ("internally consistent and exact, but its first round of cases was measured in the
+slow mode while the box was reclaiming memory, so it cannot serve as the baseline of the new host state"). What
+lifts it: a set D `--check` re-run on a quiet box with the preflight taken immediately before (including the
+kcompactd/ksmd/compile line), every case in one mode (decode256k spread <= 3%, decode <= 4%, counters not split);
+`qx-ds-multi` built from the candidate tree and passing all rows (the chain copied only qx-ds-check and quixiinfer;
+the installed qx-ds-multi was a 20:22 build); the driver build stamp in the scoreboard note. Not promoted.
+A clean-box control twelve minutes after this run: decode256k 42.1 / 42.1 / 41.9 (`mix-off`), pool 1,648, gap 1,179.
+
+## 2026-11-09: Prefetch with the shared-mix predictor (`QX_DS_PREDICT=mix`), standard tier, clean box — CANDIDATE (-3.0%; budget closed)
+
+Hypothesis: the `pre` predictor's 1.3 ms was mostly the hc terms it recomputed; the layer computes the same terms
+(`hc_terms(hc_attn)` into `pre_a`) at the top of `layer_attn`, so a predictor launched right after them needs only
+the mix application, one norm and the router GEMV. Counter: decode256k, and the predictor-only arm.
+Change: `QX_DS_PREDICT=mix` (mode 3), chunk52. Kill criterion written before the build: below 3% against the
+control at the standard tier, the prefetch stops here (build 6 of the 7 budgeted).
+decode256k, standard settings (QX_DS_RAM=100), preflight clean (VM off, pressure 0.00), three repeats per arm:
+
+| arm | ms per token | pool records / staged / NVMe per 64 tokens | host call us | gap us |
+|---|---|---|--:|--:|
+| off | 42.1 / 42.1 / 41.9; 41.8 / 41.8 / 41.7; 41.8 x3 | 3,395 / 2,034 / 556 | 705-709 | 1,157-1,179 |
+| `pre` K=6, 1 copy | 40.8 / 41.1 / 40.9 | 2,467 / 1,482 / 513 | 616 | 1,268 |
+| `mix` K=6, 1 copy | 41.0 / 40.6 / 40.7; 40.5 / 40.7 / 40.2 | 2,491 / 1,494 / 513 | 627 | 1,235 |
+| `mix` K=12, 1 copy | 40.8 / 40.7 / 40.7 | 2,487 / 1,494 / 515 | 627 | 1,235 |
+| `mix` K=6, 2 copies | 42.4 / 42.4 / 42.2 | 2,384 / 1,431 / 500 | 664 | 1,244 |
+| `mix` predictor only | 43.0 / 42.9 / 43.0 | 3,395 / 2,034 / 557 | 711 | 1,200 |
+
+Reading: `mix` 40.6 against 41.85 (mean of the controls' medians): -3.0%; `pre` -2.3%. The predictor alone still
+costs +1.1 ms (four launches per layer: mix application, norm, router GEMV, top-k), so the copies themselves are
+worth 2.3 ms and a free predictor would give about -5.5%. The host side gets what the outsider's arithmetic
+predicted (host call 707 -> 627 us per layer, 14 pool records and 8 staged per token removed), and the GPU side
+gives 2.2 ms of it back (gap +56 us per layer: 0.9 the predictor, the rest the 24 more records per token that GPU
+expert kernels now run and the post). Two copies per layer lose again (issued 4,318, used 2,160): the second copy
+runs into the host window. ds-checks with `mix` K=6 one copy: pass (all nine lines).
+Verdict: CANDIDATE, off by default. A complexity-adding change needs 8%; the measured ceiling of this design (one
+copy per layer, the lead of one attention phase) is ~5.5% with a free predictor. Budget closed at six builds. Re-open
+if a source of lead longer than one attention phase appears (a probe two layers ahead, or copies that do not
+contend with the pool for DRAM: NVMe-to-BAR1 peer-to-peer, backlog).
+
+## 2026-11-09: How much a GiB of VRAM tier is worth at 256k — MEASURED (presupposition row 8: payoff revised down)
+
+decode256k, clean box, three repeats: 15.4 GiB tier (1,613 records; the standard) 41.8 x3; 13.0 GiB (1,354)
+43.5 / 43.6 / 43.6; 11.0 GiB (1,145) 44.3 / 44.4 / 44.4. VRAM-served selections per token 147.1 / 139.4 / 131.5.
+Slope: 0.75 ms per GiB over the last 2.4 GiB, 0.40 over the 2 before: flattening as the tier grows (the ranking's
+tail). Extrapolated, the ~8 GiB that the latent KV rows hold would be worth at most 3.5-4.5 ms as experts
+(likely less: the slope keeps falling), against +0.9 to +3.3 ms for gathering 512 rows per layer per token from
+host memory: net -3 ms at the very best, around zero at the measured 7 GB/s gather rate. Row 8's predicted
+"-7 ms of waits vs +3 of gathers" does not survive; the latent-rows-to-host build is not worth starting for
+decode256k. (For serve256k3, which is bytes-bound, each GiB is worth more: re-rate there if serve stays the gap.)
+
+## 2026-11-09: The decode staging share after the placement fix — MEASURED (row 12 held)
+
+decode256k, clean box, three repeats: share 2/8 41.7 x3, 3/8 (default) 41.8 x3, 5/8 42.7 / 42.6 / 42.6. Flat
+between 2 and 3, worse at 5: with the pool at 0.27 ms per record the balance has not moved. No change.
+
+## 2026-11-10: The placement swept the server's own threads onto the engine's spinning CPU — FIXED (TTFT at concurrency 3: 1.8 s every run, was 2.8-3.3 s in 4 of 6); found by the breaker
+
+The breaker's finding on the placement diff: `place_threads` pinned every other thread of the process to the
+engine's CPU; in the server that includes the main thread and the HTTP runtime's workers (`23 other threads on
+[15]`), which then time-share with a thread that spins for the whole request. The setd-620 serve "gains" were this:
+per-request ms counts after the first token, and the first token came a second later in 6 of 9 concurrency-3
+sessions (0 of 6 on the baseline); wall time and aggregate tok/s were unchanged.
+Change (chunk53): `pin_engine_early` records the threads that exist before it (the host process's own);
+`place_threads` leaves those unpinned (`QX_DS_HELPERS=all` restores the full sweep). qx-ds-check has no such
+threads: its placement is unchanged by construction (`0 host threads left alone`).
+Arms, same binaries, clean box, three repeats, (ms per token per request, TTFT median s, aggregate tok/s):
+
+| case | new default | `QX_DS_HELPERS=all` (the old sweep) |
+|---|---|---|
+| serve3 | 96.15 / 1.73 / 28.75, 96.06 / 1.79 / 28.72, 96.43 / 1.80 / 28.63; again 96.71 / 1.75, 96.81 / 1.80, 96.90 / 1.80 | 94.52 / 2.76 / 28.48, 93.90 / 2.83 / 28.56, 96.06 / 1.77 / 28.65 |
+| serve256k3 | 106.84 / 1.89 / 25.96, 106.16 / 1.90 / 26.10, 105.82 / 1.88 / 26.13 | 103.73 / 3.32 / 25.76, 104.82 / 3.32 / 25.55, 106.38 / 1.88 / 26.02 |
+| serve1 | 38.79, 38.99, 36.98; 37.02, 36.31, 34.76 | 37.33, 38.37, 37.45 |
+| serve256k1 | 37.59, 39.05, 41.24 | 38.94, 37.58, 40.23 |
+
+New default: TTFT 1.73-1.90 s in 9 of 9 concurrency-3 sessions and aggregate tok/s equal or better; the sweep: slow
+TTFT in 4 of 6. serve3 per-request is 96.1-96.9, the baseline's 96.81: the placement gives the server's
+concurrency-3 decode nothing (it is bytes-bound) and the forced decode cases 6-9%.
+Other arms of the chain: prefill256k 5.7 / 5.6 / 5.6 default, 5.6 x3 with `QX_DS_HELPERS=free` (the breaker's
+item 6: no difference; the +1.8% of setd-620 was its disturbed round). decode256k with the pre-placement layout
+(`QX_DS_MAIN_CPU=none QX_DS_CPUS=0-15`): 44.1 / 43.8 / 44.3 against the default's 41.7-42.1 in nine clean
+repeats an hour earlier: the placement, not the driver, is the 2 ms (the breaker's item 4), with the caveat below.
+**Open: the slow mode is still here on the clean box.** The default's decode256k right after a server case read
+44.5 / 44.2 / 41.8 (pool 1,819 / 1,846 / 1,648 ms, gap 1,487 / 1,460 / 1,169). `kcompactd0` burns 5-100% of a CPU
+in bursts while an engine holds the pinned tier (free order-10 blocks at 0; `vm.compaction_proactiveness` = 20),
+on CPUs 16-21, the SMT siblings of pool cores 0-5 (`~/qx-chains/kcompactd.log`, sampled every 10 s from 00:48).
+Engine reads are already O_DIRECT, THP is madvise-only and unused: the compaction is the kernel's proactive
+pass over what the 100 GiB pinned tier leaves free. Not yet shown repeat by repeat; the sampler now runs beside
+every chain. The cure (a sysctl) needs sudo: the user's call.
