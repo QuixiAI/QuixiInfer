@@ -2578,3 +2578,56 @@ the place for v when the copy event fires (`finish_copies`); until then v is not
 promotions are planned. Residency only: the weights are read-only and the same bytes come back.
 The serve session's TTFT 3.16 s is the 96-wide first-use window again (see the entry above), to confirm.
 `QX_DS_RAM_DEDUP` defaults to 2 from chunk59 (0 restores the old tiers).
+
+## 2026-11-10: Set D on the new host state: placement, narrow staged share, exclusive tiers — score 30.047 -> 26.925 (-10.4%); promotion run `perf/results/2026-11-10/setd-promo-052925` (adjudication below)
+
+NEW HOST STATE against every earlier scoreboard row (all on driver 595.99.02, the last ones with the win10 VM
+running): NVIDIA driver 620.70.06 (the user's fork, open kernel module built 2026-11-09 17:34 EST), win10 VM shut
+off, `vm.compaction_proactiveness` 0 (the user, 2026-11-10 04:33:49; not persistent across a reboot). Same case
+settings as the 30.047 row. Tree 4ee0e73, clean (binaries chunk60: qx-ds-check 62323a792596, quixiinfer
+d68e6df3af5d). Since the 30.047 row the tree gained: the engine thread on its own core with the pool on the
+other 15 (df104c7 / 176f115), the staged-fallback exactness fix (165a674), the server's own threads kept off the
+engine's CPU (6e0a8bc), widths 2-3 on a 4/8 staged share (0bc58dc), exclusive tiers (270c920 + the breaker's fix
+4ee0e73); prefetch and predictors present, off.
+Protocol: the user's 10-minute rule of today (goal prompt, "Test length"): `bench.sh --promo` 05:29:25-05:38:02
+(decode256k twice, the others once), then the 8k serve guard and a second serve256k session 05:38-05:44
+(`val4-serve-053805`, rows serve1/serve3 attached to the run, same commit/binaries/settings), then ds-checks in two
+parts 05:44-05:51 and 05:51-05:55 (all lines pass, logs in the run directory). `run.json` records the attachments.
+Preflight 05:29:25: VM shut off; 3.2 GB used, 107 GB free; swap 0.6 of 8 GB used; pressure some avg10 0.00
+(avg60 0.40, avg300 1.16: the run before it had ended 20 s earlier); kcompactd0 6.4% lifetime average, nothing
+else; no build tool, no engine; tmpfs 69 MB.
+
+| case | baseline (30.047 row) | this run | change |
+|---|--:|--:|--:|
+| decode256k | 45.10 | 38.3, 38.2 | -15.2% |
+| prefill256k | 5.60 | 5.7 | +1.8% (5.6-5.7 in every run since 2026-11-09, both tier modes) |
+| serve256k3 | 107.41 | 89.53 (second session 89.85) | -16.6% |
+| serve256k1 | 44.39 | 38.37 (36.08) | -13.6% |
+| decode | 34.60 | 30.5 | -11.8% |
+| prefill128 | 11.00 | 10.5 | -4.5% |
+| serve3 | 96.81 | 78.62 | -18.8% |
+| serve1 | 38.65 | 33.66 | -12.9% |
+
+Attribution from the same-day arms (each on one binary or adjacent arms, clean box):
+- placement: decode256k 44.1 / 43.8 / 44.3 (old layout) against 41.7-42.1; serve unchanged, TTFT fixed.
+- narrow staged share: serve256k3 106.3 -> 95.3, serve3 96.5 -> 87.9, concurrency 2 74 -> 67.
+- exclusive tiers, same binary interleaved (chunk60, `QX_DS_RAM_DEDUP=0` / default / default / 0): decode256k
+  42.1 / 38.9 / 38.3 / 41.9; NVMe records per 64 tokens 556 -> 285, fetch 514-531 -> 303-306 ms; prefill256k 5.7
+  both ways (the chunk path and flex tail with the swap on: RAM promotions 1,547 against 1,024); serve256k3
+  93.0 -> 87.6 in the screen (one session each, different binaries: not a same-binary control).
+- the sysctl: the serve256k3 control read 95.3 at 02:08 and 93.0 at 04:47 across the sysctl change and a binary
+  change: unattributed, at most 2.4%.
+Exactness: ds-checks pass (two parts); server identity identical in 2 of 2 serve256k sessions on these binaries
+against `srv2-chunk32`; the breaker's test for the swap (64-wide window then single steps with tiers adapting
+against frozen tiers, windows of 8, line 3b with the counter visible): 192/192, 192/192, 128/128 bit-identical
+with 1,009 / 2,141 / 1,999 swaps. qx-ds-multi all rows not rerun on this tree (no scheduler, window or job-path
+change since it passed on chunk53's tree for setd-620; ds-checks line 6 passes).
+Breaker (fresh context, on 6e0a8bc..270c920): found the in-flight list being cleared while copies were still
+queued (mode 2; fixed in 4ee0e73 before any output-checked run), the wb queue re-queuing pending reads (fixed),
+dedup churn with `QX_DS_GPU_SHARE` (dedup disabled there), no same-binary control for the tier claim (run:
+above), identity print-only (now in `run.json`), and that my 96-wide-window explanation of the slow first token
+does not survive the logs (a 96 window formed in 15 normal sessions): **the slow-first-token rate (about 1
+session in 10 with narrow windows off the window share, 0 of 15 controls) is unexplained and open**; TTFT median
+in this run 1.89-1.9 s at 256k, 1.74 at 8k.
+Open and not claimed: the first-repeat slow mode of decode256k (not seen since the sysctl: 42.1, 38.9/38.3,
+41.9, 38.3/38.2), `QX_DS_STG_WAIT=words` unsafe with dedup (non-default knob).

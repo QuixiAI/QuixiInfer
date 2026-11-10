@@ -24,7 +24,12 @@ gpu_free() { until [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader
 gpu_free
 echo "1. exact f32 vs reference:      $(env -u QX_DS_PACK QX_MGEMV_INT8=0 QX_EXACT_EXPERTS=1 QX_REF_COMPAT=0 $B "$M" golden/out-dsv41/p0.tokens 6 2>&1 | grep '^positions')"
 gpu_free
+# DS_CHECKS_PART=a: lines 1 and 2 only (about 7 minutes: line 2 is most of the run); =b: lines 3 to 6 (about 4).
+# The 10-minute test rule (2026-11-10): run the two parts as two runs and check the concatenated logs.
+if [ "${DS_CHECKS_PART:-}" != b ]; then
 echo "2. production vs reference:     $(QX_DS_VRAM=20 QX_DS_RAM=60 QX_REF_COMPAT=engine $B "$M" golden/out-dsv41/p1.tokens 59 2>&1 | grep '^positions')"
+fi
+[ "${DS_CHECKS_PART:-}" = a ] && exit 0
 B0="QX_DS_VRAM=20 QX_DS_RAM=60 QX_DS_BENCH=0 QX_DS_ADAPT=0"
 gpu_free
 env $B0 QX_DS_DUMP_LOGITS="$T/t1.bin" $B "$M" golden/data/route1k.tokens 128 >/dev/null 2>&1
