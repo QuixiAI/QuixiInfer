@@ -1,19 +1,16 @@
 {
   "schema": 1,
-  "label": "setd-flex",
-  "date": "2026-11-08T15:37:49",
+  "label": "setd-promo",
+  "date": "2026-11-10T05:38:02",
   "git": {
-    "commit": "635ab36",
-    "dirty": true,
-    "modified": [
-      "M crates/qx-engine/src/dsv41/driver.rs",
-      " M crates/qx-engine/src/dsv41/mod.rs"
-    ],
-    "diff_sha": "6e0731b6736c"
+    "commit": "4ee0e73",
+    "dirty": false,
+    "modified": [],
+    "diff_sha": null
   },
   "host": {
     "gpu": "NVIDIA GeForce RTX 5090",
-    "driver": "595.99.02",
+    "driver": "620.70.06",
     "power_limit": "575.00 W",
     "vram": "32607 MiB",
     "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
@@ -31,14 +28,21 @@
     "prefill128",
     "serve"
   ],
-  "repeats": 3,
+  "repeats": 2,
   "correctness": "pass",
+  "identity": [
+    "serve256k-1: identical"
+  ],
   "commands": [
     "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_LOAD_STATE=perf/states/wiki256k-262144.state target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/wiki256k.tokens 262208",
     "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_RAM=95 QX_SCHED_STATS=1 target/release/quixiinfer serve --model /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf --pack /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp --ctx 262144 --slots 3 --window 128 --host 127.0.0.1 --port 8089 ; python3 tools/loadgen.py --url http://127.0.0.1:8089/v1 --levels 1,3 --rounds 2 --max-tokens 256 --temperature 0 --warmup 6",
-    "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_RAM=95 QX_SCHED_STATS=1 target/release/quixiinfer serve --model /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf --pack /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp --ctx 8192 --slots 3 --window 128 --host 127.0.0.1 --port 8089 ; python3 tools/loadgen.py --url http://127.0.0.1:8089/v1 --levels 1,3 --rounds 2 --max-tokens 256 --temperature 0 --warmup 6",
     "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_WINDOW=128 QX_DS_SKIP=1 QX_DS_CHUNK=8192 QX_DS_LOAD_STATE=perf/states/wiki256k-245760.state target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/wiki256k.tokens 262144",
     "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 QX_DS_WINDOW=128 target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/route1k.tokens 1024",
     "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/route1k.tokens 1024"
-  ]
+  ],
+  "attached": {
+    "serve1,serve3": "from perf/results/2026-11-10/val4-serve-053805 (same commit, binaries and settings; run 05:38-05:44 right after this run: the 10-minute test rule splits the set)",
+    "correctness": "tools/ds-checks.sh in two parts (DS_CHECKS_PART=a 05:44-05:51, b 05:51-05:55) on the same binaries; logs/ds-checks-part-*.timestamped.log",
+    "identity_second_session": "serve256k-1: identical (perf/results/2026-11-10/val4-serve-053805)"
+  }
 }

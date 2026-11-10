@@ -60,6 +60,11 @@ driver JIT at first use.
 - **The 256k indexer scorer (2026-11-06):** `qx_ds_idx_score2` keeps the 32 index queries in shared memory
   instead of re-reading 32 cache lines per key row: decode256k 56.6 → 43.6 ms per token (-23%), prefill256k
   34.5 → 23.2 (-33%), bit-identical. The position cost of 256k was one kernel's memory pattern, not the top-k.
+| Engine thread on its own core, pool on the other 15; the server's own threads kept off the engine's CPU | decode256k 44.1 -> 42.0; TTFT at concurrency 3 back to 1.8 s (was 2.8-3.3 in 4 of 6 with the full sweep) | 2026-11-08 / 2026-11-10, notebook |
+| Widths 2-3 (a 3-slot server's concurrent decode steps) on a 4/8 staged share, window share from width 4 (`QX_DS_STAGE_SHARE_NARROW`, `QX_DS_STAGE_WIDE_MIN`) | serve256k3 106.3 -> 95.3 (-10.4%), concurrency 2 74 -> 67, serve3 96.5 -> 87.9: on 8/8 the pool idled | 2026-11-10 |
+| Exclusive tiers (`QX_DS_RAM_DEDUP=2`): a VRAM victim is copied back from its slot into the RAM place of a duplicate; RAM promotions evict duplicates first | decode256k 42.0 -> 38.3 (-8.8%, same-binary interleaved), serve256k3 95.06 -> 90.01; NVMe records per 64 tokens 556 -> 285. Over half the NVMe fetches were promotion churn | 2026-11-10 |
+| Set D on the new host state (driver 620.70.06, VM off, compaction_proactiveness 0) | score 30.047 -> 26.925: decode256k 38.25, prefill256k 5.70, serve256k3 89.53 | 2026-11-10, `setd-promo-052925` |
+
 
 ## Strata on this box (2026-11-07, same files and ids; details in the notebook)
 
@@ -184,6 +189,14 @@ Read for the "bridge the gap" plan (families 11-13). Numbers are theirs, on thei
   (75% at confidence 0.5), serving hardening and a disk tier for parked states.
 
 ## Rejected: with the reason, so they are not retried
+- 2026-11-10: prefetch at width 3 in the server (`mix` K=6): 95.6-96.1 against 97.2-97.4 with one copy, 99.7 with
+  three: the copies are not free in the gap. Re-open: a predictor that costs nothing (parallel to the wait kernel).
+- 2026-11-10: NVMe write-back of VRAM victims (mode 1): halves the NVMe-served records but not the fetch wait
+  (25 promotion reads per token contend with demand fetches); the device-to-host copy (mode 2) replaced it.
+- 2026-11-10: `QX_DS_VRAM_PROMOS=4` / 0: decode256k 44.0 / 49.0 against 42.0: the promotions buy hit rate.
+- 2026-11-09: latent rows to host for decode256k: VRAM slope 15.4/13.0/11.0 GiB -> 41.8/43.6/44.4, net ~0.
+- 2026-11-09: decode staged share 5/8: 42.6 against 41.8 at 3/8 (2/8 equal).
+- Candidate, off: prefetch `mix` K=6 one copy, decode256k -3.0% (before the exclusive tiers; re-measure on them).
 
 - **GPU reads of RAM-resident experts in place over PCIe (`QX_DS_GPU_SHARE`) were rejected on 2026-11-04.**
   Mapped reads ran at about 7 GB/s, 1.3 ms per expert against the pool's 0.22. Decode went from 32 to 135-175 ms

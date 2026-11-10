@@ -2,6 +2,25 @@
 
 
 
+## Resume 2026-11-10, morning: set D promoted at 26.925 on the new host state; tests are 10 minutes maximum
+- 2026-11-10: **promoted** `perf/results/2026-11-10/setd-promo-052925` (tree 4ee0e73, binaries `~/qx-bins/chunk60`):
+  decode256k 38.25, prefill256k 5.70, serve256k3 89.53, score 26.925 (30.047 before; new host state: driver
+  620.70.06, VM off, `vm.compaction_proactiveness` 0 set by the user by hand, not persistent). Adjudicator PROMOTE
+  quoted in the notebook.
+- 2026-11-10: the user's rule: **no test over 10 minutes** (goal prompt "Test length"; `bench.sh --promo`,
+  `SERVE_LEVELS=3`, `DS_CHECKS_PART=a|b`; identity from each serve256k session's `identity.txt`).
+- Landed: server threads off the engine CPU; widths 2-3 on a 4/8 staged share; exclusive tiers
+  (`QX_DS_RAM_DEDUP=2`). Beliefs changed: rows 28, 29, 30 false; 31 false; 8 and 12 re-rated (see the table).
+- Counts since the last handoff: 7 experiments (mix prefetch, VRAM slope, decode share, placement fix, narrow
+  share, tier leak/exclusive tiers, serve prefetch); presupposition rows attacked: 5, 8, 12, 28, 29, 30, 31;
+  long shots: 0 of 7 (owed: the next one; candidates NVMe read-ahead on a parallel branch, 32k-row chunks).
+- Open: (1) the `ram dedups` counter mixes swaps and evictions: split it and rerun the swap test; a test that
+  discriminates the in-flight-list bug of 270c920; (2) the slow first token, about 1 server session in 10,
+  unexplained; (3) `qx-ds-multi` all rows does not fit in 10 minutes: split it; (4) re-measure the prefetch on
+  the exclusive tiers; (5) the queue in `perf/backlog.md` ("Queue as of 2026-11-10").
+- Chains: scripts in `~/qx-chains/` (`chain-val*.sh`, `chain-promo.sh` are the 10-minute templates); markers in
+  `~/qx-chains/log.out` (grep by scope, old markers repeat: wait on the scope, not the marker).
+
 ## Resume 2026-11-09, late evening: VM off, the user's NVIDIA driver fork installed (620.70.06), re-baseline in flight
 
 - **Host changed, at the user's instruction:** the win10 VM was forced off (`virsh destroy`; definition intact, do not
