@@ -2469,3 +2469,59 @@ on CPUs 16-21, the SMT siblings of pool cores 0-5 (`~/qx-chains/kcompactd.log`, 
 Engine reads are already O_DIRECT, THP is madvise-only and unused: the compaction is the kernel's proactive
 pass over what the 100 GiB pinned tier leaves free. Not yet shown repeat by repeat; the sampler now runs beside
 every chain. The cure (a sysctl) needs sudo: the user's call.
+
+## 2026-11-10: The server's width-3 decode windows on the decode staged share — CANDIDATE (serve256k3 -9.0%, serve3 -9%; narrow-share sweep in flight)
+
+Presupposition row 28. The byte accounting of a concurrency-3 round showed windows 3 wide on the window share
+(8/8 from width 2 since 2026-11-06): 136 staged records per token, 0.1 pool records: the 15-core pool idle while
+the DMA lane carried 3.9 GB per step. Arms on chunk53 (commit 6e0a8bc), clean box (VM off, pressure 0, kcompactd
+1 tick per 8 minutes during the chain), one after another, three repeats each; (ms per token per request, TTFT
+median s, aggregate tok/s); records per run staged / pool:
+
+| arm (serve256k) | serve256k3 | serve256k1 | staged / pool |
+|---|---|---|---|
+| control (8/8 from width 2) | 105.71 / 1.91 / 26.17, 106.38 / 1.88 / 26.03, 106.38 / 1.91 / 26.03 | 41.84, 40.23, 39.75 | 468k / 38k |
+| `QX_DS_STAGE_WIDE_MIN=4` (width 3 on 3/8) | 96.81 / 1.90 / 28.38, 96.81 / 1.91 / 28.35, 96.62 / 1.89 / 28.43 | 39.81, 37.76, 41.55 | 251k / 256k |
+| + `QX_DS_STAGE_SHARE_DECODE=5` | 95.51 / 1.86 / 28.70, 95.88 / 1.90 / 28.63, 93.90 / 3.24 / 28.20 | 41.95, 40.45, 40.13 | 336k / 168k |
+| + `QX_DS_STAGE_SHARE_DECODE=2` | 101.01 / 1.91 / 27.29, 100.81 / 1.86 / 27.31, 101.01 / 1.92 / 27.25 | 39.03, 39.29, 37.79 | 196k / 307k |
+| `QX_DS_STAGE_SHARE=6` (all windows) | 98.91 / 2.21 / 27.44, 98.43 / 2.20 / 27.56, 99.01 / 2.21 / 27.41 | 38.91, 41.27, 39.70 | 356k / 147k |
+
+8k context (`serve`): `WIDE_MIN=4` serve3 88.03 / 1.77 / 31.15, 88.26 / 1.79 / 31.03, 86.51 / 2.78 / 30.79;
+`WIDE_MIN=8` 87.95, 87.80, 88.18 (TTFT 1.79-1.81, 31.1 tok/s); against 96.1-96.9 / 28.6-28.75 tok/s for the
+default an hour earlier (entry above). serve1 36.4-38.6, unchanged.
+Reading: -9.0% serve256k3 per request and +8.9% aggregate tok/s (26.03 -> 28.38), repeats within 0.2%, far outside
+the spread; TTFT unchanged; single stream unchanged. The share has an interior optimum near 4-5/8 at width 3
+(101.0 at 2/8, 96.8 at 3/8, 95.5 at 5/8, 98.7 at 6/8, 106.2 at 8/8): the 2026-11-06 measurement that 6/8 beat 3/8 at
+widths 2 and 4 predates the pool's own-core placement. `SHARE=6` for all windows also slows TTFT (2.2 s: prompt
+windows lose staged share). `QX_DS_STAGE_SHARE_DECODE=5` costs decode256k +2% (entry of 2026-11-09), so width 1
+and widths 2-3 need separate shares: chunk54 adds `QX_DS_STAGE_SHARE_NARROW` (widths 2 .. wide_min-1, default the
+decode share) and `qx-chain-narrow` sweeps it 3/4/5/6 at concurrency 2 and 3 (bench.sh `SERVE_LEVELS=2,3`).
+
+Narrow-share sweep (`qx-chain-narrow`, chunk54 = 6e0a8bc + `QX_DS_STAGE_SHARE_NARROW`, clean box, three repeats,
+`SERVE_LEVELS=2,3`, all with `QX_DS_STAGE_WIDE_MIN=4`; ms per token per request / TTFT median s / aggregate tok/s):
+
+| narrow share (widths 2-3) | serve256k3 | serve256k2 | staged / pool records |
+|---|---|---|---|
+| control (default: 8/8 from width 2) | 106.38 / 2.05 / 25.95, 106.38, 106.16 | 73.86, 76.05, 72.46 (24.3 tok/s) | 570k / 4k |
+| 3/8 | 97.18 / 2.05 / 28.20, 97.18, 97.37 | 65.10, 67.48, 69.98 | 273k / 302k |
+| **4/8** | 95.33 / 2.06 / 28.69, 95.24, 95.24 | 67.98, 67.43, 65.32 (26.4 tok/s) | 340k / 238k |
+| 5/8 | 95.97, 96.06, 96.15 | 65.66, 69.40, 67.93 | 401k / 173k |
+| 6/8 | 99.01, 98.91, 97.28 (TTFT 3.47) | 68.82, 69.54, 68.92 | 461k / 118k |
+
+8k: narrow 4/8 serve3 87.80, 85.98 (TTFT 2.91), 87.95; serve2 60.35, 63.17, 60.35; narrow 5/8 serve3 88.50, 88.57,
+88.57; serve2 63.45, 62.77, 62.97.
+Choice: `QX_DS_STAGE_WIDE_MIN` 4 and `QX_DS_STAGE_SHARE_NARROW` 4/8 become the defaults (chunk55): serve256k3
+106.3 -> 95.3 (-10.4%, +10.5% aggregate tok/s), concurrency 2 -9..-10%, serve3 96.5 -> 87.9 (-9%), width 1 untouched
+by construction (its share is still 3/8). Low-risk class (a default flip behind existing knobs): bar 3%.
+**Caveat for the breaker: a slow first token (2.8-3.5 s median instead of 1.8-2.1) in one repeat of three in 4 of
+the 13 arms with the narrow windows off the window share (s8k-min4, s256-min4s5, s256-n6, s8k-n4), in 0 of the 3
+control arms here and 0 of 9 control sessions the hour before.** Aggregate tok/s in those repeats is still
+27.2-30.9, above the control's 26.0.
+The slow first token, read from the server logs (narrow-s256-n6, session 3 against session 2): in the slow
+session the second round's three prompts were admitted into one 96-wide window (`window widths {... 96: 1}`,
+`launch/replay 20.10 ms` averaged over 110 steps = 2.2 s in that window) and all three first tokens waited for it
+(prompt times 4.43 / 3.58 / 3.85 s); in the normal session the same prompts went through 32/48/64 windows
+(launch/replay 5-6 ms per step, prompt times 1.2-2.1 s). So it is which window width the arrivals happen to form
+(a timing matter that the faster decode steps shift), and the first real use of that width in the session costs
+about 2 s of launch/replay: the scheduler's behaviour, not the share. Backlog: first real use of a wide window
+after warm-up should not cost 2 s (see what the dry pass leaves undone for width 96).

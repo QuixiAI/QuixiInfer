@@ -31,6 +31,8 @@ pub struct Tiers {
     stage_share: u64,
     stage_share_decode: u64,
     stage_wide_min: usize,
+    /// The share for windows of width 2 up to `stage_wide_min` - 1 (a server's concurrent decode steps).
+    stage_share_narrow: u64,
     pub store: crate::tiers::ExpertStore,
     arena: DeviceBuf,
     /// The arena's flex tail (address, bytes) that the chunk path's buffers view during a prompt.
@@ -363,6 +365,8 @@ pub struct AsyncBufs {
     stage_share_decode: u64,
     /// Windows of this width or more use `stage_share`; narrower ones `stage_share_decode`.
     stage_wide_min: usize,
+    /// The share for windows of width 2 up to `stage_wide_min` - 1 (a server's concurrent decode steps).
+    stage_share_narrow: u64,
     stage_cap: usize,
     _stage: DeviceBuf,
     _pred_stage: DeviceBuf,
@@ -1077,11 +1081,16 @@ impl<'a> DsEngine<'a> {
                 // no difference at 64 and overflowed at 128 (perf/optimization_status.md, "128-chunk bundle")
                 let stage_share = knob("QX_DS_STAGE_SHARE", 8);
                 let stage_share_decode = knob("QX_DS_STAGE_SHARE_DECODE", 3);
-                // The window share applies from width 2 (QX_DS_STAGE_WIDE_MIN; it was 8 until 2026-11-06): at widths
-                // 2 and 4 the 6/8 share measured 4.7% and 8.2% faster per position than 3/8, outside the noise
-                // (perf/optimization_status.md). Width 1 keeps the decode share: a staged expert's DMA costs about 0.7
-                // ms against the pool's 0.22 when it serves one token, and 4/8 measured flat there.
-                let stage_wide_min: usize = std::env::var("QX_DS_STAGE_WIDE_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2).max(1);
+                // The window share applies from width 4 (QX_DS_STAGE_WIDE_MIN; it was 8 until 2026-11-06, then 2 until
+                // 2026-11-10). Width 1 keeps the decode share: a staged expert's DMA costs about 0.7 ms against the
+                // pool's 0.22 when it serves one token, and 2/8, 3/8, 5/8 measured 41.7, 41.8, 42.6 ms on decode256k.
+                // Widths 2 and 3 (a 3-slot server's concurrent decode steps) have their own share
+                // (QX_DS_STAGE_SHARE_NARROW, 4/8): on the window share the 15-core pool idled (136 staged records per
+                // token, 0.1 pool) and the step was bound by the DMA lane; serve256k3 measured 106.3 ms at 8/8, 97.2 at
+                // 3/8, 95.3 at 4/8, 96.1 at 5/8, 98.9 at 6/8, and concurrency 2 74 -> 67 (perf/optimization_status.md,
+                // 2026-11-10). Width 4 and up is unmeasured since the pool got its own cores: it keeps the window share.
+                let stage_wide_min: usize = std::env::var("QX_DS_STAGE_WIDE_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
+                let stage_share_narrow = knob("QX_DS_STAGE_SHARE_NARROW", 4);
                 let stage_cap: usize = if stage_share > 0 || stage_share_decode > 0 { std::env::var("QX_DS_STAGE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(256) } else { 1 };
                 let max_rec = (0..cfg.n_layer).map(|l| pack.experts.record[l] as usize).max().unwrap_or(0);
                 let stage = DeviceBuf::new(stage_cap * max_rec.max(256));
@@ -1168,6 +1177,7 @@ impl<'a> DsEngine<'a> {
                     stage_share,
                     stage_share_decode,
                     stage_wide_min,
+                    stage_share_narrow,
                     store,
                     arena,
                     flex,
@@ -1244,7 +1254,7 @@ impl<'a> DsEngine<'a> {
                     n_embd: E,
                     ff: cfg.ff_exp,
                 };
-                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_wide_min: t.stage_wide_min, stage_cap: t.stage_cap, _stage: t.stage, _pred_stage: t.pred_stage, prestaged: t.prestaged, pred_ctr: DeviceBuf::new(8), slots_all, slots_stg, stg_ready, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
+                let abufs = AsyncBufs { _arena: t.arena, table_dev, rtable_dev, gpu_share, stage_share: t.stage_share, stage_share_decode: t.stage_share_decode, stage_share_narrow: t.stage_share_narrow, stage_wide_min: t.stage_wide_min, stage_cap: t.stage_cap, _stage: t.stage, _pred_stage: t.pred_stage, prestaged: t.prestaged, pred_ctr: DeviceBuf::new(8), slots_all, slots_stg, stg_ready, step: DeviceBuf::new(crate::mailbox::STEP_ROW * 4), slots: t.slots, gpu_out: t.gpu_out, xq: t.xq, xd: t.xd, gu: t.gu };
                 abufs.step.zero();
                 place_threads();
                 let d = driver::Driver::start(host, cpus.clone());
@@ -2759,7 +2769,7 @@ impl<'a> DsEngine<'a> {
             // the misses to the driver's mailbox (x quantized to Q8_K on the way), the residents on the GPU,
             // then wait for the CPU's rows: no host involvement
             let mb = d.shared.mb.dptr;
-            let stage_share = if t >= ab.stage_wide_min { ab.stage_share } else { ab.stage_share_decode };
+            let stage_share = if t >= ab.stage_wide_min { ab.stage_share } else if t >= 2 { ab.stage_share_narrow } else { ab.stage_share_decode };
             self.trace("qx_moe_post");
             gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (tt, 1, 1), &[mb, ab.table_dev.ptr, (l * c.n_expert) as u64, self.s.ids.ptr, self.s.wts.ptr, self.s.x.ptr, ab.step.ptr, l as u64, k as u64, E as u64, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, t as u64 | ((self.warm as u64) << 32), ab.rtable_dev.ptr, ab.gpu_share, stage_share, ab.slots_all.ptr, ab.slots_stg.ptr, ab.stage_cap as u64, ab.prestaged.ptr]);
             self.trace_done();

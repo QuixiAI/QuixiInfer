@@ -158,6 +158,8 @@ for c in "${CASE_LIST[@]}"; do [ -n "${ARGS[$c]+x}" ] || { echo "unknown case $c
 # the serving case: a server with 3 slots at the standard tier settings, then loadgen at concurrency 1 and 3 after 6
 # unmeasured requests (the tiers adapt over the first requests, as they do over route1k's first hundred tokens).
 # Greedy sampling, so the replies and their lengths repeat from run to run.
+# SERVE_LEVELS=2,3 (environment) drives other concurrency levels for an experiment; the standard cases are 1,3.
+SERVE_LEVELS_LIST=${SERVE_LEVELS:+${SERVE_LEVELS//,/ }}
 serve_case() {
   # (two statements: `local` expands every word before it assigns any, so $name is unbound in the same one)
   local r=$1 name=${2:-serve} ctx=${3:-8192}
@@ -169,7 +171,7 @@ serve_case() {
   # compare. The later env entry wins.
   local srv=(env "${BASE[@]}" QX_DS_RAM="${SERVE_RAM}" QX_SCHED_STATS=1 "${EXTRA[@]}" $SERVER serve --model "$M" --pack "$PACK"
              --ctx "$ctx" --slots 3 --window "$SERVE_WINDOW" --host 127.0.0.1 --port "$PORT")
-  cmds+=("${srv[*]} ; python3 tools/loadgen.py --url http://127.0.0.1:$PORT/v1 --levels 1,3 --rounds 2 --max-tokens 256 --temperature 0 --warmup 6")
+  cmds+=("${srv[*]} ; python3 tools/loadgen.py --url http://127.0.0.1:$PORT/v1 --levels ${SERVE_LEVELS:-1,3} --rounds 2 --max-tokens 256 --temperature 0 --warmup 6")
   "${srv[@]}" > "$slog" 2>&1 &
   local pid=$! i=0 rc=1
   # the worker loads the tiers and captures the graphs before it answers; wait for its warm-up line
@@ -180,7 +182,7 @@ serve_case() {
   done
   if kill -0 "$pid" 2>/dev/null && grep -q "warm-up" "$slog"; then
     set +e
-    timeout 1500 python3 tools/loadgen.py --url "http://127.0.0.1:$PORT/v1" --levels 1,3 --rounds 2 --max-tokens 256 \
+    timeout 1500 python3 tools/loadgen.py --url "http://127.0.0.1:$PORT/v1" --levels ${SERVE_LEVELS:-1,3} --rounds 2 --max-tokens 256 \
       --temperature 0 --warmup 6 > "$log" 2>&1
     rc=$?
     set -e
@@ -188,7 +190,7 @@ serve_case() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   [ $rc = 0 ] || echo "  exit $rc (see $log and $slog)"
-  for cc in 1 3; do
+  for cc in ${SERVE_LEVELS_LIST:-1 3}; do
     python3 -I perf/harness/perf_diff.py parse "$log" --case "$name$cc" --repeat "$r" --exit "$rc" --metric "serve:$cc" >> "$RUN/results.jsonl"
   done
 }
