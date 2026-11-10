@@ -2717,3 +2717,24 @@ chunk-wide scratch: (1) the dense groups once over all rows of the chunk (one `q
 4096-8192 rows); (2) attention in slabs of 256-2048 queries per launch; (3) experts batched across the layer in
 one gate/up and one down launch (`qx_gemm_grouped2` exists), sequenced by stream events rather than in-kernel
 waits; (4) the first chunk's 5 s of cold cost; (5) the full stack only on the rows that need it (Strata: 2,668).
+
+## 2026-11-10: Match Strata, steps 1b and 2: slab attention re-screened; the FFN's dense products chunk-wide — MEASURED, no gain from step 2 (reverted)
+
+16k prompt, 4096-row chunks, one run each, a 233 GiB download writing to the same NVMe (indicative). chunk61:
+control 2.77 ms per token (361 tok/s; chunks 13,139 / 8,064 / 7,799 / 15,822 ms); `QX_DS_ATTN=tile` (the
+same-bits slab attention, one launch per slab) 2.65 (377 tok/s; 12,978 / 7,212 / 7,274 / 15,642): -4%, where it
+was 5% slower on 2026-11-07 before raw launches; with `QX_DS_CHUNK_GEMM=1` as well 2.54 (394 tok/s; last chunk
+14,458). But the 64 single steps after the prompt read 71-72 ms per token with `tile` on against 36.9: the
+slab kernel must be confined to the chunk path before it can be a default.
+Step 2 (chunk62, not committed; patch kept at `~/qx-chains/chunk-ffn-wide.patch`): with the knob, the slab loop
+runs only the FFN norm and `chunk_ffn` runs the router, the shared expert's gate/up, the selections and the
+shared expert's down product once over all the chunk's rows (`MGemv::run_gemm_to`, chunk-wide scratch).
+Result: 2.67 ms per token, chunks 13,561 / 7,952 / 7,693 / 14,845 ms: the same as the per-slab tile GEMM
+(7,597 / 14,757), and the KL of the 63 tail positions is the same to four digits (0.0077, top-1 95.2%), as it
+must be if both forms compute the same per-row products. At chunk 8192: 2.76 (18,917 / 26,416 ms). No gain:
+REJECTED as built and reverted. Reading: the FFN's dense products are not where the slab passes' time is; by the
+kernel table the weight is in attention (9.4 s), the attention-side dense groups (`g_x`, `g_qr`, `wo_a`, `g_ob`:
+most of the 10.6 s) and the experts (12.9 s). Not verified: that the wide path was taken on every layer (no
+counter was added). Next, in order: (1) experts batched across the layer (36% of kernel time, one launch per
+expert today); (2) `tile` attention inside the chunk path only, then wider attention slabs; (3) `g_x` and
+`wo_a` chunk-wide (needs an x-stride argument in `qx_gemm2` and a split of `layer_attn` at the KV commit).
