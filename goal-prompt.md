@@ -14,6 +14,21 @@ measurement and adventurous about ideas.
 3. **Capability**: 256k must work with at least one slot on this box (it does: 15.4 GiB tier at one slot, 12.2 at
    three) and must not grow host memory with context (it does not since `39c3bc0`).
 
+## Match Strata (the user's goal change, 2026-11-10: "change the goals - we need to match Strata's performance")
+Strata (`~/git/Strata`, built here as `~/git/Strata/build-dsv41/strata-dsv41`; same model files, same ids) is the
+bar. On this box on 2026-11-10: decode 27.2 tok/s (ours 32.8: ahead), **prefill of a 16k prompt 765 tok/s at its
+chunk 8192 (935 on 2026-11-07); ours 175-250**. The target is prompt processing at Strata's rate or better:
+a 16k prompt at 765+ tok/s (new scored case `prefill16k`: a cold 16k prompt, tok/s; sanctioned case-set change),
+and prefill256k to match.
+**The contract changes for prompt processing**: prefill may use tensor-core kernels (FP16 / bf16 tiles with f32
+accumulation, as Strata does; we have its code: read `~/git/Strata/src/dsv41/` and translate) and is then checked
+against the exact path by a KL bound instead of bit-identity: teacher-forced on the same ids, mean KL of the
+positions after the prompt against the exact (f32 single-step) path at most 0.03, top-1 agreement at least 95%
+(Strata's whole engine sits at KL 0.026-0.029 from our exact path; measured 2026-11-07). The fast path is the
+default once it meets the bound. Decode after the prompt stays on the exact kernels, and the exact prefill path
+stays available behind a knob (`QX_DS_PREFILL_EXACT=1`) and is what ds-checks lines 3/3b/5/6 keep testing.
+This work is priority 3a: ahead of every other new experiment.
+
 ## Priority order (stated, because it was only implied)
 1. **Exactness bugs first.** A failing ds-checks line or a server identity mismatch stops all performance work until
    it is fixed and has a regression check. On an intermittent mismatch: record the run's schedule
@@ -113,7 +128,7 @@ No test, chain or validation run may take more than about 10 minutes of wall tim
   - Wait for the GPU to be free before any CUDA job. Kill anything on the GPU that is not ours.
   - Never pkill -f / pgrep -f with a pattern that matches the tool shell; use pkill -x or kill by PID.
   - Never let a new kernel or window width load while an expert job is posted: new widths go through the dry pass.
-  - Default GEMVs stay on the f32 path; windows must stay bit-identical to single steps.
+  - Decode GEMVs stay on the f32 path; with `QX_DS_PREFILL_EXACT=1` windows and chunks must stay bit-identical to single steps. The default prompt path may be tensor-core within the KL bound of "Match Strata" (2026-11-10).
   - tools/golden/golden-dsv41 stays modified and uncommitted. Exclude it from every commit.
 - The chunk path's buffers are views into the VRAM arena's tail: nothing writes them without holding the flex tail (`assert_flex_held`); any new writer takes the tail first and the caller releases it.
 - Thread placement: no spinning thread (engine thread, CUDA helpers) on a physical core a pool worker uses. Defaults come from `pool_cpus()` / `main_cpu()` (sysfs topology); `QX_DS_CPUS`, `QX_DS_MAIN_CPU` override. Confining the whole process with taskset deadlocks the engine; do not.
@@ -129,7 +144,7 @@ experiment list is in the handoff and `perf/backlog.md`; the long-shot candidate
 
 ## Stop and report (do not ask otherwise)
 - Five consecutive REJECTED/INCONCLUSIVE experiments, excluding deliberate measurements.
-- The next step would change the exactness contract, the standard settings or the case set (beyond item 1 above), or needs sudo beyond gdb attach, another disk, or more than the memory cap.
+- The next step would change the exactness contract beyond what "Match Strata" allows (anything that makes decode non-exact, or prefill outside the KL bound), the standard settings or the case set (beyond item 1 above), or needs sudo beyond gdb attach, another disk, or more than the memory cap.
 - Any ds-checks line stops matching and a revert does not restore it.
 - The box cannot be made benchmark-clean without the user (the VM is up, another user's job holds memory or the GPU): report it with the evidence; keep relative arms going if they are meaningful.
 When stopping, give: current score vs the promoted baseline (scoreboard last row), what landed, what was rejected and why, which presupposition rows were tested and how they changed, the long-shot count against the one-in-four rule, and the next three experiments ranked by expected value.

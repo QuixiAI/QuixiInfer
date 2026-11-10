@@ -2657,3 +2657,16 @@ condition that the three entry corrections under check 4 are made and the scoreb
 gains (serve3 87.9 -> 78.62, serve1 ~37 -> 33.66) rest on one session with no 8k arm for the exclusive tiers and
 are not attributed; prefill256k +1.8% is one quantisation step (5.57-5.71 in 16 runs on this host state); the new
 baseline has single-run spreads, so future gates use the goal prompt's measured spreads. LANDED and promoted.
+
+## 2026-11-10: Concurrency 1-4 on a 4-slot server, and Strata rerun on today's box state — RECORDED (the user's questions)
+
+4 slots, 256k context, chunk60, one session, loadgen levels 1,2,3,4 (VRAM tier 10.7 GiB; 12.3 with 3 slots):
+aggregate tok/s 23.47 / 27.07 / 29.13 / **24.38**, per-request 26.26 / 15.14 / 10.62 / 7.08, TTFT median 1.12 /
+1.89 / 2.00 / **6.19 s**. Concurrency 4 is worse than 3: width-4 windows are on the 8/8 window share
+(`QX_DS_STAGE_WIDE_MIN` 4), unmeasured since the pool got its own cores; screen `QX_DS_STAGE_WIDE_MIN=8` next.
+Strata (`strata-dsv41` as built 2026-11-06, same pack and ids as the 2026-11-07 entry, single cold runs, driver
+620.70.06, VM off): decode 256 tokens after a 64-token prompt, DSpark off: **27.18 tok/s** (27.5 on 2026-11-07);
+16k prompt at chunk 8192: **765 tok/s** (935 on 2026-11-07). Ours today: `decode` 30.5 ms = 32.8 tok/s (forced
+bench, warm), prefill128 95 tok/s, prefill256k 175 tok/s (the last 16k of a 256k prompt; no 16k cold prompt run
+today). Decode: ahead by about 20% on unlike shapes (their run is cold and includes its adaptation); prefill:
+4-8x behind, as before. The DSpark drafter GGUF is on the box (`~/models/DeepSeek-V4.1-Flash-1017-GGUF/dspark/`).
