@@ -2683,3 +2683,37 @@ a >= 4.6-5.5 accepted of 7 (66-79%); at T=4 (w 25-33) a >= 1.6-2.5 of 3 (55-82%)
 Strata's DSpark measured 26.9 against 27.5 tok/s on this box: consistent. Verdict: REJECTED for this hardware at
 256k. Re-open if a window's cost per position at width 4-8 falls under ~12 ms (it is the experts: 0.9 GB of host
 bytes per position), e.g. with a much larger VRAM tier or a second card.
+
+## 2026-11-10: Match Strata, step 1: where a 16k prompt's time goes, and the dense tile GEMM per slab — MEASURED (knob off; the lever is launch shape, not the dense kernel)
+
+Target (goal prompt, "Match Strata"): a cold 16k prompt at Strata's 765 tok/s (21.4 s; rerun today, DeepSeek
+sources unchanged by the user's pull of 2026-11-10). Ours, chunk60, `long16k`: 2.89 ms per token at chunk 8192
+(346 tok/s), 2.68-2.77 at chunk 4096 (361-373 tok/s). The gap is 2.05x, not the 4.3x of 2026-11-07 (217 then).
+Per chunk at 4096 (ms): 13,059 (first, KV-only; cold) / 8,067 / 7,808 (KV-only) / 15,966 (4,032 rows, full
+stack). Row-layers: ours ~0.10 ms per row per layer; Strata 21.4 s over 16,384 x 20 + 2,668 x 20 = 0.056.
+GPU utilization sampled at 250 ms across the run: 85-99%, 320-440 W: **the chunk path is GPU-bound; the "slab
+enqueue" seconds are back-pressure, not host cost** (conjecturer E8; rows 10/21: kernel-latency-bound).
+nsys kernel table (exact path; 35.5 s of kernel time in ~46 s of wall):
+
+| kernel(s) | s | launches | avg us |
+|---|--:|--:|--:|
+| attention: `qx_ds_attn_part` + `_merge` | 7.42 + 2.01 | 13,040 each | 569 / 154 |
+| dense: `qx_mgemv_t8z` / `_t8zt` / `_t8zf` | 5.92 / 3.98 / 0.75 | 8,877 / 34,152 / 4,634 | 667 / 117 / 161 |
+| expert gate+up (`qx_moe_gateup_mma_*`: iq2_xxs, iq1_s, iq2_s) | 4.69 + 4.20 + 1.36 | 14,042 / 13,007 / 4,718 | 334 / 323 / 288 |
+| expert down (`qx_moe_down_mma_*`) | 2.7 | ~30,000 | 82-100 |
+| `qx_ds_hc_mixes`, `qx_ds_idx_score2`, `qx_moe_quant_h_sel` | 0.56, 0.54, 0.33 | | |
+
+Thirds: experts 36%, dense 30%, attention 27%. Every one is tens of thousands of launches of 0.1-0.7 ms, each
+far too small to fill 170 SMs: 32-token attention slices, 128-row slabs, one expert per launch.
+`QX_DS_CHUNK_GEMM=1` (chunk61, off by default): `mgt` sends windows/slabs of 64+ tokens to `MGemv::run_gemm`
+(`qx_gemm2` bf16 tiles with f32 accumulation per segment, `qx_gemm_f32` for F32 rows; the head stays exact;
+groups with an x stride other than their columns, `wo_a`, and the shared expert's moded products keep the old
+path). Result: last chunk 15,966 -> 14,757 ms (-7.6%), KV-only chunks -3%; kernel time 35.5 -> 33.7 s
+(`qx_gemm2` 5.02 s in 24,924 launches at 201 us; `qx_gemm_f32` 1.51 s at 532 us for the router). KL of the 63
+positions after the prompt against the exact path: mean 0.0077, p99 0.058, top-1 95.2% (60 of 63); within the
+bound, and too little speed to be worth it per slab: a 128-token GEMM launch is as latency-bound as the GEMV.
+Plan (Strata's layout, `layer_chunk` in `~/git/Strata/src/dsv41/ds4_model.cu:11387`): phase-major layers with
+chunk-wide scratch: (1) the dense groups once over all rows of the chunk (one `qx_gemm2` launch per matrix over
+4096-8192 rows); (2) attention in slabs of 256-2048 queries per launch; (3) experts batched across the layer in
+one gate/up and one down launch (`qx_gemm_grouped2` exists), sequenced by stream events rather than in-kernel
+waits; (4) the first chunk's 5 s of cold cost; (5) the full stack only on the rows that need it (Strata: 2,668).

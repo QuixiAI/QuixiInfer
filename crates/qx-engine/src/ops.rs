@@ -119,6 +119,8 @@ pub struct MGemv {
     pub q8: bool,
     /// `qx_tmv`'s split-K partial sums and tile counters.
     _tscratch: (qx_gpu::mem::DeviceBuf, qx_gpu::mem::DeviceBuf),
+    /// The segments as given (for `run_gemm`).
+    pub segs: Vec<Seg>,
 }
 
 /// Whether a window of `t` tokens runs its products on tensor cores (`qx_tmv`) rather than in f32 (`qx_mgemv`).
@@ -284,7 +286,7 @@ impl MGemv {
         let rtable = qx_gpu::mem::DeviceBuf::from_slice(if rn == 0 { &[0u64][..] } else { &rwords });
         let zt = |i: usize| (qx_gpu::mem::DeviceBuf::from_slice(if zw[i].0.is_empty() { &[0u64; 8][..] } else { &zw[i].0 }), zw[i].1, zw[i].0.len() / 8);
         let ztable = [zt(0), zt(1), zt(2)];
-        Self { table: qx_gpu::mem::DeviceBuf::from_slice(&words), n: segs.len(), blocks, rest: (rtable, rblocks, rn), ztable, ttable: [tab(0), tab(1)], tcols, q8, _tscratch: (partials, counters) }
+        Self { table: qx_gpu::mem::DeviceBuf::from_slice(&words), n: segs.len(), blocks, rest: (rtable, rblocks, rn), ztable, ttable: [tab(0), tab(1)], tcols, q8, _tscratch: (partials, counters), segs: segs.to_vec() }
     }
 
     pub fn run(&self, gpu: &Gpu, x: u64) {
@@ -305,6 +307,28 @@ impl MGemv {
     /// token-n output at y_s + n * rows_s. Each token's result is bit for bit its `run_x` result.
     pub fn run_t(&self, gpu: &Gpu, x: u64, mode: u64, arg: u64, t: usize, x_stride: usize) {
         self.run_t_with(gpu, x, mode, arg, t, x_stride, use_tmv(t))
+    }
+
+    /// The products as tile GEMMs over `t` tokens whose x rows are `tcols` floats apart: F32 segments in f32
+    /// (`qx_gemm_f32`), the others on bf16 tensor cores with f32 accumulation (`qx_gemm2`: 128 tokens x 64 rows per
+    /// block, each weight tile decoded once for 128 tokens). NOT bit-identical to `run_t`: prompt processing only
+    /// (the 2026-11-10 contract: KL-bounded against the exact path). One launch per segment.
+    pub fn run_gemm(&self, gpu: &Gpu, x: u64, t: usize) {
+        for s in &self.segs {
+            let (rows, cols) = (s.rows as u64, s.cols as u64);
+            if s.qx == 0 && s.rows < 128 && s.cols % 4 == 0 {
+                gpu.run(modules::GEMM.kernel("qx_gemm_f32_narrow", CubeDim::new_1d(256)), ((t as u32).div_ceil(8), s.rows as u32, 1), &[x, s.w, s.y, t as u64, rows, cols, rows]);
+            } else if s.qx == 0 {
+                gpu.run(modules::GEMM.kernel("qx_gemm_f32", CubeDim::new_1d(256)), ((s.rows as u32).div_ceil(64), (t as u32).div_ceil(64), 1), &[x, s.w, s.y, t as u64, rows, cols, rows]);
+            } else {
+                gpu.run(modules::GEMM.kernel("qx_gemm2", CubeDim::new_1d(256)), ((s.rows as u32).div_ceil(64), (t as u32).div_ceil(128), 1), &[x, s.w, s.y, t as u64, rows, cols, s.qx, s.stride as u64, rows, 0]);
+            }
+        }
+    }
+
+    /// Whether `run_gemm` can take this group: every segment's type has a tile decoder and dense F32 rows.
+    pub fn gemm_ok(&self) -> bool {
+        self.segs.iter().all(|s| matches!(s.qx, 0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10) && (s.qx != 0 || s.stride == 0 || s.stride == s.cols * 4))
     }
 
     /// `run_t` with the kernel chosen by the caller (`tmv`: `qx_tmv`, else `qx_mgemv`).

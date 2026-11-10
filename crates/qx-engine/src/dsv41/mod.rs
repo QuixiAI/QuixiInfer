@@ -734,6 +734,12 @@ pub fn place_threads() {
     }
 }
 
+/// `QX_DS_CHUNK_GEMM=1`: the dense products of windows and slabs of 64 tokens or more as tile GEMMs (off by default).
+fn chunk_gemm() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QX_DS_CHUNK_GEMM").is_ok_and(|v| v == "1"))
+}
+
 fn bits(f: f32) -> u64 {
     f.to_bits() as u64
 }
@@ -1353,6 +1359,13 @@ impl<'a> DsEngine<'a> {
         if std::env::var("QX_DS_TRACE").is_ok() {
             self.gpu.sync();
             eprintln!("  table {:x?} x {x:#x} stride {x_stride} t {t}", g.table_words());
+        }
+        // QX_DS_CHUNK_GEMM=1: windows and slabs of 64 tokens or more take the tile GEMMs (bf16 tensor cores, f32
+        // accumulation; the vocabulary head stays exact). Prompt processing only, KL-bounded (goal prompt, 2026-11-10).
+        if t >= 64 && x_stride == g.tcols && what != "g_out" && chunk_gemm() && g.gemm_ok() {
+            g.run_gemm(&self.gpu, x, t);
+            self.trace_done();
+            return;
         }
         let tmv = t > 8 && t <= 32 && std::env::var("QX_TMV").is_ok_and(|v| v == "1");
         g.run_t_with(&self.gpu, x, 0, 0, t, x_stride, tmv);
