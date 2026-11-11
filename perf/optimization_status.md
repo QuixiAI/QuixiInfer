@@ -3280,3 +3280,47 @@ requests reads (10.62, 9.61) and (8.97, 10.80) s on the new binaries and (9.24, 
 old: one request of a pair is about a second slower in three of the four sessions, on either binary. The same
 spread as the 8k server's; not this change (a serve256k session has no chunk tick). serve256k3 in the four
 sessions: 90.74, 91.16 (new), 91.32, 90.66 (old). Identity identical in all four.
+
+**Adjudicator (fresh context): "Verdict: LANDED for ec8cb28, with no baseline promotion", on condition that these
+corrections to the entry above are appended** (its list, applied here as a correction paragraph):
+1. "Scored cases unchanged by construction" holds for decode256k, serve256k3, decode, prefill128 and the 8k server
+   (a step is 1 to 128 tokens across slots, so `dt` never exceeds `DS_TMAX`). **Not for prefill256k**: its first
+   chunk's tick (`dt` 8,192, capped) precedes the timed chunk, whose tier counters moved (VRAM selections 1,495
+   -> 1,778, NVMe 6,233 -> 5,896, RAM promotions 1,531 -> 1,081) while its time did not (18,360 -> 18,381 ms; 2.241
+   against 2.244 ms per row). Unchanged by measurement there; the baseline's prefill256k counters will not
+   reproduce on HEAD.
+2. Preflight of the promotion-style run (log, 05:57:04 V11): VM shut off; 64,759 MiB free; swap 1,817 used /
+   6,374 free MiB; pressure 0.00 / 0.00 / 0.00; no build tool; driver 620.70.06; tree ec8cb28; binaries
+   6004c15416fb, 8f509760f785. The EVC2 A B B A has no preflight line of its own; it ran between V10's (05:21:42)
+   and V11's, both clean. chunk103 and chunk104 are byte-identical, so EVC2 is on the landed code.
+3. The Strata table's "ours" columns were measured on chunk101 (1ac3e01, the all-tick cap). Re-run on chunk104
+   (tag H2L): 8,192 rows KV-only 5,771 ms, 8,184 rows mixed 7,758 ms; the first 8 tokens 42.1 ms (23.8 tok/s;
+   steps 49, 46, 46, 40, 40, 38, 40, 39).
+4. "1,178, 1,208 tok/s" is the chunks' rows over the chunks' summed time (16,376 rows in 13.90 and 13.56 s; 13.53 s
+   = 1,210 on chunk104); the tool's own whole-prompt figure in the same logs is 1,151 and 1,179 (1,182 on
+   chunk104), which is the one to set against Strata's whole-prompt timer (885, 806). The cold row (811, 813)
+   uses the chunk-time convention too (the tool's figure there: 743, 741).
+5. serve3's reference: the current baseline reads serve3 79.55 and serve1 34.77 (not 78.68); `v11-serve-060514`
+   is serve1 +1.1%, serve3 -0.8% against it.
+6. The 38.6 serve256k1 session I cited as "previous trees" was on 1ac3e01 with a build running beside it: dropped.
+   The old binaries' sessions are 36.97, 37.09, 37.06 and 39.17; the new binaries' 39.54, 39.57, 38.43: a slow
+   request in 3 of 3 sessions on ec8cb28 and 1 of 4 on a41128e's binaries. Adequately explained (no chunk tick in
+   those sessions, the worker's additions only arm after a chunk), not conclusively: open item.
+7. The TTFT cost's mechanism is unknown: the slots returned empty are the same with and without the cap in EVC2
+   (105 and 10 against 103 and 11).
+8. The TTFT cost is on one request: the first short request after the long prompts reads 1.82 against 1.83 s,
+   the second 1.25 against 1.45 s (+0.2 s). Whether it recurs after every long prompt was not measured. At the
+   default budget the concurrency-1 loadgen wall reads 14.9 -> 15.4 s (one session).
+9. The messages' identity: the chain hashed the empty `content` field; the adjudicator compared
+   `reasoning_content` in the eight `~/qx-chains/evc2-*-w0.json` / `-w2.json` files: one text per prompt across
+   the four sessions (my own comparison of the whole message objects agrees).
+10. -5.5%, not -5.6%; "27 of 240 in VRAM" is the second step (the difference of the first two prints); the row
+    "187, 167, 137, 84 ms" mixes two sessions (187.6, 166.8 and 137.2, 84.5); commit 058bf62's subject overstates
+    (old binaries 37.06 and 39.17, new 38.43 and 39.57).
+LANDED. The baseline stays the run of a41128e.
+
+Short prompts against Strata, the same ids' first 4,096 and 2,048 tokens, alternating (tag H2S; ours chunk104,
+`QX_DS_WARM=1`, the tool's whole-prompt figure): 4,096 tokens: Strata 11.1 s (367 tok/s), ours 6.35 s of chunk
+time (607 tok/s by the tool's timer); 2,048 tokens: Strata 10.7 s (191 tok/s), ours 5.83 s (327 tok/s). The first
+8 tokens after them: Strata 14.6 and 14.0 tok/s, ours 20.3 and 18.2. Both engines have a floor per prompt (ours
+~6 s for a full-stack pass, Strata's ~10.5 s).

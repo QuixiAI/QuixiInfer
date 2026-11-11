@@ -72,6 +72,7 @@ driver JIT at first use.
 | Mixed chunks (`forward_chunk_keep`): the full stack on the last `prompt_keep` (2,796) rows only, the rows before them stopping at the last KV source in the same chunk (`QX_DS_CHUNK_MIXED=0`: two chunks) | the last 8,192 rows at 256k 38.4 -> 18.4 s; server, 3,293-token prompt 5.94 s against 6.94 s without the skip; bit-identical to the split plan and, with the exact knob, to no skip | 2026-11-11 |
 | A chunk's Engram rows on a background thread (direct page reads; each engram layer waits for its rows), the thread on every CPU | 0.4-1.0 s per 4,096-row chunk with the card idle -> 0.06-0.2 s waited. The reads themselves do not get faster however they are issued | 2026-11-11 |
 | Set D with these | score 25.447 -> 19.770: decode256k 38.6, prefill256k 2.2 (the mean over the last 8,192 rows), serve256k3 90.99; three-slot 256k server, 13.3k prompt 26.8 -> 13.0 s (495 -> 1,024 tok/s) | 2026-11-11, `setd-promo8-032500` |
+| Evictions at a prompt chunk's tick capped at the per-token budget (`QX_DS_EVICT_CAP`): the chunk's tick evicted hundreds of VRAM residents and promoted none (the flex tail holds the free slots) | three-slot 256k server: the 64 tokens after a 13k prompt 3.76 -> 3.55 s, after a second one 3.33 -> 2.72 s; scored cases unchanged by construction. Cost: TTFT of the short requests after it +0.1 s | 2026-11-11 |
 
 
 ## Strata on this box (2026-11-07, same files and ids; details in the notebook)
@@ -205,6 +206,15 @@ Read for the "bridge the gap" plan (families 11-13). Numbers are theirs, on thei
   (75% at confidence 0.5), serving hardening and a disk tier for parked states.
 
 ## Rejected: with the reason, so they are not retried
+- 2026-11-11: learning the tiers from the prompt, three forms, all flat in the three-slot 256k server: the
+  chunk's selection counts as a per-token rate in the scores (`chunk-scores-fill.patch`), the layer's hottest
+  NVMe-only records promoted to RAM during the chunk (NVMe selections on the first decode step 36 -> 38 -> 37 with
+  12 / 32 records per layer promoted), the tail's residents without a RAM copy saved into RAM
+  (`evict-cap+flex-save.patch`). The reply to a chat prompt routes differently from the prompt's text: the
+  decode's first misses are not on the records the prompt used most.
+- 2026-11-11: an eviction cap on every tier tick (1ac3e01): prefill128 10.5 -> 15.8, decode256k 38.6 -> 39.4.
+  Window and decode ticks evict in bursts that the next ticks' fill budgets refill; only a prompt chunk's tick
+  cannot be refilled (landed in that form).
 - 2026-11-11: filling the flex tail's empty slots when a prompt ends with the hottest RAM records
   (`~/qx-chains/flex-fill.patch`): empty slots 102 -> 0 in a three-slot server, and nothing moved (64 tokens after
   a 13.3k prompt 3.70 s both ways, loadgen at 1 and 3 unchanged). The slow tokens after a long prompt are not the

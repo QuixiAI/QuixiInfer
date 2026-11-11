@@ -20,7 +20,18 @@
   slot 1's 10k prompt 54.8 s); (3) the full-stack floor (stream fewer bytes: keep the prompt's hottest experts in
   the flex-free VRAM, or 16,384-row chunks); (4) the one-shot cold start (a PTX cache for the per-kernel
   compiles); (5) the Engram projection in f16 (1.3 s per 16k prompt; its f16 weights are 315 MB).
-- Knobs added: `QX_DS_ATTN16`, `QX_DS_GEMM16_BLOCKS`, `QX_DS_CHUNK_MIXED`, `QX_DS_ENGRAM_THREADS`, `QX_DS_LAST`;
+- 2026-11-11 morning (ec8cb28, binaries `~/qx-bins/chunk104`, in `target/release`): evictions at a prompt
+  chunk's tick capped (`QX_DS_EVICT_CAP`): the 64 tokens after a 13k prompt 3.76 -> 3.55 s, after a second prompt
+  3.33 -> 2.72 s; nothing scored moves (the baseline stays a41128e's run). Rejected on the way: the cap on every
+  tick, and three ways of learning the tiers from the prompt (a chat reply routes differently from its prompt).
+- Strata like for like (same 16,384 ids, alternating, ours warmed as a server is, `QX_DS_WARM=1`): prompt 1,178 /
+  1,208 tok/s against 885 / 806; first 8 tokens after it 23.4 tok/s against 14.2-14.3; decode 32.4-32.7 against
+  27.2. As a cold one-shot process ours reads 811-813 (4.4 s of per-kernel compiles in the first chunk).
+- The concurrency-1 rows (serve256k1 37.1-39.6, serve1 32.3-36.5) flip between sessions on any binary: one
+  request of the pair is ~1 s slower in three sessions of four. Unexplained; do not read them as a change's cost
+  without alternating binaries.
+- Knobs added: `QX_DS_ATTN16`, `QX_DS_GEMM16_BLOCKS`, `QX_DS_CHUNK_MIXED`, `QX_DS_ENGRAM_THREADS`, `QX_DS_LAST`,
+  `QX_DS_EVICT_CAP`, `QX_DS_WARM` and `QX_DS_TAIL_PRINT` (qx-ds-check);
   trace op `K` (mixed chunk) in `QX_DS_SCHED_TRACE`, replayed by `qx-ds-replay`.
 
 ## Resume 2026-11-10, night: set D 25.447 promoted (expert side streams + own f16 kernel for prompt chunks); Strata's prefill still ~2x ahead

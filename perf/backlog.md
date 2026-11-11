@@ -10,9 +10,12 @@ invented one. The aggregate score lives in `scoreboard.md`.
 ## Beam
 
 ### Queue as of 2026-11-11 (after set D 19.770; the prompt path is bounded by the experts now)
-1. **The tokens right after a long prompt**: 64 tokens after a 13.3k prompt take 3.70 s (57.8 ms each against
-   ~37 steady); Strata's first 8 after 16k run at 14.4 tok/s, ours 8-11 in the server. Not the empty tail slots
-   (filled: no change). Measure per token: promotions, pool time, staged share, the first step's own cost.
+1. **The tokens right after a long prompt** (partly done 2026-11-11: the chunk-tick eviction cap, 3.76 -> 3.55 s
+   and 3.33 -> 2.72 s for the 64 tokens after a first and a second 13k prompt). What is left is the three-slot
+   server's first steps (174, 102, 82, 79 ms): a tier that has not seen the reply's routing (first step: 18% of
+   selections in VRAM, 16% on NVMe only). Learning from the prompt's counts does not help (three forms tried).
+   Ideas not tried: a faster promotion budget for the first tokens of a reply; keeping a per-conversation set
+   of the previous reply's experts; a larger RAM tier share for the server.
 2. **Chunks while another slot decodes**: the policy "chunk path only when no slot decodes" makes a second long
    prompt wait in windows (10,031 tokens: 54.8 s; slot 0 beside it 21.8 s against 13.0 alone). Try: chunks of a
    bounded size between decode steps (a decoder waits one chunk), or the f16 kernels for prompt windows.
