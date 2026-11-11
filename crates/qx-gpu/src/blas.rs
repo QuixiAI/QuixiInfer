@@ -33,9 +33,26 @@ fn with<R>(need_stream: bool, f: impl FnOnce(sys::cublasHandle_t) -> R) -> R {
     f(hd.0)
 }
 
-/// Creates the cuBLAS handle now (at load, before the expert tier is sized, so its memory is accounted for).
-pub fn init() {
-    with(false, |_| ());
+/// Creates the cuBLAS handle if it does not exist yet; false when the device has no memory for it (the caller
+/// then keeps its exact kernels). The handle takes about 0.4 GiB: created at the first long prompt, from the
+/// headroom, not at load (at load it came out of the expert tier: 12.3 -> 11.9 GiB with three slots at 256k).
+pub fn try_init() -> bool {
+    let mut g = HANDLE.lock().unwrap();
+    if g.is_some() {
+        return true;
+    }
+    crate::mem::bind();
+    let mut h: sys::cublasHandle_t = std::ptr::null_mut();
+    match unsafe { sys::cublasCreate_v2(&mut h).result() } {
+        Ok(()) => {
+            *g = Some(Handle(h, false));
+            true
+        }
+        Err(e) => {
+            eprintln!("cuBLAS: no handle ({e:?}): prompt chunks keep the exact kernels");
+            false
+        }
+    }
 }
 
 /// Y[t][n] = sum_k W[n][k] X[t][k] for t < `t`, n < `n`: `w16` holds N rows of K halves, `x16` T rows of K halves,

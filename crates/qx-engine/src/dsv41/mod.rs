@@ -1136,10 +1136,6 @@ impl<'a> DsEngine<'a> {
                 // allocated by now), less headroom for the runtime's pools and the window graphs
                 // the staging area for DMA-staged experts comes first (its slots are of the largest record)
                 // the share for prompt windows (8 tokens and more) and for decode steps; both in eighths
-                // (cuBLAS's handle and workspace exist before the tier is sized: the chunk path's dense GEMMs)
-                if chunk_rows.is_some() && chunk_gemm() {
-                    qx_gpu::blas::init();
-                }
                 let knob = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d).min(8);
                 // 8/8 and 256 records since 2026-11-06 (were 6/8 and 96): at windows of 128 the GPU takes every RAM
                 // miss by DMA and the pool idles, 10.8 ms per token against 12.3 at the old 64-chunk; 6/8 at 96 made
@@ -2222,7 +2218,7 @@ impl<'a> DsEngine<'a> {
             }
         }
         // QX_DS_CHUNK_GEMM=1: the FFN's dense products once over the chunk's rows (cuBLAS f16 GEMMs), not per slab
-        let chunk_ffn_wide = chunk_gemm() && self.layers.iter().all(|w| w.g_ffn.blas_ok() && w.g_shd.blas_ok());
+        let chunk_ffn_wide = chunk_gemm() && self.layers.iter().all(|w| w.g_ffn.blas_ok() && w.g_shd.blas_ok()) && qx_gpu::blas::try_init();
         if verbose_types() && pos0 == 0 {
             let w = &self.layers[0];
             let t = |g: &MGemv| g.segs.iter().map(|s| format!("{}:{}x{}/{}", s.qx, s.rows, s.cols, s.stride)).collect::<Vec<_>>().join(" ");
