@@ -3055,25 +3055,28 @@ What changed (prompt chunks only; decode, windows and `QX_DS_PREFILL_EXACT=1` ch
    `results.jsonl` still carries the old field name `ms_per_token_last32`.
 
 Measurements (single runs unless said; `~/qx-chains/log.out` tags FILL2, BG, AT, V8, BRK, BRK2, SRV, V9):
-| | promoted tree (da7465b) | 09e123f | a41128e |
+| | promoted tree (da7465b) | 09e123f (chunk88/89) | a41128e (chunk92 unless named) |
 |---|--:|--:|--:|
-| 16k prompt, steady 4,096-row KV-only chunk | 6.2 s | 3.3 s | 2.9 s |
+| 16k prompt, steady 4,096-row KV-only chunk | 6.2 s | 3.3 s | 2.9 s (chunk90/91: 09e123f plus the then-uncommitted mixed chunks) |
 | three-slot 256k server, 13,283-token prompt (`req:` prompt seconds) | 26.84 s | 16.04, 16.06 s | 12.97 s |
 | the same, tok/s | 495 | 828 | 1,024 |
-| server, 3,293-token prompt | | split 8.32 s | 5.94 s (no skip: 6.94 s) |
+| server, 3,293-token prompt | | split plan 8.32 s (chunk91 with `QX_DS_CHUNK_MIXED=0`) | 5.94 s (no skip: 6.94 s, chunk91) |
 | prefill256k (ms per token over the last 8,192 rows) | 4.7 | 2.5 | 2.2 |
 | the last 8,192 rows' wall time at 256k | 38.4 s | 20.1 s | 18.4 s (promotion run; 18.7 s in the run with a 64-row tail) |
 | the KV-only chunk before them (8,192 rows at 245,760) | 20.6 s | 14.9 s | 14.1 s (promotion run; 14.8 s with the tail) |
 Of prefill256k's 4.7 -> 2.2, most is the full stack running on 2,796 rows instead of 8,192 (the breaker's point);
 the kernels' own share shows in the KV-only chunk, which does the same work in both trees: 20.6 -> 14.1 s (-32%).
 The kernel table after (09e123f, `~/qx-chains/nsys3`): `qx_moe_wait_word` 25.7 s (the expert kernels waiting for
-their staged records, over eight streams), experts 16 s, attention 1.6 s, `qx_gemm16` 1.6 s, the Engram
+their staged records, over eight streams), experts 16 s, attention 1.83 s (`qx_ds_attn16` 1.59 s plus the exact
+kernels of the dry passes), `qx_gemm16` 1.58 s, the Engram
 projection (`qx_mgemv_t8z`, exact, 25,600 x 6,144) 1.3 s. Per layer of a steady chunk (125 ms): slab kernels 42
 ms, experts 46-60 ms, copies busy 60-80 ms (3.3 GB): the experts' streaming and arithmetic are what is left.
 A full-stack pass costs about 6 s however few its rows (2,774 rows 6.8 s, 5,544 rows 6.85 s): 40 layers x ~300
 experts x 9.5 MB to stream. That floor is the next target.
 
-Promotion run (a41128e, preflight in the V9 log line: VM off, no build tool, pressure 0.13 / 0.07, 64.8 GiB free):
+Promotion run (a41128e, preflight in the V9 log line: VM off, no build tool, pressure 0.13 / 0.07, 64.8 GiB free,
+swap 1.8 GiB used / 6.4 free; the HOLD and HOLD2 sessions below have no preflight line of their own: nothing was
+built between 03:13 and 04:08):
 | case | baseline | candidate | change |
 |---|--:|--:|--:|
 | decode256k | 38.50 | 38.6, 38.6 | +0.3% (within noise) |
@@ -3149,7 +3152,8 @@ own prompt timer, a fresh process each run): Strata 841 and 880 tok/s (19.5 and 
 (`qx-ds-check`, 8,192-row chunks): 811 and 813 tok/s over the chunks (20.2 s; the first chunk of a cold process
 takes 10.5 s against 5.0-6.0 s in a warm server): **4-8% behind as a one-shot process**. Ours in the warm
 three-slot 256k server, text prompts of 16,587 and 16,311 tokens: 16.25 s and 13.95 s, 1,021 and 1,169 tok/s:
-**ahead in the server**. Decode: the 1k single-stream guard reads 30.6 ms (32.7 tok/s) against Strata's 27.2
+**ahead of those Strata runs with our server warm** (different text, and Strata's process was fresh each time: a
+warm Strata was not measured today; its second run, with the page cache warm, is the 880). Decode: the 1k single-stream guard reads 30.6 ms (32.7 tok/s) against Strata's 27.2
 tok/s on 2026-11-10; the 256k server decodes at 27.05 tok/s at concurrency 1 and 10.99 per request at
 concurrency 3. Right after a 16k prompt we are slower: the first 8 tokens at 4.2 tok/s in `qx-ds-check` and 8-11
 tok/s in the server, against Strata's 14.2-14.4: the tiers are cold after the chunk path returns the flex tail.
@@ -3167,14 +3171,33 @@ What I ran for it (chunk92, tags HOLD and HOLD2, each step under 10 minutes):
   that setting). So serve256k3 reads 90.99, 91.41, 91.41 against the baseline's 91.07: +0.4% at worst.
 - The 8k guard, two sessions (`hold-serve-035136`, `hold2-serve-040119`): serve3 79.55 and 78.99 against 78.68
   (+1.1%, +0.4%); serve1 34.77 and 34.07 against 32.32 (+7.6%, +5.4%: the gate prints REGRESSION on this
-  companion row). serve1 is the mean of two concurrency-1 requests, and those read 8.0-9.6 s in every session
-  since 7f7117f whatever the tree (4ee0e73: 8.02, 9.24; 25c7614: 9.04, 9.58; 7f7117f: 9.03, 9.56; today 9.16,
-  8.59 and 8.11, 9.35); the baseline's pair (8.27, 8.21) is the fastest of the nine sessions on record. I read
-  it as that spread, not as a cost of this change (an 8k server takes no chunk path and none of the changed
-  kernels), and I have not shown that: the first-to-second-request spread at concurrency 1 is still unexplained.
+  companion row). serve1 is the mean of two concurrency-1 requests, and those read 8.0-9.9 s in the ten sessions
+  since 4ee0e73 on five trees (4ee0e73: 8.02, 9.24; 7f7117f: 9.03, 9.56; 4b915b9: 9.71, 8.70 / 9.35, 8.57 / 9.87,
+  8.51 / 8.33, 8.72; 25c7614: 9.04, 9.58; today 9.16, 8.59 and 8.11, 9.35; serve1 32.3-36.5); the baseline's pair
+  (8.27, 8.21) is the fastest of the ten. The slow requests carry more pool and NVMe time (the adjudicator's
+  reading of the counters: second request, pool +3,722 ms / NVMe +197 records in the baseline's 8.21 s, +4,270 /
+  +566 in the 8.59 s, +4,844 / +665 in the 9.35 s): the tier state the warm-up schedule leaves. I read it as that
+  spread, not as a cost of this change (an 8k server takes no chunk path and none of the changed kernels), and I
+  have not shown that: the cause of the spread is open.
 - Accuracy at the length that read 61/64: the 15,153-token prompt, 511 positions against a no-skip exact
   reference: KL mean 0.0091, p99 0.088, max 0.201, top-1 486/511 = 95.1%. With the exact attention kernels
-  (`QX_DS_ATTN16=0`, f16 GEMMs only) the same positions read 0.0082 and 488/511 = 95.5%: this stretch of text sits
-  near the 95% bound on the promoted path too, and the f16 attention costs 2 of 511 rows there.
+  (`QX_DS_ATTN16=0` on chunk92: f16 GEMMs only, not the promoted binary) the same positions read 0.0082 and
+  488/511 = 95.5%: this stretch of text sits near the 95% bound without the f16 attention too, which costs a net
+  2 of 511 rows there (10 lost, 8 gained, 15 wrong either way). The bound is cleared by one row on this sample;
+  the mismatching rows are near-ties (the adjudicator: the reference's top-1 to top-2 margin has a median of 0.08
+  there against 2.2 over all rows).
 - `run.json` of the promotion run now carries `correctness: pass` and the attachments (ds-checks logs, the guard
   rows from the first 8k session, the second identity session, the long-prompt server log).
+
+**Adjudicator (fresh context), second pass: "Verdict: PROMOTE — `perf/results/2026-11-11/setd-promo8-032500`
+(a41128e, binaries chunk92), score 25.447 -> 19.770. The three first-pass blockers are lifted."** Its remaining
+text corrections are applied above (the serve1 history, the binaries of the measurements table, the attention
+figure, the 95.5% arm's binary and the net 2 rows, the Strata sentence, the preflight sentence); `summary.md`
+regenerated and `serve` added to `run.json`'s cases. LANDED and promoted with its scoreboard note.
+
+Tried after the promotion run and rejected (chunk93, `~/qx-chains/flex-fill.patch`, tag FILLV): the tail slots
+that return empty after a prompt (102-105 of 318 in a three-slot server) filled at once with the hottest RAM
+records of their class. Empty slots 102 -> 0; the 64 tokens after the 13.3k prompt 3.70 / 3.70 s against 3.71 /
+3.70 s without, loadgen at 1 and 3 unchanged (24.2-24.4 tok/s; 11.17 / 11.64 against 11.54 / 11.23 per request).
+So the slow first tokens after a long prompt (57.8 ms per token over those 64 against ~37 steady) are not the
+empty slots. Reverted.

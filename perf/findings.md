@@ -67,6 +67,11 @@ driver JIT at first use.
 | Chunk-path experts on 8 side streams (`QX_DS_CHUNK_STREAMS`, `CUDA_DEVICE_MAX_CONNECTIONS=32`): N experts overlap on the card | 16k prompt 361 -> 461 tok/s, prefill256k 5.7 -> 5.2, bit-identical | 2026-11-10 |
 | Prompt chunks' dense products as f16 x f16 -> f32 tensor-core GEMMs by the own kernel `qx_gemm16`, weights decoded to f16 once per layer and chunk (KL-bounded; `QX_DS_PREFILL_EXACT=1` exact) | prefill256k 5.2 -> 4.7; three-slot 256k server, 13.3k prompt: second chunk 16.2 -> 14.5 s; KL 0.005-0.009, top-1 97.5-100% | 2026-11-10 |
 | Set D with both | score 26.925 -> 25.447: decode256k 38.5, prefill256k 4.7, serve256k3 91.07 | 2026-11-10, `setd-promo6-211440` |
+| Prompt-chunk attention on f16 tensor cores (`qx_ds_attn16`, 16 heads x 16 keys per step, running softmax; `QX_DS_ATTN16=0` exact) | attention kernels 9.4 -> 1.8 s of GPU time per 16k prompt; KL against exact 0.0085-0.0091, top-1 95.1-98.4% | 2026-11-11 |
+| `qx_gemm16` planes: the 8 output-projection groups in one launch, products of few output rows K-sliced to ~320 blocks, partials summed in order (`QX_DS_GEMM16_BLOCKS`) | `qx_gemm16` 8.25 -> 1.6 s per 16k prompt: a block's time is its K loop (44 us per 1,024 of K) however few blocks run | 2026-11-11 |
+| Mixed chunks (`forward_chunk_keep`): the full stack on the last `prompt_keep` (2,796) rows only, the rows before them stopping at the last KV source in the same chunk (`QX_DS_CHUNK_MIXED=0`: two chunks) | the last 8,192 rows at 256k 38.4 -> 18.4 s; server, 3,293-token prompt 5.94 s against 6.94 s without the skip; bit-identical to the split plan and, with the exact knob, to no skip | 2026-11-11 |
+| A chunk's Engram rows on a background thread (direct page reads; each engram layer waits for its rows), the thread on every CPU | 0.4-1.0 s per 4,096-row chunk with the card idle -> 0.06-0.2 s waited. The reads themselves do not get faster however they are issued | 2026-11-11 |
+| Set D with these | score 25.447 -> 19.770: decode256k 38.6, prefill256k 2.2 (the mean over the last 8,192 rows), serve256k3 90.99; three-slot 256k server, 13.3k prompt 26.8 -> 13.0 s (495 -> 1,024 tok/s) | 2026-11-11, `setd-promo8-032500` |
 
 
 ## Strata on this box (2026-11-07, same files and ids; details in the notebook)
@@ -83,6 +88,14 @@ prompts is structural (chunk size, tensor cores, launch count), not tuning.
 - So a bf16-tile dense path for prompts would cost at most ~0.03 KL against the exact path, likely under 0.01 with f32 accumulation and the exact K/V and expert paths; what it spends is the bit-identity contract (windows/chunks identity checks, prefix reuse equal to single steps), which would become KL-bounded checks.
 
 ## Correctness rules learned the hard way
+- 2026-11-11: a chunk's dry passes of the slab widths write the ring and store cells of the positions in the
+  window arrays, so the arrays must hold the chunk's first rows for the WIDEST slab: with a first slab narrower
+  than a later one (a mixed chunk with 5 KV-only rows) the wider passes ran on stale positions and overwrote
+  other positions' stored keys (0 of 64 rows; the breaker's test B).
+- 2026-11-11: a thread spawned by the engine thread inherits its one-CPU mask: helper threads set their own
+  affinity. And a helper's panic must stop the engine: a wait on its progress checks that it is alive.
+- 2026-11-11: `prompt_keep` is measured from the prompt's END: anything compared bit for bit before the end (a
+  tool's tail of single steps) must add its length to the keep.
 
 - **Dry first-use windows must preserve incoming compressor pending pairs (2026-11-09).** At ratio 2, a dry
   window spanning positions 1,2 replaces pending position 0 with dry position 2; real position 1 then pools the
@@ -192,6 +205,13 @@ Read for the "bridge the gap" plan (families 11-13). Numbers are theirs, on thei
   (75% at confidence 0.5), serving hardening and a disk tier for parked states.
 
 ## Rejected: with the reason, so they are not retried
+- 2026-11-11: filling the flex tail's empty slots when a prompt ends with the hottest RAM records
+  (`~/qx-chains/flex-fill.patch`): empty slots 102 -> 0 in a three-slot server, and nothing moved (64 tokens after
+  a 13.3k prompt 3.70 s both ways, loadgen at 1 and 3 unchanged). The slow tokens after a long prompt are not the
+  empty slots.
+- 2026-11-11: faster Engram row reads for a chunk (six buffered rings; twelve threads of positioned reads; direct
+  page reads on four rings): 0.4-1.0 s per 4,096 rows every way (positioned reads on threads: slower). Overlapping
+  them with the card's work is what paid.
 - 2026-11-10: cuBLAS for the chunk path's GEMMs (`QX_DS_GEMM16=cublas`, kept as a knob): the fastest arithmetic
   measured (16k prompt chunks 4.8 / 4.6 / 7.5 s against the own kernel's 6.3 / 6.0 / 10.0; prefill256k 4.0 in
   `qx-ds-check`), but its handle and kernel libraries (~1.4 GiB) fit no server's headroom: a panic on the first

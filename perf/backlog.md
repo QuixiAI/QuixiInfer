@@ -9,6 +9,24 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-11 (after set D 19.770; the prompt path is bounded by the experts now)
+1. **The tokens right after a long prompt**: 64 tokens after a 13.3k prompt take 3.70 s (57.8 ms each against
+   ~37 steady); Strata's first 8 after 16k run at 14.4 tok/s, ours 8-11 in the server. Not the empty tail slots
+   (filled: no change). Measure per token: promotions, pool time, staged share, the first step's own cost.
+2. **Chunks while another slot decodes**: the policy "chunk path only when no slot decodes" makes a second long
+   prompt wait in windows (10,031 tokens: 54.8 s; slot 0 beside it 21.8 s against 13.0 alone). Try: chunks of a
+   bounded size between decode steps (a decoder waits one chunk), or the f16 kernels for prompt windows.
+3. **The full-stack floor (~6 s per pass, however few rows)**: 40 layers x ~300 experts x 9.5 MB. Fewer bytes:
+   route a short prompt's layers through the resident experts first; 16,384-row chunks for prompts over 8k (one
+   pass less); the upper layers' experts prefetched while the lower layers run.
+4. **Expert arithmetic in the chunk path**: 46-60 ms per layer of a 4,096-row chunk on int8 tensor cores (exact);
+   an f16 tile kernel is allowed there (KL-bounded) if decode of the IQ formats to f16 is cheap enough per expert.
+5. **One-shot cold start**: ~45 per-kernel NVRTC compiles and the dry passes put 4.5 s on a fresh process's
+   first chunk (811 against Strata's 841-880 tok/s on 16k). A PTX cache on disk.
+6. **The Engram projection in f16** (`qx_mgemv_t8z`, 1.3 s per 16k prompt): its f16 weights are 315 MB of scratch.
+7. Carried: the concurrency-1 request spread (8.0-9.9 s, pool and NVMe time of the warm-up's tier state), the
+   slow first token (~1 session in 8), `serve 200 calls` in the prefill256k log.
+
 ### Queue as of 2026-11-10 (after the conjecturer pass, `perf/ideation/2026-11-10-conjecturer.md`)
 1. **Narrow staged share (widths 2-3 at 4/8)**: candidate default in 0bc58dc, serve256k3 -10.4%; set D, breaker,
    adjudicator pending.

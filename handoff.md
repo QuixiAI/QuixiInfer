@@ -1,6 +1,27 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-09, late evening)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-11)
 
 
+
+## Resume 2026-11-11: set D 19.770 promoted (f16 attention, filled GEMM launches, mixed chunks, Engram thread); prefill ahead of Strata in a warm server, 4-8% behind as a one-shot process
+- **Promoted** `perf/results/2026-11-11/setd-promo8-032500` (a41128e, binaries `~/qx-bins/chunk92`): decode256k
+  38.6, prefill256k 2.2, serve256k3 90.99, score 19.770. Breaker (one defect found and fixed: dry passes on stale
+  arrays in a mixed chunk), adjudicator HOLD then PROMOTE. prefill256k's value is now the mean over its last 8,192
+  rows (`QX_DS_LAST=8192`; the same quantity as before while one chunk held them).
+- Against Strata on the same 16,384 ids, alternating (2026-11-11): Strata 841 / 880 tok/s (fresh process); ours
+  as a fresh process 811 / 813 (the first chunk of a cold process takes 10.5 s against 5-6 s warm: ~45 per-kernel
+  NVRTC compiles and the dry passes); ours in the warm three-slot 256k server 1,021-1,169 tok/s on ~16k-token text
+  prompts (13.3k: 1,024). Decode: 32.7 tok/s (1k guard) against 27.2; right after a 16k prompt ours is slower
+  (first 8 tokens 8-11 tok/s in the server against Strata's 14.4).
+- What bounds a prompt now: the experts. Per layer of a steady 4,096-row chunk (125 ms): slab kernels 42 ms,
+  expert kernels 46-60 ms (int8 tensor cores, eight streams), copies 60-80 ms (3.3 GB). A full-stack pass costs
+  ~6 s however few its rows (40 layers x ~300 experts x 9.5 MB streamed; 3,478 of 13,581 records are on NVMe).
+- Next, in order: (1) the tokens right after a long prompt (57.8 ms per token over the first 64 against ~37
+  steady; not the empty tail slots: tried); (2) two long prompts at once (chunks run only while no slot decodes:
+  slot 1's 10k prompt 54.8 s); (3) the full-stack floor (stream fewer bytes: keep the prompt's hottest experts in
+  the flex-free VRAM, or 16,384-row chunks); (4) the one-shot cold start (a PTX cache for the per-kernel
+  compiles); (5) the Engram projection in f16 (1.3 s per 16k prompt; its f16 weights are 315 MB).
+- Knobs added: `QX_DS_ATTN16`, `QX_DS_GEMM16_BLOCKS`, `QX_DS_CHUNK_MIXED`, `QX_DS_ENGRAM_THREADS`, `QX_DS_LAST`;
+  trace op `K` (mixed chunk) in `QX_DS_SCHED_TRACE`, replayed by `qx-ds-replay`.
 
 ## Resume 2026-11-10, night: set D 25.447 promoted (expert side streams + own f16 kernel for prompt chunks); Strata's prefill still ~2x ahead
 - 2026-11-10: the user's instruction: **match or exceed Strata's prefill and decode** (goal prompt, "Match Strata";
