@@ -3016,3 +3016,113 @@ all applied in the committed text (HEAD 3e0d906, tree clean), and the measuremen
 previous pass."** Its non-blocking notes: the multi-arch evidence is a compile of the one changed kernel file, not
 a full `QX_NVCC_ARCHS` cargo build (to run in the background and record); the second session on the box is
 outside the run window. LANDED and promoted with its scoreboard note.
+
+## 2026-11-11: Prompt chunks: f16 attention, filled f16 GEMM launches, the full stack on the kept rows only (mixed chunks), Engram rows off the critical path — set D 25.447 -> 19.770 (prefill256k 4.7 -> 2.2); three-slot 256k server, 13,283-token prompt 26.9 s -> 13.0 s (494 -> 1,024 tok/s); promotion run `perf/results/2026-11-11/setd-promo8-032500` (adjudication below)
+
+Trees: 09e123f (attention, GEMM planes, Engram thread, keep split) and a41128e (mixed chunks, the breaker's
+fixes); binaries chunk92 = a41128e clean (qx-ds-check 514c699145bd, quixiinfer 124920a690f2).
+Hypothesis (from the nsys table of the promoted tree, `~/qx-chains/nsys2`, 16k prompt, 37.2 s of kernel time):
+`qx_gemm16` 8.25 s, of which 4.6 s were 25,600 launches of 16 blocks (the eight output-projection groups, one
+launch each: a block's time is its K loop, 44 us per 1,024 of K, however few blocks run) and 1.7 s the 8- and
+20-block launches of `g_x`; the exact attention kernels 9.4 s; the Engram row reads 0.4-1.0 s per 4,096-row chunk
+with the card idle; and the final chunk ran all 40 layers on every row where only the last `prompt_keep` (2,796)
+need them.
+
+What changed (prompt chunks only; decode, windows and `QX_DS_PREFILL_EXACT=1` chunks keep the exact kernels):
+1. `qx_gemm16` takes planes (groups x K slices): the eight `wo_a` groups in one launch, products of few output rows
+   K-sliced to about 320 blocks, the slices' partials added in order by `qx_gemm16_sum` (the same bits every run;
+   a row's bits do not depend on the slab or chunk it is in). 8.25 s -> 1.6 s. `QX_DS_GEMM16_BLOCKS=0` never slices.
+2. `qx_ds_attn16`: the chunk's attention on f16 tensor cores, 16 heads x 16 keys per step with a running softmax
+   (m = sink, l = 1 at the start). 9.4 s -> 1.6 s. `QX_DS_ATTN16=0` keeps the exact kernels.
+3. Mixed chunks (`forward_chunk_keep`): the rows before the kept ones stop at the last KV source inside the same
+   chunk, so the layers above run on the kept rows only and the lower layers stream their experts once. A prompt
+   longer than a chunk runs KV-only chunks up to the kept rows. `QX_DS_CHUNK_MIXED=0`: a KV-only chunk and a chunk
+   of the kept rows (the plan of 09e123f). The server and `qx-ds-check` plan the same way; `qx-ds-check` adds its
+   tail to the keep (the tail's first rows are compared bit for bit).
+4. A chunk's Engram rows on a thread (direct page reads, four rings), each engram layer (1 and 14) waiting for
+   its rows. What I tried first and measured: six buffered rings, twelve threads of positioned reads, direct
+   reads in line: the same 0.4-1.0 s each, so the reads were not limited by how they were issued; they now
+   overlap the card's work. `QX_DS_ENGRAM_THREADS=0` gathers in line.
+5. Harness: prefill256k's value is the mean over its last 8,192 rows (`QX_DS_LAST=8192`): the last 8,192 rows
+   were one full-stack chunk until today, so "the last 32" was that chunk's per-row time; with the full stack on
+   the kept rows only the per-row time differs inside the chunk. The old binaries (chunk81) under today's
+   harness read 4.7 (rows at 253952: 38,430 ms), as the baseline row does. `perf/perf.md` updated.
+
+Measurements (single runs unless said; `~/qx-chains/log.out` tags FILL2, BG, AT, V8, BRK, BRK2, SRV, V9):
+| | promoted tree (da7465b) | 09e123f | a41128e |
+|---|--:|--:|--:|
+| 16k prompt, steady 4,096-row KV-only chunk | 6.2 s | 3.3 s | 2.9 s |
+| three-slot 256k server, 13,283-token prompt (`req:` prompt seconds) | 26.84 s | 16.04, 16.06 s | 12.97 s |
+| the same, tok/s | 494 | 828 | 1,024 |
+| server, 3,293-token prompt | | split 8.32 s | 5.94 s (no skip: 6.94 s) |
+| prefill256k (ms per token over the last 8,192 rows) | 4.7 | 2.5 | 2.2 |
+| the last 8,192 rows' wall time at 256k | 38.5 s | 20.1 s | 18.7 s |
+| the KV-only chunk before them (8,192 rows at 245,760) | 20.5 s | 14.9 s | 14.8 s |
+Of prefill256k's 4.7 -> 2.2, most is the full stack running on 2,796 rows instead of 8,192 (the breaker's point);
+the kernels' own share shows in the KV-only chunk: 20.5 -> 14.8 s (-28%).
+The kernel table after (09e123f, `~/qx-chains/nsys3`): `qx_moe_wait_word` 25.7 s (the expert kernels waiting for
+their staged records, over eight streams), experts 16 s, attention 1.6 s, `qx_gemm16` 1.6 s, the Engram
+projection (`qx_mgemv_t8z`, exact, 25,600 x 6,144) 1.3 s. Per layer of a steady chunk (125 ms): slab kernels 42
+ms, experts 46-60 ms, copies busy 60-80 ms (3.3 GB): the experts' streaming and arithmetic are what is left.
+A full-stack pass costs about 6 s however few its rows (2,774 rows 6.8 s, 5,544 rows 6.85 s): 40 layers x ~300
+experts x 9.5 MB to stream. That floor is the next target.
+
+Promotion run (a41128e, preflight in the V9 log line: VM off, no build tool, pressure 0.13 / 0.07, 64.8 GiB free):
+| case | baseline | candidate | change |
+|---|--:|--:|--:|
+| decode256k | 38.50 | 38.6, 38.6 | +0.3% (within noise) |
+| prefill256k | 4.70 | 2.2 | -53.2% |
+| serve256k3 | 91.07 | 90.99 | -0.1% |
+| serve256k1 | 39.14 | 36.97 | -5.5% |
+| decode | 31.00 | 30.6 | -1.3% |
+| prefill128 | 10.50 | 10.5 | 0 |
+Score 25.447 -> 19.770. Identity (serve256k-1, the session's dump against the reference): identical.
+
+Correctness and accuracy (all on chunk92 unless said):
+- ds-checks part a and part b: pass (lines V9 in the log; windows of 3 / 8 / 64 bit-identical, rewind, mixed
+  sequences, production vs reference 57/59 as before).
+- Exact knob: prefill256k configuration, 64 tail rows against the exact dump of 2026-11-10 (`pe.bin`): 64/64
+  bit-identical. 16,383-token prompt (the full stack starts on an odd position, 13,523) against a no-skip exact
+  reference: 64/64. 15,153-token prompt (5 rows of a chunk before the kept ones; chunk91): 64/64.
+- f16 default against the exact path: 511 positions after a 16k prompt KL mean 0.0087, top-1 97.7% (09e123f);
+  prefill256k configuration, 64 rows: KL 0.0085, max 0.115, top-1 98.4%; 16,383 tokens, 64 rows: KL 0.0072, top-1
+  98.4%; 15,153 tokens, 64 rows: KL 0.0110, top-1 95.3% (3 of 64 rows; the bound is 0.03 and 95%). No NaN line.
+- Mixed against split, f16: 64/64 rows bit-identical on both prompts (the chunk plan does not change the bits).
+- Three-slot 256k server, two long prompts at once (13,283 tokens on slot 0, 10,031 on slot 1), exact knob: the
+  last 60 decode rows' hashes per slot equal to a no-skip exact session's (60/60 and 60/60; chunk91 and again
+  chunk92). `qx-ds-replay` of the exact trace and of an f16 trace (chunk91): 98 forwards, 2,413 rows, 0 mismatches
+  each: the f16 path's bits are a function of the schedule.
+- Server sessions: no panic, no `fatal`, no `chunk scratch ... outside the flex tail` line.
+- `gemm.cu` (flattened, sha256 2b20765ef12b, with `qx_ds_attn16`, `qx_gemm16_sum`) compiles with the build
+  script's nvcc (cuda-13.3) `-cubin` for sm_86, sm_89, sm_120a, exit 0 each (`~/qx-chains/archs/gemm2-*`). The full
+  `QX_NVCC_ARCHS` cargo build of the previous tree finished with exit 0 at 21:47 on 2026-11-10.
+
+The breaker (fresh context, read-only review of 09e123f, then its tests run by me):
+- Found by its test B: a chunk whose first slab is narrower than a later one ran the wider slabs' dry passes on
+  the first slab's token arrays, so they wrote ring and store cells of stale positions: 0/64 rows on the 5-row
+  case (chunk90). Introduced by the mixed chunk (before it a chunk's first slab was its widest). Fixed: the
+  arrays cover the widest slab; 64/64 (chunk91).
+- The Engram thread inherited the engine thread's one-CPU mask: the server waited 373-480 ms at engram layer 1.
+  Fixed (every CPU; nothing in it spins): 60-215 ms in the V9 server.
+- A failed Engram read would have left the engine waiting forever: the wait now asserts the thread is alive.
+- Its metric objection is answered in point 5 above; its cost objection (the split streamed the lower layers'
+  experts twice: NVMe records +29% on the 13.3k prompt, prompts of 3-6k tokens slower than no skip) is what the
+  mixed chunk removes (3,293 tokens: 5.94 s against 6.94 s without the skip).
+- Checked by it and found sound: the keep derivation (from existing dumps: exactness starts 19 x 127 rows after
+  the boundary; 2,796 leaves 255 spare), the info ring's stale words (every `qx_gemm16` call passes [7]),
+  `blas_map`'s lifetime, the scratch sizes (partials 16.8 MB against a worst need of 12.6), the direct reads (rows
+  never straddle a page), the attention kernel's layouts, masking, ring wrap and slot indexing.
+
+Costs and what is not covered:
+- With two long prompts at once the second waits: chunks run only while no slot decodes, so slot 1's prompt went
+  on in windows once slot 0 decoded (10,031 tokens: 54.8 s on the f16 path, 81 s exact). That policy is older than
+  this work; it is now the largest prompt-side cost under load.
+- f16 `QX_DS_GEMM16=cublas` was not re-run on these trees (the code path compiles; the knob stays opt-in).
+- `qx-ds-multi` all rows: not run (no window, scheduler or job-path change).
+- top-1 on the 15,153-token case is 95.3% over 64 rows, at the bound; the larger samples read 97.7-98.4%.
+- The server's long-prompt numbers are single sessions (two for 09e123f: 16.04 and 16.06 s).
+
+Against Strata (its numbers of 2026-11-10 on this box: 765 tok/s cold, 905 warm on a 16k prompt; decode 27.2
+tok/s): our three-slot 256k server reads 1,024 tok/s on a 13.3k-token prompt and decodes at 32.7 tok/s (decode
+30.6 ms). Not yet like for like: a different prompt length and our own timer; a same-prompt run of both is the
+next measurement.
