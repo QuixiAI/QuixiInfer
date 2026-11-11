@@ -79,8 +79,52 @@ pub fn gemm16(gpu: &Gpu, w16: u64, k: usize, n: usize, x16: u64, t: usize, y: u6
     if gemm16_cublas() {
         qx_gpu::blas::gemm_hss(w16, k, n, x16, t, y, ldc);
     } else {
-        gpu.run(modules::GEMM.kernel("qx_gemm16", CubeDim::new_1d(256)), ((n as u32).div_ceil(64), (t as u32).div_ceil(128), 1), &[x16, w16, y, t as u64, n as u64, k as u64, ldc as u64]);
+        // ([7] = 0: one plane; the info ring's slot keeps an earlier launch's words beyond the ones passed)
+        gpu.run(modules::GEMM.kernel("qx_gemm16", CubeDim::new_1d(256)), ((n as u32).div_ceil(64), (t as u32).div_ceil(128), 1), &[x16, w16, y, t as u64, n as u64, k as u64, ldc as u64, 0]);
     }
+}
+
+/// K slices for a `qx_gemm16` launch of `groups` products of `n` output rows over `t` rows of `k`: a block's time
+/// is its K loop's (44 us per 1,024 of K measured, however few blocks run), so a product of a few dozen blocks
+/// leaves the card idle; slices make about QX_DS_GEMM16_BLOCKS (320; 0 = never slice) blocks of it, each slice at
+/// least 1,024 of K.
+pub fn gemm16_slices(n: usize, k: usize, t: usize, groups: usize) -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let target = *V.get_or_init(|| std::env::var("QX_DS_GEMM16_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(320));
+    let blocks = n.div_ceil(64) * t.div_ceil(128) * groups;
+    if target == 0 { 1 } else { ((target + blocks / 2) / blocks).clamp(1, (k / 1024).max(1)) }
+}
+
+/// `groups` products in one `qx_gemm16` launch, each of `n` output rows over `t` rows of `k`, K-sliced to fill the
+/// card (`gemm16_slices`): group g reads x16 + g * dx bytes (rows `xstride` halves apart) and w16 + g * n * k * 2
+/// bytes, and writes y + g * dy bytes (rows `ystride` floats apart). Sliced products pass through the partials
+/// buffer `p` (`p_bytes`) and `qx_gemm16_sum`, which adds the slices in order.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm16_planes(gpu: &Gpu, x16: u64, xstride: usize, dx: usize, w16: u64, y: u64, ystride: usize, dy: usize, t: usize, n: usize, k: usize, groups: usize, p: u64, p_bytes: usize) {
+    let mut s = gemm16_slices(n, k, t, groups);
+    while s > 1 && groups * s * t * n * 4 > p_bytes {
+        s -= 1;
+    }
+    let ks = k.div_ceil(s).div_ceil(32) * 32;
+    let grid = ((n as u32).div_ceil(64), (t as u32).div_ceil(128), (groups * s) as u32);
+    let k16 = modules::GEMM.kernel("qx_gemm16", CubeDim::new_1d(256));
+    if s == 1 {
+        gpu.run(k16, grid, &[x16, w16, y, t as u64, n as u64, k as u64, ystride as u64, xstride as u64, k as u64, 1, k as u64, dx as u64, (n * k * 2) as u64, dy as u64]);
+    } else {
+        gpu.run(k16, grid, &[x16, w16, p, t as u64, n as u64, k as u64, n as u64, xstride as u64, k as u64, s as u64, ks as u64, dx as u64, (n * k * 2) as u64, (t * n * 4) as u64]);
+        gpu.run(modules::GEMM.kernel("qx_gemm16_sum", CubeDim::new_1d(256)), (((groups * t * n) as u32).div_ceil(256), 1, 1), &[p, y, t as u64, n as u64, ystride as u64, s as u64, groups as u64, dy as u64, 0, n as u64]);
+    }
+}
+
+/// The grouped output projection's first half for `t` rows in one launch: group g's product reads its `gd` columns
+/// of the x rows (`x_stride` floats apart, converted whole to f16 in `x16`) with the f16 weights `prep_w16` left
+/// at base + g * rows * cols * 2. The caller checked that every group is one f16 segment of the same shape.
+#[allow(clippy::too_many_arguments)]
+pub fn run_blas_groups(gpu: &Gpu, groups: &[MGemv], x: u64, x_stride: usize, gd: usize, t: usize, x16: u64, base: u64, p: u64, p_bytes: usize) {
+    gpu.run(modules::GEMM.kernel("qx_x16", CubeDim::new_1d(256)), (((t * x_stride) as u32).div_ceil(256), 1, 1), &[x, x_stride as u64, x16, t as u64, x_stride as u64]);
+    let s0 = &groups[0].segs[0];
+    let dy = if groups.len() > 1 { (groups[1].segs[0].y - s0.y) as usize } else { 0 };
+    gemm16_planes(gpu, x16, x_stride, gd * 2, base, s0.y, s0.rows, dy, t, s0.rows, s0.cols, groups.len(), p, p_bytes);
 }
 
 /// One matrix of a `qx_mgemv` launch: `y = W . x`. `qx` is the kernel type id (`qx_type` or a planar id),
@@ -382,19 +426,36 @@ impl MGemv {
 
     /// The products for `t` rows (x rows `x_stride` floats apart) from the f16 weights `prep_w16` left at `base`: x
     /// to f16 (`x16`), then one cuBLAS half-precision GEMM with f32 accumulation per segment; F32 segments in f32.
-    pub fn run_blas_cached(&self, gpu: &Gpu, x: u64, x_stride: usize, t: usize, x16: u64, base: u64) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_blas_cached(&self, gpu: &Gpu, x: u64, x_stride: usize, t: usize, x16: u64, base: u64, p: u64, p_bytes: usize) {
         let k = self.tcols;
         gpu.run(modules::GEMM.kernel("qx_x16", CubeDim::new_1d(256)), (((t * k) as u32).div_ceil(256), 1, 1), &[x, x_stride as u64, x16, t as u64, k as u64]);
-        let mut off = 0u64;
-        for s in &self.segs {
-            let (rows, cols) = (s.rows as u64, s.cols as u64);
-            if s.qx == 0 {
-                assert!(x_stride == k, "an F32 segment with strided inputs");
-                gpu.run(modules::GEMM.kernel("qx_gemm_f32", CubeDim::new_1d(256)), ((s.rows as u32).div_ceil(64), (t as u32).div_ceil(64), 1), &[x, s.w, s.y, t as u64, rows, cols, rows]);
-            } else {
+        for s in self.segs.iter().filter(|s| s.qx == 0) {
+            assert!(x_stride == k, "an F32 segment with strided inputs");
+            gpu.run(modules::GEMM.kernel("qx_gemm_f32", CubeDim::new_1d(256)), ((s.rows as u32).div_ceil(64), (t as u32).div_ceil(64), 1), &[x, s.w, s.y, t as u64, s.rows as u64, s.cols as u64, s.rows as u64]);
+        }
+        let f16: Vec<&Seg> = self.segs.iter().filter(|s| s.qx != 0).collect();
+        // the f16 segments' weights lie one after the other at `base`: one product of all their rows, K-sliced to
+        // fill the card, each segment's columns summed out of the partials into its own output
+        let n: usize = f16.iter().map(|s| s.rows).sum();
+        let mut sl = if gemm16_cublas() || f16.iter().any(|s| s.cols != k) { 1 } else { gemm16_slices(n, k, t, 1) };
+        while sl > 1 && sl * t * n * 4 > p_bytes {
+            sl -= 1;
+        }
+        if sl == 1 {
+            let mut off = 0u64;
+            for s in f16 {
                 gemm16(gpu, base + off, s.cols, s.rows, x16, t, s.y, s.rows);
                 off += (s.rows * s.cols * 2) as u64;
             }
+            return;
+        }
+        let ks = k.div_ceil(sl).div_ceil(32) * 32;
+        gpu.run(modules::GEMM.kernel("qx_gemm16", CubeDim::new_1d(256)), ((n as u32).div_ceil(64), (t as u32).div_ceil(128), sl as u32), &[x16, base, p, t as u64, n as u64, k as u64, n as u64, k as u64, k as u64, sl as u64, ks as u64, 0, 0, (t * n * 4) as u64]);
+        let mut n0 = 0usize;
+        for s in f16 {
+            gpu.run(modules::GEMM.kernel("qx_gemm16_sum", CubeDim::new_1d(256)), (((t * s.rows) as u32).div_ceil(256), 1, 1), &[p, s.y, t as u64, s.rows as u64, s.rows as u64, sl as u64, 1, 0, n0 as u64, n as u64]);
+            n0 += s.rows;
         }
     }
 

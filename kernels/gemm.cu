@@ -734,15 +734,27 @@ QX_DEV void mma_f16(float* c, const u32* a, const u32* b) {
 /// Y[t][n] = sum_k W[n][k] X[t][k] with X and W as f16 rows of K (K a multiple of 16; `qx_x16`, `qx_w16`) and f32
 /// accumulation on tensor cores: `gemm_tile` without a decoder (the operands are copied into the tile as they are).
 /// A 128 x 64 output tile per block, 8 warps. info: [0] X16 (T x K), [1] W16 (N x K), [2] Y, [3] T, [4] N, [5] K,
-/// [6] Y row stride. Grid (ceil(N / 64), ceil(T / 128)), 256 threads. No library, no extra memory: prompt chunks
+/// [6] Y row stride. Grid (ceil(N / 64), ceil(T / 128), planes), 256 threads. With info[7] != 0 the launch holds
+/// G groups x S K-slices as planes (a product with few output rows is a few dozen blocks: far too few for the card;
+/// slicing K, or launching a layer's groups together, fills it): [5] is a group's K, [7] the X row stride and [8]
+/// the W row stride in halves, [9] S, [10] the K span of a slice (a multiple of BK), [11] / [12] the bytes between
+/// two groups' X / W, [13] the bytes between two planes' Y. Sliced products go to a partials buffer and
+/// `qx_gemm16_sum` adds the slices in order: the same bits on every run. No library, no extra memory: prompt chunks
 /// in a server, where cuBLAS's handle and kernel libraries do not fit the headroom.
 extern "C" __global__ void __launch_bounds__(256) qx_gemm16(const u64* info) {
     constexpr int BTT = 128, WM = 4, WN = 2, MI = 2, NI = 4, BNN = WN * NI * 8;
     __shared__ u32 smem[(BTT + BNN) * (BK / 2 + 4)];
-    const u32 T = (u32)info[3], N = (u32)info[4], K = (u32)info[5];
-    const u16* X = reinterpret_cast<const u16*>(info[0]);
-    const u16* W = reinterpret_cast<const u16*>(info[1]);
-    float* Y = reinterpret_cast<float*>(info[2]);
+    // planes (grid z): plane z = g * S + s is group g's K slice s. info[7] = 0 keeps the one-plane form.
+    const u32 T = (u32)info[3], N = (u32)info[4];
+    const bool planes = info[7] != 0;
+    const u32 S = planes ? (u32)info[9] : 1, gz = blockIdx.z / S, sz = blockIdx.z % S;
+    const u32 XS = planes ? (u32)info[7] : (u32)info[5], WS = planes ? (u32)info[8] : (u32)info[5];
+    const u32 Kg = (u32)info[5], Ks = planes ? (u32)info[10] : Kg;
+    const u32 kb = sz * Ks;
+    const u32 K = kb >= Kg ? 0 : (Kg - kb < Ks ? Kg - kb : Ks);
+    const u16* X = reinterpret_cast<const u16*>(info[0] + (planes ? gz * info[11] : 0)) + kb;
+    const u16* W = reinterpret_cast<const u16*>(info[1] + (planes ? gz * info[12] : 0)) + kb;
+    float* Y = reinterpret_cast<float*>(info[2] + (planes ? blockIdx.z * info[13] : 0));
     const u64 ystride = info[6];
     const u32 t0 = blockIdx.y * BTT, n0 = blockIdx.x * BNN;
     auto xs = reinterpret_cast<u32(*)[BK / 2 + 4]>(smem);
@@ -756,7 +768,7 @@ extern "C" __global__ void __launch_bounds__(256) qx_gemm16(const u64* info) {
             const u32 t = t0 + r;
             u32 v[4] = {0, 0, 0, 0};
             if (t < T && k0 + c8 < K) {
-                const u32* xp = reinterpret_cast<const u32*>(X + (u64)t * K + k0 + c8);
+                const u32* xp = reinterpret_cast<const u32*>(X + (u64)t * XS + k0 + c8);
 #pragma unroll
                 for (int j = 0; j < 4; ++j) v[j] = xp[j];
             }
@@ -768,7 +780,7 @@ extern "C" __global__ void __launch_bounds__(256) qx_gemm16(const u64* info) {
             const u32 n = n0 + r;
             u32 v[4] = {0, 0, 0, 0};
             if (n < N && k0 + c8 < K) {
-                const u32* wp = reinterpret_cast<const u32*>(W + (u64)n * K + k0 + c8);
+                const u32* wp = reinterpret_cast<const u32*>(W + (u64)n * WS + k0 + c8);
 #pragma unroll
                 for (int j = 0; j < 4; ++j) v[j] = wp[j];
             }
@@ -812,6 +824,20 @@ extern "C" __global__ void __launch_bounds__(256) qx_gemm16(const u64* info) {
                 const u32 n = n0 + wn + ni * 8 + 2 * q + (e & 1);
                 if (t < T && n < N) Y[(u64)t * ystride + n] = acc[mi][ni][e];
             }
+}
+
+/// Adds the S K-slices of `qx_gemm16`'s planes, in order. info: [0] P (planes of T x NP floats, plane g * S + s),
+/// [1] Y (group g's rows at Y + g * [7] bytes, [4] floats apart), [2] T, [3] N (columns written), [4] Y row stride,
+/// [5] S, [6] G, [7] bytes between two groups' Y, [8] the first column in P, [9] NP. Grid ceil(G * T * N / 256).
+extern "C" __global__ void qx_gemm16_sum(const u64* info) {
+    const u64 T = info[2], N = info[3], S = info[5], G = info[6], NP = info[9];
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= G * T * N) return;
+    const u64 g = i / (T * N), t = (i / N) % T, n = i % N;
+    const float* P = reinterpret_cast<const float*>(info[0]) + g * S * T * NP + t * NP + info[8] + n;
+    float a = 0.f;
+    for (u64 s = 0; s < S; ++s) a += P[s * T * NP];
+    reinterpret_cast<float*>(info[1] + g * info[7])[t * info[4] + n] = a;
 }
 
 /// A weight matrix decoded to f16 rows (for cuBLAS half-precision GEMMs: once per matrix and chunk, instead of once
@@ -871,4 +897,121 @@ extern "C" __global__ void qx_tmv_prep(const u64* info) {
         }
     }
     reinterpret_cast<u32*>(info[6])[i] = pack_bf16(v0, v1);
+}
+
+/// Prompt-chunk attention on f16 tensor cores (KL-bounded against the exact kernels `qx_ds_attn_part` + `_merge`,
+/// never their bits: prompt chunks only). Block (hg, t): heads [16 hg, 16 hg + 16) of token t against its key list
+/// (the window's ring rows, then the selected compressed rows; the latent row is key and value) in chunks of 16
+/// keys, with a running softmax: per chunk the scores S = Q K^T (m16n8k16, the queries and the chunk's keys as f16
+/// in shared memory, f32 accumulation; two key tiles x four K quarters over the eight warps), each head's running
+/// maximum m and sum l updated (they start at the head's sink: m = sink, l = 1), the output accumulators scaled by
+/// e^(m_old - m_new) and P V added (the probabilities as f16, 64 dimensions per warp). o = acc / l.
+/// info: [0..14] as qx_ds_attn_part (q, ring table, W, positions, slots, sel, sel counts, store table, store row
+/// stride, sinks, out, scale, n_swa, k_sel, dim = 512). Grid (H / 16, T), 256 threads.
+extern "C" __global__ void __launch_bounds__(256) qx_ds_attn16(const u64* info) {
+    constexpr u32 HG = 16, KC = 16, DIM = 512;
+    __shared__ u32 qs[HG][DIM / 2];
+    __shared__ u32 ks[KC][DIM / 2];
+    __shared__ float ps[4][HG][KC];
+    __shared__ u32 p16[HG][KC / 2];
+    __shared__ float fac[HG], mrun[HG], lrun[HG];
+    const u32 hg = blockIdx.x, t = blockIdx.y, dim = DIM, W = (u32)info[2], n_swa = (u32)info[12], ksel = (u32)info[13];
+    const u32 H = gridDim.x * HG, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const u32 pos = reinterpret_cast<const u32*>(info[3])[t], slot = reinterpret_cast<const u32*>(info[4])[t];
+    const float* ring = reinterpret_cast<const float*>(reinterpret_cast<const u64*>(info[1])[slot]);
+    const u32 first = pos + 1 > n_swa ? pos + 1 - n_swa : 0;
+    const u32 nw = pos + 1 - first;
+    const u32 ns = info[6] ? reinterpret_cast<const u32*>(info[6])[t] : 0;
+    const i32* sel = info[5] ? reinterpret_cast<const i32*>(info[5]) + (u64)t * ksel : nullptr;
+    const float* store = ns ? reinterpret_cast<const float*>(reinterpret_cast<const u64*>(info[7])[slot]) : nullptr;
+    const float scale = __uint_as_float((u32)info[11]);
+    const float ninf = __int_as_float(0xff800000);
+    const u32 nk = nw + ns;
+    const float* q = reinterpret_cast<const float*>(info[0]) + ((u64)t * H + hg * HG) * dim;
+    for (u32 i = tid; i < HG * dim / 2; i += blockDim.x) {
+        const u32 r = i / (dim / 2), c = i % (dim / 2);
+        qs[r][c] = (u32)f32_to_f16(q[r * dim + 2 * c]) | ((u32)f32_to_f16(q[r * dim + 2 * c + 1]) << 16);
+    }
+    if (tid < HG) {
+        mrun[tid] = reinterpret_cast<const float*>(info[9])[hg * HG + tid];
+        lrun[tid] = 1.f;
+    }
+    float acc[8][4] = {};
+    const u32 g = lane / 4, qq = lane % 4;
+    for (u32 j0 = 0; j0 < nk; j0 += KC) {
+        // the chunk's key rows as f16 (zero beyond the list: their probabilities are zero too)
+        for (u32 i = tid; i < KC * dim / 2; i += blockDim.x) {
+            const u32 j = i / (dim / 2), c = i % (dim / 2), jj = j0 + j;
+            u32 v = 0;
+            if (jj < nk) {
+                const float* kr = jj < nw ? ring + (u64)((first + jj) % W) * dim : store + (u64)sel[jj - nw] * info[8];
+                v = (u32)f32_to_f16(kr[2 * c]) | ((u32)f32_to_f16(kr[2 * c + 1]) << 16);
+            }
+            ks[j][c] = v;
+        }
+        __syncthreads();
+        // scores: warp (key tile nt, K quarter kq)
+        {
+            const u32 nt = warp & 1, kq = warp >> 1;
+            float s[4] = {0.f, 0.f, 0.f, 0.f};
+            for (u32 kk = kq * (dim / 4); kk < (kq + 1) * (dim / 4); kk += 16) {
+                const u32 a[4] = {qs[g][(kk + 2 * qq) / 2], qs[g + 8][(kk + 2 * qq) / 2], qs[g][(kk + 8 + 2 * qq) / 2], qs[g + 8][(kk + 8 + 2 * qq) / 2]};
+                const u32 b[2] = {ks[nt * 8 + g][(kk + 2 * qq) / 2], ks[nt * 8 + g][(kk + 8 + 2 * qq) / 2]};
+                mma_f16(s, a, b);
+            }
+            ps[kq][g][nt * 8 + 2 * qq] = s[0];
+            ps[kq][g][nt * 8 + 2 * qq + 1] = s[1];
+            ps[kq][g + 8][nt * 8 + 2 * qq] = s[2];
+            ps[kq][g + 8][nt * 8 + 2 * qq + 1] = s[3];
+        }
+        __syncthreads();
+        // per head (16 lanes each): the chunk's maximum, the running maximum and sum, the probabilities as f16
+        {
+            const u32 h = tid / 16, j = tid % 16;
+            const bool live = j0 + j < nk;
+            const float s = live ? (ps[0][h][j] + ps[1][h][j] + ps[2][h][j] + ps[3][h][j]) * scale : ninf;
+            float m = s;
+            for (int o = 8; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            const float m_old = mrun[h];
+            const float m_new = fmaxf(m_old, m);
+            const float p = live ? expf(s - m_new) : 0.f;
+            float l = p;
+            for (int o = 8; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+            const float pn = __shfl_xor_sync(0xffffffffu, p, 1);
+            const float l_old = lrun[h];
+            if ((j & 1) == 0) p16[h][j / 2] = (u32)f32_to_f16(p) | ((u32)f32_to_f16(pn) << 16);
+            if (j == 0) {
+                const float f = expf(m_old - m_new);
+                fac[h] = f;
+                lrun[h] = l_old * f + l;
+                mrun[h] = m_new;
+            }
+        }
+        __syncthreads();
+        // outputs: this warp's 64 dimensions, acc = acc * e^(m_old - m_new) + P V
+        {
+            const u32 a[4] = {p16[g][qq], p16[g + 8][qq], p16[g][4 + qq], p16[g + 8][4 + qq]};
+            const float f0 = fac[g], f1 = fac[g + 8];
+            const u16* kh = reinterpret_cast<const u16*>(ks);
+#pragma unroll
+            for (int ni = 0; ni < 8; ++ni) {
+                const u32 n = warp * 64 + ni * 8 + g;
+                acc[ni][0] *= f0;
+                acc[ni][1] *= f0;
+                acc[ni][2] *= f1;
+                acc[ni][3] *= f1;
+                const u32 b[2] = {(u32)kh[(2 * qq) * dim + n] | ((u32)kh[(2 * qq + 1) * dim + n] << 16), (u32)kh[(8 + 2 * qq) * dim + n] | ((u32)kh[(9 + 2 * qq) * dim + n] << 16)};
+                mma_f16(acc[ni], a, b);
+            }
+        }
+        __syncthreads();
+    }
+    float* out = reinterpret_cast<float*>(info[10]) + ((u64)t * H + hg * HG) * dim;
+#pragma unroll
+    for (int ni = 0; ni < 8; ++ni)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const u32 row = g + (e >= 2 ? 8 : 0), n = warp * 64 + ni * 8 + 2 * qq + (e & 1);
+            out[(u64)row * dim + n] = acc[ni][e] / lrun[row];
+        }
 }

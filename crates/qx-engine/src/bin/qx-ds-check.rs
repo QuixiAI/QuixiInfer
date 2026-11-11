@@ -124,7 +124,8 @@ fn main() -> anyhow::Result<()> {
             // QX_DS_SKIP=1: windows with at least prompt_keep() positions after them run KV-only (no logits for
             // those positions; the kept tail is bit for bit the full pass's)
             let skip = std::env::var("QX_DS_SKIP").is_ok_and(|v| v == "1");
-            let keep = eng.prompt_keep();
+            // (the tail's single steps are compared bit for bit, so the full stack starts prompt_keep before the tail)
+            let keep = eng.prompt_keep() + tail;
             let mut kv_only_windows = 0usize;
             // QX_DS_CHUNK=N (the chunk path, layer-major in chunks of N rows): the prompt before the tail in chunks
             // instead of windows; a chunk returns its last row's logits only
@@ -133,6 +134,8 @@ fn main() -> anyhow::Result<()> {
             while p < toks.len() {
                 save_if_due(&mut eng, p);
                 let cap = if p >= toks.len() - tail { 1 } else if chunk > 0 { chunk.min(toks.len() - tail - p) } else { window.min(toks.len() - tail - p) };
+                // (as the server: a KV-only chunk stops prompt_keep positions before the end, so only those run the full stack)
+                let cap = if chunk > 0 && skip && cap > 1 && toks.len() - p > keep { cap.min(toks.len() - p - keep) } else { cap };
                 let w = &toks[p..(p + cap).min(toks.len())];
                 let kv_only = skip && w.len() > 1 && toks.len() - (p + w.len()) >= keep;
                 let logits = if chunk > 0 && w.len() > 1 {
@@ -187,7 +190,10 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             let n = per_tok.len();
-            let last = &per_tok[n.saturating_sub(32)..];
+            // QX_DS_LAST=N (default 32): the span of the "last N" mean (prefill256k: its last 8,192 rows, which one
+            // chunk held until 2026-11-11 and a KV-only chunk plus the kept rows hold since)
+            let n_last = std::env::var("QX_DS_LAST").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(32);
+            let last = &per_tok[n.saturating_sub(n_last)..];
             let last_ms = last.iter().sum::<f64>() * 1e3 / last.len().max(1) as f64;
             println!("windows of {window}: {} tokens, {:.1} ms per token ({:.1} ms engram gather), {:.1} tok/s; last {}: {:.1} ms per token, {:.1} tok/s; tokens {:?}", n, t_all * 1e3 / n as f64, t_eng * 1e3 / n as f64, n as f64 / t_all, last.len(), last_ms, 1e3 / last_ms, &out_toks[..out_toks.len().min(24)]);
             if skip {

@@ -148,7 +148,7 @@ declare -A ARGS=( [decode]="" [prefill64]="QX_DS_WINDOW=64" [prefill32]="QX_DS_W
                   [prefill2]="QX_DS_WINDOW=2" [prefill4]="QX_DS_WINDOW=4" [prefill8]="QX_DS_WINDOW=8"
                   [long16k]="QX_DS_WINDOW=128 QX_DS_TAIL=64 QX_DS_SKIP=1 QX_DS_CHUNK=4096" [serve]="" [serve256k]=""
                   [decode256k]="QX_DS_LOAD_STATE=$STATES/wiki256k-262144.state"
-                  [prefill256k]="QX_DS_WINDOW=128 QX_DS_SKIP=1 QX_DS_CHUNK=8192 QX_DS_LOAD_STATE=$STATES/wiki256k-245760.state" )
+                  [prefill256k]="QX_DS_WINDOW=128 QX_DS_SKIP=1 QX_DS_CHUNK=8192 QX_DS_LAST=8192 QX_DS_LOAD_STATE=$STATES/wiki256k-245760.state" )
 declare -A TOKF=( [long16k]="$TOKENS16K" [decode256k]="$TOKENS256K" [prefill256k]="$TOKENS256K" )
 declare -A COUNT=( [long16k]=16384 [decode256k]=262208 [prefill256k]=262144 )
 declare -A TMO=( [long16k]=2400 [decode256k]=900 [prefill256k]=1500 )

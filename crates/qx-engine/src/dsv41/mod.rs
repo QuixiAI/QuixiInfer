@@ -416,7 +416,7 @@ pub struct DsEngine<'a> {
     /// `QX_DS_CHUNK_GEMM=1`: the f16 weights of the current chunk layer's dense groups (by group address: offset in
     /// `blas_bufs.0`), decoded once per layer and chunk; `blas_bufs.1` holds a slab's f16 inputs.
     blas_map: std::cell::RefCell<std::collections::HashMap<usize, u64>>,
-    blas_bufs: Option<(DeviceBuf, DeviceBuf)>,
+    blas_bufs: Option<(DeviceBuf, DeviceBuf, DeviceBuf)>,
     /// Output scratch for the cuBLAS dry pass.
     blas_y: Option<DeviceBuf>,
     /// Per side stream of `QX_DS_CHUNK_STREAMS`: the expert scratch (gate/up rows, quantized hidden rows, scales).
@@ -1423,7 +1423,8 @@ impl<'a> DsEngine<'a> {
         }
         if let Some(&base) = self.blas_map.borrow().get(&(g as *const MGemv as usize)) {
             // the chunk path with QX_DS_CHUNK_GEMM=1: this layer's weights are in f16 already
-            g.run_blas_cached(&self.gpu, x, x_stride, t, self.blas_bufs.as_ref().unwrap().1.ptr, base);
+            let bb = self.blas_bufs.as_ref().unwrap();
+            g.run_blas_cached(&self.gpu, x, x_stride, t, bb.1.ptr, base, bb.2.ptr, bb.2.bytes);
             self.trace_done();
             return;
         }
@@ -1905,6 +1906,93 @@ impl<'a> DsEngine<'a> {
 
     /// The Engram rows of every Engram layer and token of `toks` (at `positions`), gathered on the host into the
     /// mapped regions of `dst` (region ei holds token n's rows at (ei * stride + n) * cols * dim). Sets `t_engram`.
+    /// A prompt chunk's Engram rows on a background thread, engram layer by engram layer (`done` counts the layers
+    /// whose rows are in `dst`): the reads are 196,608 random pages of the table for 4,096 rows, 0.4-1.0 s on a disk
+    /// the expert stream keeps busy, however they are issued (one ring, six rings, twelve threads of positioned
+    /// reads, direct or buffered: the same time, 2026-11-11), so they overlap the card's work instead of preceding
+    /// it. Direct page reads, a few rings; the same rows and the same decode as `gather_engram`. None without a
+    /// pack (QX_DS_ENGRAM_THREADS=0 too): the caller gathers in line.
+    fn gather_engram_start(&self, toks: &[(usize, u32)], positions: &[u32], dst: &qx_gpu::mem::HostMapped, stride: usize) -> Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicUsize>)> {
+        let (_, pack) = self.engram_pack.as_ref()?;
+        let n_thr = std::env::var("QX_DS_ENGRAM_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+        if n_thr == 0 {
+            return None;
+        }
+        let t = toks.len();
+        let c = &self.cfg;
+        let (ed, n_layers) = (c.engram_dim, c.engram_layers.len());
+        let n_e = c.engram_cols() * ed;
+        let rb = pack.ple.row_bytes as usize;
+        // (file offset, float offset in dst), engram layer by engram layer
+        let mut jobs: Vec<(u64, usize)> = Vec::with_capacity(n_layers * t * c.engram_cols());
+        for ei in 0..n_layers {
+            for n in 0..t {
+                for (j, r) in c.engram_rows(ei, &self.st.tokens[toks[n].0], positions[n] as usize).into_iter().enumerate() {
+                    jobs.push((pack.ple_row(r), (ei * stride + n) * n_e + j * ed));
+                }
+            }
+        }
+        assert!((n_layers * stride * n_e) * 4 <= dst.bytes);
+        let base = dst.slice::<f32>(0, 0).as_mut_ptr() as usize;
+        let path = pack.path.clone();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done2 = done.clone();
+        let per_layer = jobs.len() / n_layers.max(1);
+        let h = std::thread::Builder::new().name("qx-engram".into()).spawn(move || {
+            use io_uring::{opcode, types};
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::OpenOptionsExt;
+            let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&path).expect("engram table, direct");
+            let fd = f.as_raw_fd();
+            let ty = qx_pack::ggml::GgmlType::from_id(13).unwrap(); // Q5_K
+            for layer in jobs.chunks(per_layer.max(1)) {
+                let per = layer.len().div_ceil(n_thr);
+                std::thread::scope(|sc| {
+                    for part in layer.chunks(per.max(1)) {
+                        sc.spawn(move || {
+                            const QD: usize = 256;
+                            const BUF: usize = 8192;
+                            // the row's page (two when it straddles)
+                            let layout = std::alloc::Layout::from_size_align(QD * BUF, 4096).unwrap();
+                            let pool = unsafe { std::alloc::alloc(layout) };
+                            assert!(!pool.is_null());
+                            let mut free: Vec<usize> = (0..QD).collect();
+                            let mut ring = io_uring::IoUring::new(QD as u32).expect("engram io_uring");
+                            let (mut next, mut fin) = (0usize, 0usize);
+                            while fin < part.len() {
+                                while next < part.len() && !free.is_empty() {
+                                    let b = free.pop().unwrap();
+                                    let off = part[next].0;
+                                    let (a0, a1) = (off & !4095, (off + rb as u64 + 4095) & !4095);
+                                    let e = opcode::Read::new(types::Fd(fd), unsafe { pool.add(b * BUF) }, (a1 - a0) as u32).offset(a0).build().user_data(((next as u64) << 16) | b as u64);
+                                    unsafe { ring.submission().push(&e).expect("engram io_uring queue") };
+                                    next += 1;
+                                }
+                                ring.submit_and_wait(1).expect("engram io_uring submit");
+                                for cqe in ring.completion() {
+                                    let (i, b) = ((cqe.user_data() >> 16) as usize, (cqe.user_data() & 0xffff) as usize);
+                                    let (off, o) = part[i];
+                                    let in_page = (off & 4095) as usize;
+                                    assert!(cqe.result() >= (in_page + rb) as i32, "engram row read returned {}", cqe.result());
+                                    // (each row's region is written by exactly one thread; the caller reads a layer's
+                                    // rows only after `done` passed it)
+                                    let out = unsafe { std::slice::from_raw_parts_mut((base + o * 4) as *mut f32, ed) };
+                                    let raw = unsafe { std::slice::from_raw_parts(pool.add(b * BUF + in_page), rb) };
+                                    qx_pack::dequant(ty, raw, out);
+                                    free.push(b);
+                                    fin += 1;
+                                }
+                            }
+                            unsafe { std::alloc::dealloc(pool, layout) };
+                        });
+                    }
+                });
+                done2.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }).expect("engram thread");
+        Some((h, done))
+    }
+
     fn gather_engram(&self, toks: &[(usize, u32)], positions: &[u32], dst: &qx_gpu::mem::HostMapped, stride: usize) -> f64 {
         let t = toks.len();
         let c = &self.cfg;
@@ -2148,6 +2236,14 @@ impl<'a> DsEngine<'a> {
             assert!((t as usize) < n_vocab, "token id {t} outside the vocabulary");
             self.st.tokens[slot].push(t);
         }
+        // the Engram rows of every row: on a thread from here on, while the dry passes and the first layers run
+        // (each engram layer waits for its rows)
+        let mut engram_job = {
+            let cb = self.chunk.as_ref().unwrap();
+            let job = if rows >= 256 { self.gather_engram_start(&segs, &positions, &cb.erows_host, rows_max) } else { None };
+            self.t_engram = if job.is_none() { self.gather_engram(&segs, &positions, &cb.erows_host, rows_max) } else { 0.0 };
+            job
+        };
         // the slabs: full ones of DS_TMAX, then the remainder in the widths every server warms (never 5 or 7:
         // their kernels are not loaded behind a sealed kernel set, and width 5's multi-GEMV is not bit-identical)
         let mut slabs: Vec<(usize, usize)> = Vec::new();
@@ -2181,8 +2277,8 @@ impl<'a> DsEngine<'a> {
             cb.tok.upload(toks);
             cb.pos.upload(&positions);
             cb.slot.upload(&slots_v);
-            self.t_engram = self.gather_engram(&segs, &positions, &cb.erows_host, rows_max);
         }
+
         let saved = [
             std::mem::replace(&mut self.s.r, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.pre_prev, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.pre_f, DeviceBuf::view(0, 0)),
             std::mem::replace(&mut self.s.post, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.comb, DeviceBuf::view(0, 0)), std::mem::replace(&mut self.s.x, DeviceBuf::view(0, 0)),
@@ -2237,12 +2333,16 @@ impl<'a> DsEngine<'a> {
             let mut kinds = std::collections::BTreeMap::new();
             for w in &self.layers { for g in [&w.g_x, &w.g_qr, &w.g_ob, &w.g_ffn, &w.g_shd] { for s in &g.segs { *kinds.entry(s.qx).or_insert(0usize) += 1; } } }
             eprintln!("dense segment types over all layers: {kinds:?}");
+            for w in &self.layers { if let Some((g, _)) = &w.engram { eprintln!("engram group [{}]", t(g)); break; } }
         }
         if chunk_ffn_wide && self.blas_bufs.is_none() {
             let groups = |w: &Layer| -> usize { [&w.g_x, &w.g_qr, &w.g_ob].iter().map(|g| g.w16_total()).sum::<usize>() + w.wo_a.iter().map(|g| g.w16_total()).sum::<usize>() };
             let halves = self.layers.iter().map(groups).max().unwrap_or(0);
             let kmax = self.layers.iter().flat_map(|w| [w.g_x.tcols, w.g_qr.tcols, w.g_ob.tcols].into_iter().chain(w.wo_a.iter().map(|g| g.tcols))).max().unwrap_or(E);
-            let bufs = (self.cscratch(halves * 2 + 256), self.cscratch(DS_TMAX * kmax * 2 + 256));
+            // (a slab's f16 inputs: the widest are the attention rows the grouped output projection reads whole; the
+            // K-sliced products' partials: `ops::gemm16_planes`)
+            let qd = self.cfg.n_head * self.cfg.head_dim;
+            let bufs = (self.cscratch(halves * 2 + 256), self.cscratch(DS_TMAX * kmax.max(qd) * 2 + 256), self.cscratch(DS_TMAX * qd * 4));
             self.blas_bufs = Some(bufs);
         }
         let mut dry_ok = true;
@@ -2313,6 +2413,13 @@ impl<'a> DsEngine<'a> {
                         off += (g.w16_total() * 2) as u64;
                     }
                 }
+            }
+            if let (Some((_, done)), Some(ei)) = (&engram_job, self.cfg.engram_layers.iter().position(|&x| x == l)) {
+                let tw = std::time::Instant::now();
+                while done.load(std::sync::atomic::Ordering::Acquire) <= ei {
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                self.t_engram += tw.elapsed().as_secs_f64();
             }
             let te = std::time::Instant::now();
             let mut went_on = true;
@@ -2586,6 +2693,10 @@ impl<'a> DsEngine<'a> {
                 }
             }
             t_post += tp.elapsed().as_secs_f64();
+        }
+        // (the Engram thread writes the chunk's host rows: it ends before the buffers change hands)
+        if let Some((h, _)) = engram_job.take() {
+            h.join().expect("engram thread");
         }
         let (r0, t) = slab(n_slabs - 1);
         self.chunk_views(r0, t);
@@ -2948,12 +3059,19 @@ impl<'a> DsEngine<'a> {
         let hd = c.head_dim;
         // the slab kernel holds the partials buffer only as scratch (12 scores per (token, head, chunk)), so a call
         // covers the whole window: 4x the blocks of a 32-token slice (256 -> 1,024 per call at 128 tokens)
-        let slice = if attn_tile() && self.attn_chunks <= 64 { t.max(1) } else { ATTN_SLICE };
+        // prompt chunks in f16 (the layer's dense weights are decoded: `blas_map` is filled): the attention on tensor
+        // cores too, one launch for the slab (`qx_ds_attn16`; QX_DS_ATTN16=0 keeps the exact kernels)
+        let attn16 = attn16_on() && hd == 512 && c.n_head % 16 == 0 && !self.blas_map.borrow().is_empty();
+        let slice = if attn16 || (attn_tile() && self.attn_chunks <= 64) { t.max(1) } else { ATTN_SLICE };
         for s0 in (0..t).step_by(slice) {
             let ts = (t - s0).min(slice);
             let (q, o, ps, sl) = (self.s.q.ptr + (s0 * c.n_head * hd * 4) as u64, self.s.attn.ptr + (s0 * c.n_head * hd * 4) as u64, self.s.pos.ptr + (s0 * 4) as u64, self.s.slot.ptr + (s0 * 4) as u64);
             let (sps, cps) = if sp != 0 { (sp + (s0 * c.idx_top_k * 4) as u64, cp + (s0 * 4) as u64) } else { (0, 0) };
-            if std::env::var("QX_DS_ATTN").is_ok_and(|v| v == "old") {
+            if attn16 {
+                self.trace("qx_ds_attn16");
+                self.gpu.run(qx_gpu::kernel::modules::GEMM.kernel("qx_ds_attn16", CubeDim::new_1d(256)), ((c.n_head / 16) as u32, ts as u32, 1), &[q, self.st.ring_tables[l].ptr, self.ring_w as u64, ps, sl, sps, cps, stp, row as u64, w.sinks.ptr, o, bits(1.0 / (hd as f32).sqrt()), c.n_swa as u64, c.idx_top_k as u64, hd as u64]);
+                self.trace_done();
+            } else if std::env::var("QX_DS_ATTN").is_ok_and(|v| v == "old") {
                 self.k("qx_ds_attn", 256, (c.n_head as u32, ts as u32, 1), &[q, self.st.ring_tables[l].ptr, self.ring_w as u64, ps, sl, sps, cps, stp, row as u64, w.sinks.ptr, o, bits(1.0 / (hd as f32).sqrt()), c.n_swa as u64, c.idx_top_k as u64, hd as u64]);
             } else if attn_tile() && self.attn_chunks <= 64 {
                 // the slab form: one block per (8 heads, token) over all the chunks, the merge in-block (the same bits;
@@ -2970,8 +3088,23 @@ impl<'a> DsEngine<'a> {
         self.rope(self.s.attn.ptr, c.n_head, c.head_dim, nope, comp, 0, true, t);
         self.dump(format!("attn_derope-{l}"), &self.s.attn, c.n_head * c.head_dim, act);
         let gd = c.n_head / c.o_groups * c.head_dim;
-        for (gi, g) in w.wo_a.iter().enumerate() {
-            self.mgt(g, self.s.attn.ptr + (gi * gd * 4) as u64, c.n_head * c.head_dim, t, "wo_a");
+        // (prompt chunks in f16: the groups' products in one launch, the weights being one after the other)
+        let wo_base = {
+            let map = self.blas_map.borrow();
+            let s0 = &w.wo_a[0].segs[0];
+            let step = (s0.rows * s0.cols * 2) as u64;
+            let base = map.get(&(&w.wo_a[0] as *const MGemv as usize)).copied();
+            base.filter(|&b| !ops::gemm16_cublas() && w.wo_a.iter().enumerate().all(|(gi, g)| g.segs.len() == 1 && g.segs[0].qx != 0 && g.segs[0].rows == s0.rows && g.segs[0].cols == gd && g.segs[0].y == s0.y + (gi * DS_TMAX * s0.rows * 4) as u64 && map.get(&(g as *const MGemv as usize)) == Some(&(b + gi as u64 * step))))
+        };
+        if let Some(base) = wo_base {
+            let bb = self.blas_bufs.as_ref().unwrap();
+            self.trace("wo_a");
+            ops::run_blas_groups(&self.gpu, &w.wo_a, self.s.attn.ptr, c.n_head * c.head_dim, gd, t, bb.1.ptr, base, bb.2.ptr, bb.2.bytes);
+            self.trace_done();
+        } else {
+            for (gi, g) in w.wo_a.iter().enumerate() {
+                self.mgt(g, self.s.attn.ptr + (gi * gd * 4) as u64, c.n_head * c.head_dim, t, "wo_a");
+            }
         }
         // the groups' rows per token, contiguous for the second projection
         self.k("qx_ds_regroup", 256, (((c.o_groups * c.o_lora) as u32).div_ceil(256), tt, 1), &[self.s.oag.ptr, self.s.oa.ptr, c.o_groups as u64, c.o_lora as u64, DS_TMAX as u64]);
@@ -3134,6 +3267,11 @@ impl<'a> DsEngine<'a> {
 
 /// Whether the attention over a window runs the slab kernel (`QX_DS_ATTN=tile`: one block per 8 heads and token over
 /// all the key chunks, the merge in-block), the same bits as the chunked kernels.
+fn attn16_on() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| !std::env::var("QX_DS_ATTN16").is_ok_and(|v| v == "0"))
+}
+
 fn attn_tile() -> bool {
     static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *U.get_or_init(|| std::env::var("QX_DS_ATTN").is_ok_and(|v| v == "tile"))

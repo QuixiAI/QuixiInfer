@@ -307,7 +307,9 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     let others_pending = (0..running.len()).filter(|&i| i != ri).any(|i| running[i].job.prompt.len() - running[i].read >= window.max(256));
                     let r = &mut running[ri];
                     let rem = r.job.prompt.len() - r.read;
-                    let n = rem.min(chunk_rows);
+                    // (the last prompt_keep positions alone need the full stack: the chunk before them stops there,
+                    // so the layers above the last KV source run on those rows only)
+                    let n = if skip_on && rem > keep { rem.min(chunk_rows).min(rem - keep) } else { rem.min(chunk_rows) };
                     let kv_only = skip_on && rem - n >= keep;
                     let last = eng.forward_chunk_opt(r.slot, &r.job.prompt[r.read..r.read + n], kv_only);
                     r.read += n;
