@@ -2946,8 +2946,17 @@ kernel, these binaries: 16k prompt at 4096-row chunks, 511 positions: KL mean 0.
 97.5%; the scored configuration (prefill256k, 8192-row chunks from the 245,760 state), 64 tail positions: KL mean
 0.0048, max 0.044, top-1 100%.
 Server on the f16 path (the adjudicator's missing check): three slots, `--ctx 262144`, the 13,283-token prompt:
-TTFT 30.6 s (434 tok/s; the exact kernels 393-420 in three sessions), the repeat 2.2 s, loadgen at concurrency 3
-after it completes, no panic, no module compiled after layer 0 (logs in the run directory).
+TTFT 30.6 s (434 tok/s), the repeat 2.2 s, loadgen at concurrency 3 after it completes, no panic, no module
+compiled after layer 0, `ffn wide true`, `chunk steps 2` (logs in the run directory). Against the exact kernels
+in four three-slot sessions (420 with the exact knob on chunk76; 395, 399, 393 on the cuBLAS fallback): what is
+established is the second chunk, 14,489 ms against 16,151-16,192 (-10.4%; exact spread 0.3%); the first, KV-only
+chunk is not faster (12,350 against 11,643-13,688) and the TTFT difference against the like-for-like arm (30.6
+against 31.6 s, one session each) is inside that chunk's noise.
+**A consequence for outputs (the breaker's item 10):** the server takes the chunk path only while no slot is
+decoding (`worker_ds.rs:300`); a long prompt goes through f16 chunks on an idle server and through exact windows
+when another slot decodes, and a prefix-reuse rewind rebuilds the ring with exact windows over an f16 store. So
+the temperature-0 output of a long prompt can depend on server load. The "Match Strata" contract permits it;
+`QX_DS_PREFILL_EXACT=1` removes it. Presupposition row 13 says so now.
 Promotion run (10-minute protocol), 21:14-21:23; preflight: VM off; 3.5 GB used, 64.7 GB free (the rest page
 cache); swap 1.5 of 8 GB; pressure avg10 0.00; no build tool; proactiveness 0:
 
@@ -2955,7 +2964,7 @@ cache); swap 1.5 of 8 GB; pressure avg10 0.00; no build tool; proactiveness 0:
 |---|--:|--:|--:|
 | decode256k | 38.25 | 38.3, 38.7 | +0.7% |
 | prefill256k | 5.70 | 4.7 | -17.5% |
-| serve256k3 | 89.53 | 91.07 (second session 88.81) | +1.7% |
+| serve256k3 | 89.53 | 91.07 | +1.7% |
 | serve256k1 | 38.37 | 39.14 (39.65) | +2.0% |
 | decode | 30.50 | 31.0 | +1.6% |
 | prefill128 | 10.50 | 10.5 | 0 |
@@ -2965,18 +2974,32 @@ cache); swap 1.5 of 8 GB; pressure avg10 0.00; no build tool; proactiveness 0:
 Score 26.925 -> 25.447 (-5.5%). ds-checks pass (two parts, 21:03-21:14, these binaries). Server identity
 identical in 2 of 2 serve256k sessions on these binaries (short prompts: `chunk steps 0`; they cover decode only).
 Of the -17.5% on prefill256k, the exact side streams are about -9% (5.1-5.2) and the f16 kernel the rest.
-**Costs carried, stated:** decode256k and the short decode read +0.7% and +1.6% (single runs; +0.5% against the
-promoted binary interleaved earlier the same evening); serve256k3 +1.7% in this run (88.81 in the next session):
-the larger flex tail (`ChunkBufs::extra`, ~0.8 GB at 8192 rows) leaves about 100 VRAM slots empty after the
+**Costs carried, stated:** decode256k and the short decode read +0.7% and +1.6% (single runs; the cuBLAS-tree
+binary chunk76 read +0.5% against the promoted binary interleaved earlier the same evening); serve256k3 +1.7% in this run; normal sessions on the candidate trees read 90.3-91.7
+(one at 95.15) against 89.5-90.0 on the promoted tree: about +1%, systematic, not fixed. (The next session,
+`v7-serve-212321`, read 88.81 but is in the slow-first-token mode: TTFT median 3.01 s, p90 4.09 against 1.83-1.91
+in the other 13 sessions of the day; its per-request figure is not comparable and by wall time it is the slowest
+candidate session. 1 session of 8 since 4b915b9: the baseline row's open "1 in 10", not attributable to this
+change.) The mechanism: the larger flex tail (`ChunkBufs::extra`, ~0.8 GB at 8192 rows) leaves about 100 VRAM slots empty after the
 server's warm-up chunk instead of 77 (the breaker: NVMe misses +4%, pool +3.6%); not fixed. serve256k1: the
 second concurrency-1 request has been slower in every session since 7f7117f, unattributed. The slow decode256k
 mode of 19:20-20:02 (5 of 11 candidate runs, 0 of 7 promoted, 0 of 11 after 20:04; the same signature on earlier
 binaries; cause unknown) did not appear in this run.
 Not done: `qx-ds-multi` all rows (no scheduler, window or job-path change). The first chunk of a cold prompt is
 slow for a reason outside this work (waiting on experts).
-Against Strata (same files, same box, 2026-11-10): decode 32.8 tok/s against 27.2: ahead. Prefill: Strata 765
-(cold) to 905 (warm) tok/s on a 16k prompt; ours in a three-slot 256k server on a 13.3k prompt 434 tok/s (393-420
-before today's work, 361 on the 16k `long16k` case this morning): **behind by about 2x**. What is left: the
+Against Strata (same files, same box, 2026-11-10): decode 31.0 ms in this run (32.3 tok/s; 32.8 on the baseline)
+against 27.2 tok/s: ahead. Prefill: Strata 765
+(cold) to 905 (warm) tok/s on a 16k prompt; ours in a three-slot 256k server on a 13.3k prompt 434 tok/s (the exact kernels with
+today's side streams 393-420; 361 on the 16k `long16k` case this morning before either): **behind by about 2x**. What is left: the
 attention-side dense groups chunk-wide or split-K on the own kernel (cuBLAS shows the arithmetic is worth 4.8 /
 4.6 / 7.5 s per chunk against our 6.3 / 6.0 / 10.0), attention (Strata 1.5 s of kernel time on the 16k prompt,
 ours 9.4), the experts' arithmetic, the upper layers on the kept rows only.
+Kernel build for the other cards (the standing rule; the adjudicator's C4): the flattened `gemm.cu` of these
+binaries (sha256 48174b0e5f2b, with `qx_gemm16`, `qx_w16`, `qx_x16`) compiles with `nvcc -cubin -O3` for sm_86,
+sm_89 and sm_120a (exit 0 each; 7 / 7 / 6 warnings, the spill warnings of the existing kernels;
+`~/qx-chains/archs/`, 21:42). `mma ... f32.f16.f16.f32` needs sm_80 or later; nothing else in the file changed.
+(A full `QX_NVCC_ARCHS=sm_86,sm_89,sm_120a cargo build` of every kernel did not finish in the 560 s I gave it.)
+Not explained, noted: a second Claude Code session has been running on this box since about 18:56 (pid 907696),
+and debug build directories under `~/qx-targets/chunk/debug` and `~/qx-targets/check/debug` were written at 20:21
+and 18:23 by something other than this session's chains. That is a candidate for the 19:20-20:02 slow
+decode256k bursts; I have not confirmed it and did not touch that session.

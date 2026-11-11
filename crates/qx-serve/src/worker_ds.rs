@@ -295,7 +295,10 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             let mut out: Vec<f32> = Vec::new();
             // the chunk path (QX_DS_CHUNK=N at start): while nobody decodes, the longest remaining prompt goes
             // through forward_chunk, up to N rows at once, KV-only when at least prompt_keep positions follow
-            // (exact; decoders would wait seconds behind a chunk, so only prompt-only steps take it)
+            // (decoders would wait seconds behind a chunk, so only prompt-only steps take it. Since 2026-11-10 a
+            // chunk's dense products are f16 tensor-core GEMMs, KL-bounded against the exact path, while windows
+            // stay exact: a long prompt's temperature-0 output can therefore depend on whether another slot was
+            // decoding when it arrived. QX_DS_PREFILL_EXACT=1 keeps chunks exact.)
             let chunk_rows = eng.chunk_rows();
             let chunked = if chunk_rows > 0 && running.iter().all(|r| r.next.is_none()) {
                 let pick = (0..running.len()).filter(|&i| running[i].job.prompt.len() - running[i].read >= window.max(256)).max_by_key(|&i| running[i].job.prompt.len() - running[i].read);
