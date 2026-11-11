@@ -3017,7 +3017,7 @@ previous pass."** Its non-blocking notes: the multi-arch evidence is a compile o
 a full `QX_NVCC_ARCHS` cargo build (to run in the background and record); the second session on the box is
 outside the run window. LANDED and promoted with its scoreboard note.
 
-## 2026-11-11: Prompt chunks: f16 attention, filled f16 GEMM launches, the full stack on the kept rows only (mixed chunks), Engram rows off the critical path — set D 25.447 -> 19.770 (prefill256k 4.7 -> 2.2); three-slot 256k server, 13,283-token prompt 26.9 s -> 13.0 s (494 -> 1,024 tok/s); promotion run `perf/results/2026-11-11/setd-promo8-032500` (adjudication below)
+## 2026-11-11: Prompt chunks: f16 attention, filled f16 GEMM launches, the full stack on the kept rows only (mixed chunks), Engram rows off the critical path — set D 25.447 -> 19.770 (prefill256k 4.7 -> 2.2); three-slot 256k server, 13,283-token prompt 26.8 s -> 13.0 s (495 -> 1,024 tok/s); promotion run `perf/results/2026-11-11/setd-promo8-032500` (adjudication below)
 
 Trees: 09e123f (attention, GEMM planes, Engram thread, keep split) and a41128e (mixed chunks, the breaker's
 fixes); binaries chunk92 = a41128e clean (qx-ds-check 514c699145bd, quixiinfer 124920a690f2).
@@ -3045,21 +3045,27 @@ What changed (prompt chunks only; decode, windows and `QX_DS_PREFILL_EXACT=1` ch
    overlap the card's work. `QX_DS_ENGRAM_THREADS=0` gathers in line.
 5. Harness: prefill256k's value is the mean over its last 8,192 rows (`QX_DS_LAST=8192`): the last 8,192 rows
    were one full-stack chunk until today, so "the last 32" was that chunk's per-row time; with the full stack on
-   the kept rows only the per-row time differs inside the chunk. The old binaries (chunk81) under today's
-   harness read 4.7 (rows at 253952: 38,430 ms), as the baseline row does. `perf/perf.md` updated.
+   the kept rows only the per-row time differs inside the chunk. Like for like with the baseline's 4.7: the
+   baseline's own log reads `chunk of 8192 rows at 253952: 38425 ms (4.69 ms per row)`, one uniform full-stack
+   chunk, so its mean over the last 8,192 rows is the 4.69 its "last 32" printed. (I also ran the old binaries,
+   chunk81, under today's harness: they predate `QX_DS_LAST` and ignore it, printing `last 32: 4.7` with the chunk
+   at 38,430 ms; so that run shows the chunk time again, not the new harness value. The adjudicator's point.)
+   The whole case's mean, independent of the span: 59.0 s -> 32.4 s for the 16,384 rows, 3.6 -> 2.0 ms per token.
+   `perf/perf.md`, the scoreboard's set D bullet and `goal-prompt.md` say "the last 8,192 rows" now; the row in
+   `results.jsonl` still carries the old field name `ms_per_token_last32`.
 
 Measurements (single runs unless said; `~/qx-chains/log.out` tags FILL2, BG, AT, V8, BRK, BRK2, SRV, V9):
 | | promoted tree (da7465b) | 09e123f | a41128e |
 |---|--:|--:|--:|
 | 16k prompt, steady 4,096-row KV-only chunk | 6.2 s | 3.3 s | 2.9 s |
 | three-slot 256k server, 13,283-token prompt (`req:` prompt seconds) | 26.84 s | 16.04, 16.06 s | 12.97 s |
-| the same, tok/s | 494 | 828 | 1,024 |
+| the same, tok/s | 495 | 828 | 1,024 |
 | server, 3,293-token prompt | | split 8.32 s | 5.94 s (no skip: 6.94 s) |
 | prefill256k (ms per token over the last 8,192 rows) | 4.7 | 2.5 | 2.2 |
-| the last 8,192 rows' wall time at 256k | 38.5 s | 20.1 s | 18.7 s |
-| the KV-only chunk before them (8,192 rows at 245,760) | 20.5 s | 14.9 s | 14.8 s |
+| the last 8,192 rows' wall time at 256k | 38.4 s | 20.1 s | 18.4 s (promotion run; 18.7 s in the run with a 64-row tail) |
+| the KV-only chunk before them (8,192 rows at 245,760) | 20.6 s | 14.9 s | 14.1 s (promotion run; 14.8 s with the tail) |
 Of prefill256k's 4.7 -> 2.2, most is the full stack running on 2,796 rows instead of 8,192 (the breaker's point);
-the kernels' own share shows in the KV-only chunk: 20.5 -> 14.8 s (-28%).
+the kernels' own share shows in the KV-only chunk, which does the same work in both trees: 20.6 -> 14.1 s (-32%).
 The kernel table after (09e123f, `~/qx-chains/nsys3`): `qx_moe_wait_word` 25.7 s (the expert kernels waiting for
 their staged records, over eight streams), experts 16 s, attention 1.6 s, `qx_gemm16` 1.6 s, the Engram
 projection (`qx_mgemv_t8z`, exact, 25,600 x 6,144) 1.3 s. Per layer of a steady chunk (125 ms): slab kernels 42
@@ -3071,30 +3077,39 @@ Promotion run (a41128e, preflight in the V9 log line: VM off, no build tool, pre
 | case | baseline | candidate | change |
 |---|--:|--:|--:|
 | decode256k | 38.50 | 38.6, 38.6 | +0.3% (within noise) |
-| prefill256k | 4.70 | 2.2 | -53.2% |
+| prefill256k | 4.70 | 2.2 | -53.2% on the printed values (4.690 -> 2.241 unrounded: -52.2%) |
 | serve256k3 | 91.07 | 90.99 | -0.1% |
 | serve256k1 | 39.14 | 36.97 | -5.5% |
 | decode | 31.00 | 30.6 | -1.3% |
 | prefill128 | 10.50 | 10.5 | 0 |
-Score 25.447 -> 19.770. Identity (serve256k-1, the session's dump against the reference): identical.
+Score 25.447 -> 19.770 (on unrounded prefill values 25.430 -> 19.892, -21.8%). Identity (serve256k-1, the
+session's dump against the reference): identical. serve256k1's -5.5% (37.01 on 09e123f, 36.97 here) is not
+attributed: no counter explains it, and nothing in this change should move a concurrency-1 decode.
 
-Correctness and accuracy (all on chunk92 unless said):
-- ds-checks part a and part b: pass (lines V9 in the log; windows of 3 / 8 / 64 bit-identical, rewind, mixed
+Correctness and accuracy (the binary of each line is named; the f16 bits did not change between 09e123f and
+a41128e: the 256k dumps of chunk89 and chunk92, `po2.bin` and `po3.bin`, are 64/64 bit-identical, which carries the
+earlier trees' samples to the final one):
+- ds-checks part a and part b on chunk92: pass (lines V9 in the log; windows of 3 / 8 / 64 bit-identical, rewind, mixed
   sequences, production vs reference 57/59 as before).
 - Exact knob: prefill256k configuration, 64 tail rows against the exact dump of 2026-11-10 (`pe.bin`): 64/64
-  bit-identical. 16,383-token prompt (the full stack starts on an odd position, 13,523) against a no-skip exact
-  reference: 64/64. 15,153-token prompt (5 rows of a chunk before the kept ones; chunk91): 64/64.
-- f16 default against the exact path: 511 positions after a 16k prompt KL mean 0.0087, top-1 97.7% (09e123f);
-  prefill256k configuration, 64 rows: KL 0.0085, max 0.115, top-1 98.4%; 16,383 tokens, 64 rows: KL 0.0072, top-1
-  98.4%; 15,153 tokens, 64 rows: KL 0.0110, top-1 95.3% (3 of 64 rows; the bound is 0.03 and 95%). No NaN line.
-- Mixed against split, f16: 64/64 rows bit-identical on both prompts (the chunk plan does not change the bits).
+  bit-identical (chunk92). 16,383-token prompt (the full stack starts on an odd position, 13,523) against a
+  no-skip exact reference: 64/64 (chunk91 and chunk92). 15,153-token prompt (5 rows of a chunk before the kept
+  ones): 64/64 (chunk91).
+- f16 default against the exact path: 511 positions after a 16k prompt KL mean 0.0087, top-1 97.7% (chunk88 =
+  09e123f); prefill256k configuration, 64 rows: KL 0.0085, max 0.115, top-1 63/64 (chunk89 and chunk92); 16,383
+  tokens, 64 rows: KL 0.0072, top-1 98.4% (chunk90, chunk91); 15,153 tokens, 64 rows: KL 0.0110, top-1 61/64 =
+  95.3% (chunk91; the bound is 0.03 and 95%; a 511-position sample at that length follows below). No NaN line.
+- Mixed against split, f16: 64/64 rows bit-identical on both prompts (16,383 tokens on chunk90, 15,153 on
+  chunk91): the chunk plan does not change the bits.
 - Three-slot 256k server, two long prompts at once (13,283 tokens on slot 0, 10,031 on slot 1), exact knob: the
   last 60 decode rows' hashes per slot equal to a no-skip exact session's (60/60 and 60/60; chunk91 and again
   chunk92). `qx-ds-replay` of the exact trace and of an f16 trace (chunk91): 98 forwards, 2,413 rows, 0 mismatches
   each: the f16 path's bits are a function of the schedule.
 - Server sessions: no panic, no `fatal`, no `chunk scratch ... outside the flex tail` line.
 - `gemm.cu` (flattened, sha256 2b20765ef12b, with `qx_ds_attn16`, `qx_gemm16_sum`) compiles with the build
-  script's nvcc (cuda-13.3) `-cubin` for sm_86, sm_89, sm_120a, exit 0 each (`~/qx-chains/archs/gemm2-*`). The full
+  script's nvcc (cuda-13.3) `-cubin` for sm_86, sm_89, sm_120a, exit 0 each (`~/qx-chains/archs/gemm2-*`). (Two
+  attempts before it logged errors that are not the kernel's: no `nvcc` on the PATH, then cuda-13.1's nvcc, which
+  fails on this host's glibc headers, `rsqrt` exception specifications, before it reaches the file.) The full
   `QX_NVCC_ARCHS` cargo build of the previous tree finished with exit 0 at 21:47 on 2026-11-10.
 
 The breaker (fresh context, read-only review of 09e123f, then its tests run by me):
@@ -3114,15 +3129,52 @@ The breaker (fresh context, read-only review of 09e123f, then its tests run by m
   never straddle a page), the attention kernel's layouts, masking, ring wrap and slot indexing.
 
 Costs and what is not covered:
-- With two long prompts at once the second waits: chunks run only while no slot decodes, so slot 1's prompt went
-  on in windows once slot 0 decoded (10,031 tokens: 54.8 s on the f16 path, 81 s exact). That policy is older than
-  this work; it is now the largest prompt-side cost under load.
+- Accuracy against the promoted tree, at the 256k configuration, the same 64 rows against the same exact dump:
+  KL mean 0.0048 -> 0.0085, max 0.044 -> 0.115, top-1 64/64 -> 63/64 (the attention is f16 now too). Inside the
+  bound, and about twice the distance from the exact path that the promoted tree had.
+- With two long prompts at once both wait: chunks run only while no slot decodes, so slot 1's prompt went on in
+  windows once slot 0 decoded. 10,031 tokens on slot 1: 54.8 s on the f16 path (chunk91), 64.9 s (chunk91) and
+  81 s (chunk92) with the exact knob (different schedules); slot 0's 13,283 tokens took 21.8 s beside it on the
+  f16 path against 12.97 s alone. That policy is older than this work; it is now the largest prompt-side cost
+  under load.
+- The prefill256k log's driver counters changed (`serve 40 calls`, `spec 39/40` -> `serve 200 calls`, `spec
+  199/200`): not looked into.
 - f16 `QX_DS_GEMM16=cublas` was not re-run on these trees (the code path compiles; the knob stays opt-in).
 - `qx-ds-multi` all rows: not run (no window, scheduler or job-path change).
 - top-1 on the 15,153-token case is 95.3% over 64 rows, at the bound; the larger samples read 97.7-98.4%.
 - The server's long-prompt numbers are single sessions (two for 09e123f: 16.04 and 16.06 s).
 
-Against Strata (its numbers of 2026-11-10 on this box: 765 tok/s cold, 905 warm on a 16k prompt; decode 27.2
-tok/s): our three-slot 256k server reads 1,024 tok/s on a 13.3k-token prompt and decodes at 32.7 tok/s (decode
-30.6 ms). Not yet like for like: a different prompt length and our own timer; a same-prompt run of both is the
-next measurement.
+Against Strata, same 16,384 ids, same box state, alternating runs (2026-11-11 03:43-03:48, tag H2H; Strata's
+own prompt timer, a fresh process each run): Strata 841 and 880 tok/s (19.5 and 18.6 s). Ours as a fresh process
+(`qx-ds-check`, 8,192-row chunks): 811 and 813 tok/s over the chunks (20.2 s; the first chunk of a cold process
+takes 10.5 s against 5.0-6.0 s in a warm server): **4-8% behind as a one-shot process**. Ours in the warm
+three-slot 256k server, text prompts of 16,587 and 16,311 tokens: 16.25 s and 13.95 s, 1,021 and 1,169 tok/s:
+**ahead in the server**. Decode: the 1k single-stream guard reads 30.6 ms (32.7 tok/s) against Strata's 27.2
+tok/s on 2026-11-10; the 256k server decodes at 27.05 tok/s at concurrency 1 and 10.99 per request at
+concurrency 3. Right after a 16k prompt we are slower: the first 8 tokens at 4.2 tok/s in `qx-ds-check` and 8-11
+tok/s in the server, against Strata's 14.2-14.4: the tiers are cold after the chunk path returns the flex tail.
+
+**Adjudicator (fresh context), first pass: HOLD.** It accepted the gate arithmetic, the metric change (the
+baseline's 4.7 is the same quantity; unrounded 4.690 -> 2.241), the exactness and accuracy numbers (recomputed
+from the dumps) and the binaries' provenance, and asked for: a second serve256k identity session on the candidate
+binaries, the 8k serve guard, the ds-checks attached to `run.json`, and eleven text corrections (applied above:
+the metric evidence, the unrounded change, the table's sources, which binary each check ran on, the accuracy
+cost against the promoted tree, the Strata paragraph, the two-prompt cost, serve256k1 unattributed, the title's
+rounding, the nvcc attempts, the stale definitions in the scoreboard and the goal file).
+What I ran for it (chunk92, tags HOLD and HOLD2, each step under 10 minutes):
+- serve256k, levels 1 and 3 (`hold2-serve256k-035808`): identity `serve256k-1: identical`; serve256k1 37.09,
+  serve256k3 91.41. A levels-3-only session (`hold-serve256k-034848`): serve256k3 91.41 (no identity dump at
+  that setting). So serve256k3 reads 90.99, 91.41, 91.41 against the baseline's 91.07: +0.4% at worst.
+- The 8k guard, two sessions (`hold-serve-035136`, `hold2-serve-040119`): serve3 79.55 and 78.99 against 78.68
+  (+1.1%, +0.4%); serve1 34.77 and 34.07 against 32.32 (+7.6%, +5.4%: the gate prints REGRESSION on this
+  companion row). serve1 is the mean of two concurrency-1 requests, and those read 8.0-9.6 s in every session
+  since 7f7117f whatever the tree (4ee0e73: 8.02, 9.24; 25c7614: 9.04, 9.58; 7f7117f: 9.03, 9.56; today 9.16,
+  8.59 and 8.11, 9.35); the baseline's pair (8.27, 8.21) is the fastest of the nine sessions on record. I read
+  it as that spread, not as a cost of this change (an 8k server takes no chunk path and none of the changed
+  kernels), and I have not shown that: the first-to-second-request spread at concurrency 1 is still unexplained.
+- Accuracy at the length that read 61/64: the 15,153-token prompt, 511 positions against a no-skip exact
+  reference: KL mean 0.0091, p99 0.088, max 0.201, top-1 486/511 = 95.1%. With the exact attention kernels
+  (`QX_DS_ATTN16=0`, f16 GEMMs only) the same positions read 0.0082 and 488/511 = 95.5%: this stretch of text sits
+  near the 95% bound on the promoted path too, and the f16 attention costs 2 of 511 rows there.
+- `run.json` of the promotion run now carries `correctness: pass` and the attachments (ds-checks logs, the guard
+  rows from the first 8k session, the second identity session, the long-prompt server log).

@@ -15,8 +15,9 @@ Case sets so far:
   "The Metrics". The serve tier was 90 GiB in the first set B row and is 95 GiB from the second (a measured
   -5.4% on serve3; the tier is in the recorded settings).
 - **Set D (from 2026-11-06, the user's priority: performance at 256k):** `decode256k` (64 single steps from a
-  saved 262,144-token state, last 32), `prefill256k` (the last 16k tokens of the 256k input in windows of 128
-  from a saved 245,760-token state, last 32), `serve256k` (the server at `--ctx 262144 --slots 3`), with
+  saved 262,144-token state, last 32), `prefill256k` (the last 16k tokens of the 256k input as 8,192-row prompt chunks
+  from a saved 245,760-token state; the mean over the last 8,192 rows, which read as "last 32" while one
+  full-stack chunk held them, to 2026-11-10), `serve256k` (the server at `--ctx 262144 --slots 3`), with
   `decode`, `prefill128` and `serve3` kept as short-context guards. Set D scores are not comparable with earlier
   sets.
 - **Set C (from 2026-11-06, the user's decision):** the 128-token prompt chunk with the full staged share (8/8)

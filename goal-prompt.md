@@ -51,7 +51,7 @@ box; decode256k flipped between 42.0 and 44-45 ms on one binary and systemd-oomd
 ## The standard set (done 2026-11-06/07; do not rebuild)
 Set D exists: `perf/states/` holds the 262,144- and 245,760-token states, `perf/harness/bench.sh` runs `decode256k`
 (64 single steps from the 262k state, last 32 scored), `prefill256k` (the last 16k tokens of a 256k prompt in
-8192-row chunks, last 32 scored), `serve256k` (the server at `--ctx 262144 --slots 3`, loadgen at concurrency 1 and
+8192-row chunks, the mean over the last 8,192 rows scored), `serve256k` (the server at `--ctx 262144 --slots 3`, loadgen at concurrency 1 and
 3) and the guards `decode`, `prefill128`, `serve`. The scoreboard's last row is the promoted baseline; `perf_diff.py
 gate` compares against `perf/baselines/rtx-5090_ryzen-9-9950x_121g/`. Measured spreads (2026-11-08): decode256k
 0.2-3%, prefill256k 0-2%, serve256k3 0.2-1.7%, decode 1-4%.
