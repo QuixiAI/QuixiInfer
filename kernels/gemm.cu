@@ -725,6 +725,95 @@ extern "C" __global__ void __launch_bounds__(256, TMV_Q8_BLOCKS) qx_tmv_q8_2(con
 extern "C" __global__ void __launch_bounds__(256, TMV_Q8_BLOCKS) qx_tmv_q8_3(const u64* info) { tmv<3>(info); }
 extern "C" __global__ void __launch_bounds__(256, TMV_Q8_BLOCKS) qx_tmv_q8_4(const u64* info) { tmv<4>(info); }
 
+QX_DEV void mma_f16(float* c, const u32* a, const u32* b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+/// Y[t][n] = sum_k W[n][k] X[t][k] with X and W as f16 rows of K (K a multiple of 16; `qx_x16`, `qx_w16`) and f32
+/// accumulation on tensor cores: `gemm_tile` without a decoder (the operands are copied into the tile as they are).
+/// A 128 x 64 output tile per block, 8 warps. info: [0] X16 (T x K), [1] W16 (N x K), [2] Y, [3] T, [4] N, [5] K,
+/// [6] Y row stride. Grid (ceil(N / 64), ceil(T / 128)), 256 threads. No library, no extra memory: prompt chunks
+/// in a server, where cuBLAS's handle and kernel libraries do not fit the headroom.
+extern "C" __global__ void __launch_bounds__(256) qx_gemm16(const u64* info) {
+    constexpr int BTT = 128, WM = 4, WN = 2, MI = 2, NI = 4, BNN = WN * NI * 8;
+    __shared__ u32 smem[(BTT + BNN) * (BK / 2 + 4)];
+    const u32 T = (u32)info[3], N = (u32)info[4], K = (u32)info[5];
+    const u16* X = reinterpret_cast<const u16*>(info[0]);
+    const u16* W = reinterpret_cast<const u16*>(info[1]);
+    float* Y = reinterpret_cast<float*>(info[2]);
+    const u64 ystride = info[6];
+    const u32 t0 = blockIdx.y * BTT, n0 = blockIdx.x * BNN;
+    auto xs = reinterpret_cast<u32(*)[BK / 2 + 4]>(smem);
+    auto ws = reinterpret_cast<u32(*)[BK / 2 + 4]>(smem + BTT * (BK / 2 + 4));
+    const u32 tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const u32 wt = (warp / WN) * MI * 16, wn = (warp % WN) * NI * 8;
+    float acc[MI][NI][4] = {};
+    for (u32 k0 = 0; k0 < K; k0 += BK) {
+        for (u32 i = tid; i < BTT * BK / 8; i += blockDim.x) {
+            const u32 r = i / (BK / 8), c8 = (i % (BK / 8)) * 8;
+            const u32 t = t0 + r;
+            u32 v[4] = {0, 0, 0, 0};
+            if (t < T && k0 + c8 < K) {
+                const u32* xp = reinterpret_cast<const u32*>(X + (u64)t * K + k0 + c8);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) v[j] = xp[j];
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) xs[r][c8 / 2 + j] = v[j];
+        }
+        for (u32 i = tid; i < BNN * BK / 8; i += blockDim.x) {
+            const u32 r = i / (BK / 8), c8 = (i % (BK / 8)) * 8;
+            const u32 n = n0 + r;
+            u32 v[4] = {0, 0, 0, 0};
+            if (n < N && k0 + c8 < K) {
+                const u32* wp = reinterpret_cast<const u32*>(W + (u64)n * K + k0 + c8);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) v[j] = wp[j];
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) ws[r][c8 / 2 + j] = v[j];
+        }
+        __syncthreads();
+#pragma unroll
+        for (u32 kk = 0; kk < BK; kk += 16) {
+            const u32 g = lane / 4, q = lane % 4;
+            u32 a[MI][4], b[NI][2];
+#pragma unroll
+            for (int mi = 0; mi < MI; ++mi) {
+                const u32 r = wt + mi * 16 + g;
+                a[mi][0] = xs[r][(kk + 2 * q) / 2];
+                a[mi][1] = xs[r + 8][(kk + 2 * q) / 2];
+                a[mi][2] = xs[r][(kk + 8 + 2 * q) / 2];
+                a[mi][3] = xs[r + 8][(kk + 8 + 2 * q) / 2];
+            }
+#pragma unroll
+            for (int ni = 0; ni < NI; ++ni) {
+                const u32 c = wn + ni * 8 + g;
+                b[ni][0] = ws[c][(kk + 2 * q) / 2];
+                b[ni][1] = ws[c][(kk + 8 + 2 * q) / 2];
+            }
+#pragma unroll
+            for (int mi = 0; mi < MI; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < NI; ++ni) mma_f16(acc[mi][ni], a[mi], b[ni]);
+        }
+        __syncthreads();
+    }
+    const u32 g = lane / 4, q = lane % 4;
+#pragma unroll
+    for (int mi = 0; mi < MI; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < NI; ++ni)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const u32 t = t0 + wt + mi * 16 + g + (e >= 2 ? 8 : 0);
+                const u32 n = n0 + wn + ni * 8 + 2 * q + (e & 1);
+                if (t < T && n < N) Y[(u64)t * ystride + n] = acc[mi][ni][e];
+            }
+}
+
 /// A weight matrix decoded to f16 rows (for cuBLAS half-precision GEMMs: once per matrix and chunk, instead of once
 /// per tile). info: [0] W, [1] out (N x K u16), [2] N, [3] K, [4] row stride in bytes, [5] type. Grid
 /// ceil(N * K / 8 / 256), 256 threads.

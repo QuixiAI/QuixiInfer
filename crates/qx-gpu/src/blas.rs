@@ -9,6 +9,18 @@ struct Handle(sys::cublasHandle_t, bool);
 unsafe impl Send for Handle {}
 
 static HANDLE: Mutex<Option<Handle>> = Mutex::new(None);
+/// Set when the device had no memory for cuBLAS beside the engine: no further attempt in this process.
+static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Destroys the handle and stops using cuBLAS in this process (the callers keep their exact kernels).
+pub fn disable() {
+    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = HANDLE.lock().unwrap().take() {
+        unsafe {
+            let _ = sys::cublasDestroy_v2(h.0);
+        }
+    }
+}
 
 /// The handle, created on first use; its stream is CubeCL's first one, set as soon as that exists (`need_stream`:
 /// it must exist by now).
@@ -37,6 +49,9 @@ fn with<R>(need_stream: bool, f: impl FnOnce(sys::cublasHandle_t) -> R) -> R {
 /// then keeps its exact kernels). The handle takes about 0.4 GiB: created at the first long prompt, from the
 /// headroom, not at load (at load it came out of the expert tier: 12.3 -> 11.9 GiB with three slots at 256k).
 pub fn try_init() -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     let mut g = HANDLE.lock().unwrap();
     if g.is_some() {
         return true;
@@ -50,6 +65,7 @@ pub fn try_init() -> bool {
         }
         Err(e) => {
             eprintln!("cuBLAS: no handle ({e:?}): prompt chunks keep the exact kernels");
+            DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
             false
         }
     }
@@ -58,6 +74,11 @@ pub fn try_init() -> bool {
 /// Y[t][n] = sum_k W[n][k] X[t][k] for t < `t`, n < `n`: `w16` holds N rows of K halves, `x16` T rows of K halves,
 /// `y` f32 rows `ldc` apart. Queued on CubeCL's stream, behind what was launched on it.
 pub fn gemm_hss(w16: u64, k: usize, n: usize, x16: u64, t: usize, y: u64, ldc: usize) {
+    try_gemm_hss(w16, k, n, x16, t, y, ldc).expect("cublasGemmEx (f16 x f16 -> f32)")
+}
+
+/// `gemm_hss` returning cuBLAS's error (the dry pass: a shape whose kernel library does not fit in memory).
+pub fn try_gemm_hss(w16: u64, k: usize, n: usize, x16: u64, t: usize, y: u64, ldc: usize) -> Result<(), String> {
     let (alpha, beta) = (1f32, 0f32);
     with(true, |h| unsafe {
         // column-major: A' = K x N (W's rows as columns), B' = K x T, C' = N x T = A'^T B'
@@ -69,6 +90,6 @@ pub fn gemm_hss(w16: u64, k: usize, n: usize, x16: u64, t: usize, y: u64, ldc: u
             sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
         )
         .result()
-        .expect("cublasGemmEx (f16 x f16 -> f32)");
+        .map_err(|e| format!("{e:?}"))
     })
 }

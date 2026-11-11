@@ -2218,7 +2218,18 @@ impl<'a> DsEngine<'a> {
             }
         }
         // QX_DS_CHUNK_GEMM=1: the FFN's dense products once over the chunk's rows (cuBLAS f16 GEMMs), not per slab
-        let chunk_ffn_wide = chunk_gemm() && self.layers.iter().all(|w| w.g_ffn.blas_ok() && w.g_shd.blas_ok()) && qx_gpu::blas::try_init();
+        // (our own modules are loaded first: cuBLAS's handle and kernel libraries come out of the same headroom, and
+        // a module load after them failed in a three-slot 256k server, 2026-11-10)
+        // The handle and its kernel libraries (about 1.4 GiB in all) come out of the headroom at the first chunk:
+        // a one-slot engine has it (0.7 GiB left after the dry pass); a three-slot 256k server does not (0.45 GiB
+        // free after its warm-up), and its prompts keep the exact kernels (`cuBLAS: no handle`), as they do when
+        // the launches do not go through the raw launcher (cuBLAS queues on the stream directly).
+        let mut chunk_ffn_wide = chunk_gemm() && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) && self.layers.iter().all(|w| w.g_ffn.blas_ok() && w.g_shd.blas_ok()) && {
+            for m in [&MOE, &DSV41, &LAYER, &qx_gpu::kernel::modules::GEMV, &qx_gpu::kernel::modules::MGEMV, &qx_gpu::kernel::modules::GEMM] {
+                qx_gpu::raw::preload(m);
+            }
+            !ops::gemm16_cublas() || qx_gpu::blas::try_init()
+        };
         if verbose_types() && pos0 == 0 {
             let w = &self.layers[0];
             let t = |g: &MGemv| g.segs.iter().map(|s| format!("{}:{}x{}/{}", s.qx, s.rows, s.cols, s.stride)).collect::<Vec<_>>().join(" ");
@@ -2234,7 +2245,8 @@ impl<'a> DsEngine<'a> {
             let bufs = (self.cscratch(halves * 2 + 256), self.cscratch(DS_TMAX * kmax * 2 + 256));
             self.blas_bufs = Some(bufs);
         }
-        if chunk_ffn_wide {
+        let mut dry_ok = true;
+        if chunk_ffn_wide && ops::gemm16_cublas() {
             // cuBLAS loads a kernel library the first time a GEMM shape needs it, and that load must never happen
             // while an expert job is posted (a kernel waiting for a staged record keeps the card busy, the driver
             // thread sits behind the load's lock: the run stopped in layer 2 on 2026-11-10). So every shape this
@@ -2256,8 +2268,8 @@ impl<'a> DsEngine<'a> {
                 for g in [&w.g_x, &w.g_qr, &w.g_ob].into_iter().chain(w.wo_a.iter()) {
                     for sg in g.segs.iter().filter(|sg| sg.qx != 0) {
                         for &t in &widths {
-                            if seen.insert((sg.rows, sg.cols, t)) {
-                                qx_gpu::blas::gemm_hss(w16, sg.cols, sg.rows, x16s, t, ys, sg.rows);
+                            if dry_ok && seen.insert((sg.rows, sg.cols, t)) {
+                                dry_ok = qx_gpu::blas::try_gemm_hss(w16, sg.cols, sg.rows, x16s, t, ys, sg.rows).is_ok();
                             }
                         }
                     }
@@ -2267,12 +2279,24 @@ impl<'a> DsEngine<'a> {
                         if seen.insert((sg.rows, sg.cols, rows)) {
                             // (the output lands in the gate scratch or, for the down product, would not fit it: E > ff)
                             let y = if sg.rows <= self.cfg.ff_exp { gate_scratch } else { self.chunk.as_ref().unwrap().shy.ptr };
-                            qx_gpu::blas::gemm_hss(w16c, sg.cols, sg.rows, x16c, rows, y, sg.rows);
+                            dry_ok = dry_ok && qx_gpu::blas::try_gemm_hss(w16c, sg.cols, sg.rows, x16c, rows, y, sg.rows).is_ok();
                         }
                     }
                 }
             }
             self.gpu.sync();
+            // cuBLAS must leave the engine its headroom (graphs of new window widths, modules): with less than
+            // QX_DS_BLAS_MIN_FREE_MIB (384) free after the dry pass, or a failed load, it is given up for the
+            // process and prompt chunks keep the exact kernels
+            let min_free = std::env::var("QX_DS_BLAS_MIN_FREE_MIB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(384) << 20;
+            let free = qx_gpu::mem::mem_info().0;
+            if !dry_ok || free < min_free {
+                eprintln!("cuBLAS: given up ({} MiB free after its dry pass, {} needed{}): prompt chunks keep the exact kernels", free >> 20, min_free >> 20, if dry_ok { "" } else { "; a kernel library did not load" });
+                qx_gpu::blas::disable();
+                chunk_ffn_wide = false;
+            } else if verbose && pos0 == 0 {
+                eprintln!("cuBLAS: prompt chunks in f16 ({} MiB free after the dry pass)", free >> 20);
+            }
         }
         for l in 0..n_layers_run {
             if chunk_ffn_wide {
@@ -2453,7 +2477,9 @@ impl<'a> DsEngine<'a> {
             // own gate/up and hidden scratch; the outputs are per selection. The progress mark is written on the
             // main stream after it joined the side streams, every N used experts: it still means "every expert up
             // to this ordinal is done". The same kernels on the same inputs: the same bits.
-            let ns = if mma && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) { chunk_streams() } else { 1 };
+            // (not with a staging ring too small to hold several groups of N, nor for a chunk of a few rows: the
+            // driver frees a ring slot on the mark, which now comes once per N experts)
+            let ns = if mma && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) && n_ring >= 8 * chunk_streams() && rows >= 256 { chunk_streams() } else { 1 };
             let side: Vec<[u64; 3]> = if ns > 1 { self.chunk_side[..ns].iter().map(|b| [b[0].ptr, b[1].ptr, b[2].ptr]).collect() } else { Vec::new() };
             if ns > 1 {
                 qx_gpu::raw::side_begin(ns);

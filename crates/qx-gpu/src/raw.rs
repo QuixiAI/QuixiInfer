@@ -75,11 +75,8 @@ fn launcher() -> std::sync::MutexGuard<'static, Option<Launcher>> {
     g
 }
 
-/// Compiles and loads `module` (once), and launches `entry` with `grid` blocks of `threads` threads and `info`.
-pub fn launch(module: &crate::kernel::Module, entry: &'static str, threads: u32, grid: (u32, u32, u32), info: &[u64]) {
-    assert!(info.len() <= WORDS, "raw launch of {entry}: {} info words, the ring slot holds {WORDS}", info.len());
-    let mut g = launcher();
-    let l = g.as_mut().unwrap();
+/// Compiles and loads `module` if it is not loaded yet.
+fn ensure(l: &mut Launcher, module: &crate::kernel::Module) {
     if !l.modules.contains_key(&module.source_hash) {
         if std::env::var("QX_DS_VERBOSE").is_ok() {
             eprintln!("raw: compiling {}.cu", module.name);
@@ -104,6 +101,21 @@ pub fn launch(module: &crate::kernel::Module, entry: &'static str, threads: u32,
         }
         l.modules.insert(module.source_hash, Module { funcs, module: m });
     }
+}
+
+/// Loads `module` now (so a later launch from it allocates nothing): the chunk path loads its own modules before
+/// cuBLAS takes memory for its handle and kernel libraries.
+pub fn preload(module: &crate::kernel::Module) {
+    let mut g = launcher();
+    ensure(g.as_mut().unwrap(), module);
+}
+
+/// Compiles and loads `module` (once), and launches `entry` with `grid` blocks of `threads` threads and `info`.
+pub fn launch(module: &crate::kernel::Module, entry: &'static str, threads: u32, grid: (u32, u32, u32), info: &[u64]) {
+    assert!(info.len() <= WORDS, "raw launch of {entry}: {} info words, the ring slot holds {WORDS}", info.len());
+    let mut g = launcher();
+    let l = g.as_mut().unwrap();
+    ensure(l, module);
     let f = *l.modules[&module.source_hash].funcs.get(entry).unwrap_or_else(|| panic!("raw: {}.cu has no entry {entry}", module.name));
     let slot = l.next;
     l.next = (l.next + 1) % SLOTS;

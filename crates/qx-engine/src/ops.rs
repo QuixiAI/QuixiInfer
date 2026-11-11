@@ -64,6 +64,25 @@ pub fn dequant_gather(gpu: &Gpu, t: GgmlType, w: u64, out: u64, rows: usize, col
     gpu.run(modules::GEMV.kernel(entry("qx_dequant", t), CubeDim::new_1d(256)), (grid, 1, 1), &[w, out, rows as u64, cols as u64, 0, tok, 1]);
 }
 
+/// Whether the f16 GEMMs of prompt chunks go to cuBLAS (`QX_DS_GEMM16=cublas`) instead of the engine's own tile
+/// kernel `qx_gemm16` (the default): cuBLAS's handle and kernel libraries take about 1.4 GiB of the headroom, which
+/// no server configuration has (2026-11-10: a three-slot and a one-slot 256k server both fell back to the exact
+/// kernels); the own kernel needs nothing.
+pub fn gemm16_cublas() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QX_DS_GEMM16").is_ok_and(|v| v == "cublas"))
+}
+
+/// Y[t][n] = sum_k W[n][k] X[t][k]: `w16` N rows of K halves, `x16` T rows of K halves, `y` f32 rows `ldc` apart.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm16(gpu: &Gpu, w16: u64, k: usize, n: usize, x16: u64, t: usize, y: u64, ldc: usize) {
+    if gemm16_cublas() {
+        qx_gpu::blas::gemm_hss(w16, k, n, x16, t, y, ldc);
+    } else {
+        gpu.run(modules::GEMM.kernel("qx_gemm16", CubeDim::new_1d(256)), ((n as u32).div_ceil(64), (t as u32).div_ceil(128), 1), &[x16, w16, y, t as u64, n as u64, k as u64, ldc as u64]);
+    }
+}
+
 /// One matrix of a `qx_mgemv` launch: `y = W . x`. `qx` is the kernel type id (`qx_type` or a planar id),
 /// `stride` the row stride in bytes (0: dense).
 #[derive(Clone, Copy, Debug)]
@@ -342,7 +361,7 @@ impl MGemv {
                 gpu.run(modules::GEMM.kernel("qx_gemm_f32", CubeDim::new_1d(256)), ((s.rows as u32).div_ceil(64), (t as u32).div_ceil(64), 1), &[x, s.w, y, t as u64, rows, cols, rows]);
             } else {
                 gpu.run(modules::GEMM.kernel("qx_w16", CubeDim::new_1d(256)), (((s.rows * s.cols / 8) as u32).div_ceil(256), 1, 1), &[s.w, w16, rows, cols, s.stride as u64, s.qx]);
-                qx_gpu::blas::gemm_hss(w16, s.cols, s.rows, x16, t, y, s.rows);
+                gemm16(gpu, w16, s.cols, s.rows, x16, t, y, s.rows);
             }
         }
     }
@@ -373,7 +392,7 @@ impl MGemv {
                 assert!(x_stride == k, "an F32 segment with strided inputs");
                 gpu.run(modules::GEMM.kernel("qx_gemm_f32", CubeDim::new_1d(256)), ((s.rows as u32).div_ceil(64), (t as u32).div_ceil(64), 1), &[x, s.w, s.y, t as u64, rows, cols, rows]);
             } else {
-                qx_gpu::blas::gemm_hss(base + off, s.cols, s.rows, x16, t, s.y, s.rows);
+                gemm16(gpu, base + off, s.cols, s.rows, x16, t, s.y, s.rows);
                 off += (s.rows * s.cols * 2) as u64;
             }
         }
@@ -381,7 +400,7 @@ impl MGemv {
 
     /// Whether `run_blas_to` can take this group: every segment's type decodes to f16 (`qx_w16`), F32 rows dense.
     pub fn blas_ok(&self) -> bool {
-        self.segs.iter().all(|s| matches!(s.qx, 0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10 | 16) && (s.qx != 0 || s.stride == 0 || s.stride == s.cols * 4) && s.cols % 8 == 0)
+        self.segs.iter().all(|s| matches!(s.qx, 0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10 | 16) && (s.qx != 0 || s.stride == 0 || s.stride == s.cols * 4) && s.cols % 32 == 0)
     }
 
     /// The largest rows x cols among the non-F32 segments (the size of `run_blas_to`'s `w16`, in halves).
