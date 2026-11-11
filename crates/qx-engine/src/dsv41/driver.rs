@@ -726,18 +726,21 @@ impl Loop {
         self.finish_copies(sh, false);
         let vram_ok = self.inflight.is_empty() && self.d2h.is_empty();
         let mut plan: Vec<(usize, u64)> = Vec::new();
-        // Evictions per call: a victim's slot is quarantined two ticks, so its candidate enters VRAM only if another
-        // slot is free now; otherwise the eviction just empties a slot that a later tick fills. A decode tick's
-        // budget (`promos_per_token`) keeps that pipeline full. A tick of `dt` tokens (a prompt window, a chunk) had
-        // the budget times `dt`, up to 512: each prompt chunk evicted up to 512 residents and promoted none (the
-        // flex tail holds the free slots), and the ticks after refill 32 a token: the first decode step after a
-        // 13.3k prompt in a three-slot server found 11% of its selections in VRAM and 26% on NVMe only (188 ms
-        // against ~37 steady), 2026-11-11. QX_DS_EVICT_CAP=N (default the per-token budget; 0: no cap, as before).
+        // Evictions at a prompt chunk's tick (`dt` over a window's width): a victim's slot is quarantined two ticks,
+        // so its candidate enters VRAM only if another slot is free now, and during a prompt's chunks the flex tail
+        // holds the free slots: a chunk's tick evicted hundreds of residents and promoted none, and the decode
+        // ticks after it refill at the per-token budget. Window and decode ticks are not capped: their bursts are
+        // refilled by the next ticks' own budgets (capping them too read prefill128 10.5 -> 15.8 and decode256k
+        // 38.6 -> 39.4, 2026-11-11). QX_DS_EVICT_CAP=N (default the per-token budget; 0: no cap, as before).
         static EVICT_CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-        let evict_cap = match *EVICT_CAP.get_or_init(|| std::env::var("QX_DS_EVICT_CAP").ok().and_then(|v| v.parse::<usize>().ok())) {
-            Some(0) => usize::MAX,
-            Some(n) => n,
-            None => self.host.promos_per_token.max(1),
+        let evict_cap = if dt <= crate::dsv41::DS_TMAX {
+            usize::MAX
+        } else {
+            match *EVICT_CAP.get_or_init(|| std::env::var("QX_DS_EVICT_CAP").ok().and_then(|v| v.parse::<usize>().ok())) {
+                Some(0) => usize::MAX,
+                Some(n) => n,
+                None => self.host.promos_per_token.max(1),
+            }
         };
         let mut evicted_now = 0usize;
         for &g in cand.iter() {
