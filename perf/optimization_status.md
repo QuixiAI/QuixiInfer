@@ -2925,3 +2925,58 @@ What followed (each run time-boxed):
   attention-side groups chunk-wide (the inputs of `g_x` depend only on the previous layer) or split-K.
 Presupposition rows 7, 10, 21 updated; new rows 32 (a vendor library is the cheap way: false for a server) and
 33 (short-prompt identity validates a chunk-path change: false).
+
+## 2026-11-10 (night): Expert side streams and the own f16 kernel for prompt chunks — set D 26.925 -> 25.447 (prefill256k 5.70 -> 4.7); promotion run `perf/results/2026-11-10/setd-promo6-211440` (adjudication below)
+
+This replaces the withdrawn request on `setd-promo5` (cuBLAS, tree 25c7614: HOLD; see the entry above).
+Tree: the code of 013f98c (binaries chunk81: qx-ds-check 1a1d5cf9cb9d, quixiinfer bc1b41e0bb3d); `run.json`
+records 41dec22, a notebook-only commit made while the chain ran (`git diff 013f98c 41dec22` touches `perf/`
+only). Changes since the promoted 4ee0e73:
+1. Experts of the chunk path on 8 side streams (bit-identical: 16k prompt, 4096 / 4096 rows; prefill256k at
+   8192-row chunks with a 64-step tail, 8192 / 8192 rows, 8 streams against 1), with `CUDA_DEVICE_MAX_CONNECTIONS`
+   = 32; off for a staging ring under 8 N or a chunk under 256 rows (the breaker's deadlock by reading).
+2. Prompt chunks' dense products as f16 x f16 -> f32 tensor-core GEMMs by the engine's own kernel `qx_gemm16`
+   (weights decoded to f16 once per layer and chunk by `qx_w16`; the router's F32 rows in f32; the vocabulary
+   head, every window and every single step exact; `QX_DS_PREFILL_EXACT=1` restores the exact chunk path:
+   bit-identical to the exact reference, 4096 / 4096 rows on chunk76). Only through the raw launcher; the
+   engine's modules are loaded before the first job. `QX_DS_GEMM16=cublas` selects cuBLAS (faster in
+   `qx-ds-check`: prefill256k 4.0; it fits no server's headroom and gives up there).
+Accuracy of the f16 path against the exact path (contract of 2026-11-10: KL mean <= 0.03, top-1 >= 95%), own
+kernel, these binaries: 16k prompt at 4096-row chunks, 511 positions: KL mean 0.0089, p99 0.073, max 0.131, top-1
+97.5%; the scored configuration (prefill256k, 8192-row chunks from the 245,760 state), 64 tail positions: KL mean
+0.0048, max 0.044, top-1 100%.
+Server on the f16 path (the adjudicator's missing check): three slots, `--ctx 262144`, the 13,283-token prompt:
+TTFT 30.6 s (434 tok/s; the exact kernels 393-420 in three sessions), the repeat 2.2 s, loadgen at concurrency 3
+after it completes, no panic, no module compiled after layer 0 (logs in the run directory).
+Promotion run (10-minute protocol), 21:14-21:23; preflight: VM off; 3.5 GB used, 64.7 GB free (the rest page
+cache); swap 1.5 of 8 GB; pressure avg10 0.00; no build tool; proactiveness 0:
+
+| case | baseline (26.925 row) | this run | change |
+|---|--:|--:|--:|
+| decode256k | 38.25 | 38.3, 38.7 | +0.7% |
+| prefill256k | 5.70 | 4.7 | -17.5% |
+| serve256k3 | 89.53 | 91.07 (second session 88.81) | +1.7% |
+| serve256k1 | 38.37 | 39.14 (39.65) | +2.0% |
+| decode | 30.50 | 31.0 | +1.6% |
+| prefill128 | 10.50 | 10.5 | 0 |
+| serve3 | 78.62 | 78.68 (attached, `v7-serve-212321`) | +0.1% |
+| serve1 | 33.66 | 32.32 (attached) | -4.0% (single sessions range 32.3-36.5 today) |
+
+Score 26.925 -> 25.447 (-5.5%). ds-checks pass (two parts, 21:03-21:14, these binaries). Server identity
+identical in 2 of 2 serve256k sessions on these binaries (short prompts: `chunk steps 0`; they cover decode only).
+Of the -17.5% on prefill256k, the exact side streams are about -9% (5.1-5.2) and the f16 kernel the rest.
+**Costs carried, stated:** decode256k and the short decode read +0.7% and +1.6% (single runs; +0.5% against the
+promoted binary interleaved earlier the same evening); serve256k3 +1.7% in this run (88.81 in the next session):
+the larger flex tail (`ChunkBufs::extra`, ~0.8 GB at 8192 rows) leaves about 100 VRAM slots empty after the
+server's warm-up chunk instead of 77 (the breaker: NVMe misses +4%, pool +3.6%); not fixed. serve256k1: the
+second concurrency-1 request has been slower in every session since 7f7117f, unattributed. The slow decode256k
+mode of 19:20-20:02 (5 of 11 candidate runs, 0 of 7 promoted, 0 of 11 after 20:04; the same signature on earlier
+binaries; cause unknown) did not appear in this run.
+Not done: `qx-ds-multi` all rows (no scheduler, window or job-path change). The first chunk of a cold prompt is
+slow for a reason outside this work (waiting on experts).
+Against Strata (same files, same box, 2026-11-10): decode 32.8 tok/s against 27.2: ahead. Prefill: Strata 765
+(cold) to 905 (warm) tok/s on a 16k prompt; ours in a three-slot 256k server on a 13.3k prompt 434 tok/s (393-420
+before today's work, 361 on the 16k `long16k` case this morning): **behind by about 2x**. What is left: the
+attention-side dense groups chunk-wide or split-K on the own kernel (cuBLAS shows the arithmetic is worth 4.8 /
+4.6 / 7.5 s per chunk against our 6.3 / 6.0 / 10.0), attention (Strata 1.5 s of kernel time on the 16k prompt,
+ours 9.4), the experts' arithmetic, the upper layers on the kept rows only.
