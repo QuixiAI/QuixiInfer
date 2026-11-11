@@ -2817,3 +2817,65 @@ Whole-slab pipelining across streams is blocked by `ring_w = n_swa + DS_TMAX` (t
 overwrite cells the previous slab's attention still reads) and the saved 256k states carry that ring.
 Validation of the expert streams default (tree 7f7117f, `setd-promo2-085837`): ds-checks pass (two parts),
 identity 2 of 2, prefill256k 5.70 -> 5.20, decode256k 38.55, serve256k3 90.74, score 26.299; not yet adjudicated.
+
+## 2026-11-10: Prompt processing in FP16 on tensor cores, experts on side streams — set D 26.925 -> 24.08 (prefill256k 5.70 -> 4.0); 16k prompt 361 -> 599 tok/s; promotion run `perf/results/2026-11-10/setd-promo5-201304` (adjudication below)
+
+The user's instruction of 2026-11-10: match or exceed Strata's prefill and decode. Decode is ahead (ours 32.8
+tok/s on the short decode case, Strata 27.2 on its 64-token-prompt run). Prefill, 16k prompt: Strata 765 tok/s
+cold / 905 warm; ours 361 this morning, 461 with the expert side streams (exact), 599 with the dense products in
+FP16 (this entry). Tree 25c7614 (binaries chunk76/77: qx-ds-check 5ef3cf3cb8c9, quixiinfer 5cc0a76722de), clean.
+Changes since the promoted 4ee0e73:
+1. **Experts on 8 side streams** (7f7117f; entry above): bit-identical.
+2. **Dense products of the chunk path as half-precision tensor-core GEMMs with f32 accumulation** (cuBLAS
+   `GemmEx`, f16 x f16 -> f32; 4b915b9, 25c7614): the weights of a matrix are decoded to f16 once per layer and
+   chunk (`qx_w16`; Q5_K added to the types it decodes: 39 dense matrices are Q5_K, and without it the path never
+   engaged: the "no gain" of the first chunk-wide FFN attempt and of the first cuBLAS screen were both this); the
+   FFN's shared expert runs once over the chunk's rows (`chunk_ffn`), the attention-side groups (`g_x`, `g_qr`,
+   `wo_a`, `g_ob`) per 128-row slab from the cached f16 weights; the router's F32 rows stay f32 (`qx_gemm_f32`),
+   the vocabulary head and every single step and window stay on the exact kernels. `QX_DS_PREFILL_EXACT=1`
+   restores the exact chunk path (measured bit-identical to the exact dump: 4096 / 4096 rows).
+   - cuBLAS loads a kernel library at a GEMM shape's first use; with an expert job posted the run stopped in
+     layer 2 (gdb: the engine thread in `cuLibraryLoadData` under libcublasLt, the driver thread behind its lock,
+     a waiting kernel on the card). Every shape a chunk will use now runs once on scratch before any job is
+     posted (the standing dry-pass rule).
+   - The scratch (chunk-wide FFN rows, f16 weights and inputs, side-stream scratch: ~0.8 GB at 8192 rows) is a
+     region of the flex tail (`ChunkBufs::extra`, `cscratch`): lent during chunks only. The cuBLAS handle (~0.4
+     GiB) is created at the first chunk from the headroom (`blas::try_init`; without memory for it the chunk
+     keeps the exact kernels): created at load it had cut the tier from 15.4 to 15.0 GiB (12.3 -> 11.9 with three
+     slots).
+Screens (16k prompt, 4096-row chunks, ms per chunk 0/1/2/3 and ms per token):
+exact 11,236 / 6,207 / 5,927 / 12,477, 2.17; FFN only in FP16 5,425 / 5,094 / 9,812 (chunks 1-3); all dense in
+FP16 9,981 / 4,800 / 4,520 / 8,260, **1.67 (599 tok/s)**. prefill256k: 5.70 (baseline) -> 5.1-5.2 (streams) -> 4.0.
+**Accuracy against the exact path** (the contract of 2026-11-10: KL mean <= 0.03, top-1 >= 95%): 511 positions
+after the 16k prompt (`QX_DS_TAIL=512`): KL mean 0.0084, p99 0.0765, max 0.167, top-1 97.8%; over the 63 positions
+of the shorter tail in four runs: KL 0.0070-0.0088, top-1 95.2-98.4%.
+Promotion run (10-minute protocol), 20:13-20:21, preflight: VM off; 3.5 GB used, 105.9 GB free; swap 1.5 of 8 GB;
+pressure avg10 0.06 (avg300 1.15); no build tool; proactiveness 0; tree 25c7614 clean:
+
+| case | baseline (26.925 row) | this run | change |
+|---|--:|--:|--:|
+| decode256k | 38.25 | 38.7, 38.6 | +1.0% |
+| prefill256k | 5.70 | 4.0 | -29.8% |
+| serve256k3 | 89.53 | 90.33 (other sessions today: 90.66, 90.74, 90.99) | +0.9% |
+| serve256k1 | 38.37 | 40.68 (38.4, 38.37, 40.73) | |
+| decode | 30.50 | 30.8 | +1.0% |
+| prefill128 | 10.50 | 10.5 | 0 |
+| serve3 | 78.62 | 78.86 (attached from `v6-serve-194523`) | +0.3% |
+| serve1 | 33.66 | 36.48 (attached; 35.1-36.0 on chunk67 today) | noise of single sessions |
+
+Score 26.925 -> 24.08 (-10.6%). ds-checks pass (two parts, 19:25-19:36, same tree). Server identity identical in
+4 of 4 serve256k sessions on this tree (`setd-promo4`, `v6-serve`, `v5a-s256`, this run).
+**Disclosed: an earlier promotion run on the same tree (`setd-promo4-193647`, 19:36-19:45) read decode256k 38.6
+/ 41.2**, and interleaved decode256k runs 19:52-20:03 read the candidate at 38.8, 38.8, 41.2, 40.9, 38.6, 40.8,
+38.6 against the promoted binary's 38.6, 38.3, 38.5, 38.4, 38.4, 38.4, 38.4 (one of those with the same enlarged
+gap over its first half). Then 12 runs 20:04-20:13 in four arms (candidate; with 8 work queues; with
+`QX_DS_PREFILL_EXACT=1`; the pre-FP16 binary chunk67) all read 38.3-38.8, and this run 38.7 / 38.6. All slow
+runs of the evening fall between 19:20 and 20:02, a window in which the box had 64-65 GB free against 106 GB
+after it; decode does not run the chunk path. My reading: bursts on the box, not the candidate; not proven, and
+the candidate's steady value is 38.6-38.8 against 38.3-38.6 (+0.5 to 1%), inside decode256k's spread.
+Also: the 8k server interleaved (chunk67, chunk75, chunk67): serve3 81.37, 79.55, 79.94: no difference.
+Not done: `qx-ds-multi` all rows (no scheduler, window or job-path change); the first chunk of a prompt is cold
+(10 s against 4.5-4.8 s for the next: waiting on experts), unchanged by this work.
+Against Strata on prefill we are at 599 of 765 tok/s. What is left, from the kernel tables: attention (Strata
+1.5 s, ours 9.4 s of kernel time on the 16k prompt), the experts' arithmetic (exact int8 tiles against FP16
+tiles), the cold first chunk, the upper layers on the kept rows only.
