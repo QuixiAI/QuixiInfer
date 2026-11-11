@@ -3202,3 +3202,74 @@ records of their class. Empty slots 102 -> 0; the 64 tokens after the 13.3k prom
 3.70 s without, loadgen at 1 and 3 unchanged (24.2-24.4 tok/s; 11.17 / 11.64 against 11.54 / 11.23 per request).
 So the slow first tokens after a long prompt (57.8 ms per token over those 64 against ~37 steady) are not the
 empty slots. Reverted.
+
+## 2026-11-11 (morning): The tokens right after a long prompt: evictions at a chunk's tick capped — LANDED candidate (64 tokens after a 13k prompt 3.76 -> 3.55 s, after a second one 3.33 -> 2.72 s; scored cases unchanged by construction); four tier ideas rejected; Strata like for like
+
+Trees: 1ac3e01 (the cap on every tick: rejected by its own promotion-style run), ec8cb28 (the cap on chunk ticks
+only; binaries chunk104: qx-ds-check 6004c15416fb, quixiinfer 8f509760f785).
+The question: Strata's first 8 tokens after a 16k prompt run at 14.2-14.4 tok/s; ours in the three-slot 256k
+server at 8-11, and the 64 tokens after a 13.3k prompt take 3.70 s (57.8 ms each against ~37 steady).
+What the server's first steps after the prompt look like (new verbose lines `post-prompt step N`, chunk97): 188,
+164, 158, 135, 90, 101, 65, 56 ms; of a step's 240 selections the first step finds 27 in VRAM (11%), 57 staged,
+94 in RAM and **62 on NVMe only**; by step 7: 99 / 50 / 82 / 9. The whole excess is the tiers.
+
+Tried, measured, rejected (each a same-binary A/B in the three-slot 256k server unless said; patches kept in
+`~/qx-chains/`):
+1. Filling the tail's empty slots at the end of the prompt with the hottest RAM records (`flex-fill.patch`, tag
+   FILLV): empty slots 102 -> 0, the 64 tokens 3.70 s both ways.
+2. The chunk's selection counts as a per-token rate in the scores, plus 1 (`chunk-scores-fill.patch`, tags RAMP2,
+   POST; today a chunk's counts are decayed by its rows at its own tick, 0.5^32 for 8,192): `qx-ds-check`, 16k
+   prompt, steps 2-9 after it 50.4 -> 47.2 ms; server 3.70 -> 3.81 s, loadgen slightly worse. No.
+3. The layer's hottest NVMe-only records of the prompt promoted to RAM during the chunk (12 or 32 per layer; tag
+   RPR): RAM promotions 997 -> 1,614 -> 2,196 by the end of the prompt, NVMe selections on the first step 36 -> 38
+   -> 37. The decode's misses are not on the records the prompt used most: the reply (a chat turn about the
+   text) routes differently from the text.
+4. Saving the tail's residents that have no RAM copy into RAM when the tail is taken (`evict-cap+flex-save.patch`,
+   tag SAVE): 55 records saved, empty slots after the prompt 77 -> 22, the first steps and the 64 tokens unchanged
+   (3.45 / 3.47 s).
+5. The eviction cap on every tick (1ac3e01; promotion-style run `setd-promo9-052143`): prefill128 10.5 -> 15.8,
+   decode256k 38.6 -> 39.4, serve256k1 36.97 -> 39.22, serve256k3 90.99 -> 89.13. Window and decode ticks need
+   their bursts (the next ticks' budgets refill them). The breaker had predicted both: evictions were never
+   bounded by the fill budget (a victim with no free slot never entered `plan`), so the cap bound on single steps
+   too, and a 128-token window got 32 evictions.
+
+What landed (ec8cb28): at a prompt chunk's tick (`dt` over a window's width) evictions are capped at the per-token
+budget (`QX_DS_EVICT_CAP`, 0 = none). A victim's slot is quarantined two ticks, so its candidate enters VRAM only
+if another slot is free, and during a prompt the flex tail holds the free slots: a chunk's tick evicted hundreds
+of residents and promoted none, and the decode ticks after it refill at the per-token budget.
+| three-slot 256k server, same binary (chunk103 = the code of ec8cb28), A B B A | no cap | cap |
+|---|--:|--:|
+| 64 tokens after the first 13,284-token prompt | 3.76, 3.76 s | 3.57, 3.54 s (-5.6%) |
+| 64 tokens after a second, different 13,242-token prompt | 3.33, 3.33 s | 2.75, 2.70 s (-18%) |
+| its first four steps | 187, 167, 137, 84 ms | 122, 70, 44, 31 ms |
+| loadgen after them, concurrency 1: per-request tok/s; TTFT median | 24.46, 24.45; 1.54 s | 24.21, 24.60; 1.64, 1.65 s |
+| loadgen, concurrency 3: per-request tok/s | 11.27, 11.28 | 11.25, 11.28 |
+| the two generated messages (64 tokens each) | identical in all four sessions | |
+With the server's default budget (`QX_DS_PROMOS` unset: 4 a token; chunk104, one session each): 4.65 -> 3.96 s and
+3.71 -> 3.05 s; loadgen at 1: 22.04 -> 21.62 tok/s per request, TTFT 1.59 -> 1.69 s.
+Cost: the short requests that follow a long prompt start about 0.1 s later (TTFT 1.54 -> 1.64 s; fewer empty
+slots for the next text's candidates), and at the default budget their decode reads 2% slower in the one session.
+Scored cases, unchanged by construction (no tick of a scored decode or window has `dt` over 128; prefill256k's
+chunk ticks are capped but nothing after them is timed): promotion-style run `setd-promo10-055704` on chunk104:
+decode256k 38.6, 38.4 (baseline 38.6), prefill256k 2.2, serve256k3 90.83 (90.99), decode 30.9, prefill128 10.5,
+serve256k1 39.54 (36.97 in the baseline run, 37.09 and 38.6 in two later sessions of the previous trees: the
+concurrency-1 spread again); identity identical; ds-checks parts a and b pass (V11); the 8k guard serve1 35.16,
+serve3 78.93 (78.68). The baseline stays the run of a41128e: nothing scored moved.
+
+The breaker (fresh context, on 1ac3e01): no corruption path; its blocking points were that the cap bound on single
+steps (true; fixed by narrowing it), that the gain might be a first-request-after-start effect (measured: larger
+on the second prompt), that windowed prompts would lose VRAM hits (true: prefill128; fixed by narrowing), and the
+default budget of 4 (measured above). Its text comparison: done, identical.
+
+Strata like for like (tag H2W; same 16,384 ids, alternating, Strata's own timers; ours in `qx-ds-check` with
+`QX_DS_WARM=1`, which runs the server's start-up warm-up before the timed prompt: a cold process spends 4.4 s of
+its first chunk in ~45 per-kernel NVRTC compiles and graph captures, which a server pays at start):
+| | Strata | ours |
+|---|--:|--:|
+| prompt, 16,384 tokens | 885, 806 tok/s | 1,178, 1,208 tok/s |
+| the same, ours as a cold process (compiles inside the first chunk; tag H2H) | 841, 880 | 811, 813 |
+| the first 8 tokens after it | 14.2, 14.3 tok/s | 23.4, 23.4 tok/s (42.7 ms; steps 49, 46, 47, 39, 41, 43, 41, 36) |
+| decode, short context (2026-11-10 for Strata) | 27.2 tok/s | 32.4-32.7 |
+(Whether Strata's prompt timer includes any start-up work of its own was not checked. The three-slot 256k server
+is a different configuration from Strata's single stream at 32k: its VRAM tier is 12.3 GiB, not 17, and its first
+tokens after a prompt are the 100-180 ms above.)
