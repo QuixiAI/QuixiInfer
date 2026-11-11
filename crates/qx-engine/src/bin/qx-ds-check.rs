@@ -130,6 +130,24 @@ fn main() -> anyhow::Result<()> {
             // QX_DS_CHUNK=N (the chunk path, layer-major in chunks of N rows): the prompt before the tail in chunks
             // instead of windows; a chunk returns its last row's logits only
             let chunk = std::env::var("QX_DS_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            // QX_DS_WARM=1 (a fresh prompt only): the server's start-up warm-up before the timed prompt, so a one-shot
+            // run times what a running server would (the per-kernel compiles and graph captures of every window
+            // width and the chunk kernels' dry pass: 4.4 s of a cold process's first chunk, 2026-11-11)
+            if std::env::var("QX_DS_WARM").is_ok_and(|v| v == "1") && start == 0 {
+                let tw = std::time::Instant::now();
+                let z = vec![0u32; 256];
+                eng.reset(0);
+                let _ = eng.forward_window(&z[..2], None);
+                for w in [1usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128] {
+                    let _ = eng.forward_window(&z[..w], None);
+                }
+                eng.reset(0);
+                if chunk > 0 {
+                    eng.chunk_warm();
+                    eng.chunk_release();
+                }
+                eprintln!("warm-up (QX_DS_WARM=1): {:.1} s", tw.elapsed().as_secs_f64());
+            }
             let mut p = start;
             while p < toks.len() {
                 save_if_due(&mut eng, p);
@@ -179,7 +197,12 @@ fn main() -> anyhow::Result<()> {
                 t_eng += eng.t_engram;
                 per_tok.extend(std::iter::repeat(eng.t_forward / w.len() as f64).take(w.len()));
                 if w.len() == 1 && tail > 0 {
-                    if tail_times.len() < 4 {
+                    // QX_DS_TAIL_PRINT=N: the first N tail steps' lines (default 4), each with the tiers' counters
+                    let n_print = std::env::var("QX_DS_TAIL_PRINT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+                    if n_print > 4 && tail_times.len() < n_print {
+                        eprintln!("  tail tiers {}: {}", tail_times.len(), eng.tier_stats().unwrap_or_default());
+                    }
+                    if tail_times.len() < n_print {
                         eprintln!("  tail step {} at {}: {:.1} ms (uploads {:.2}, launch/replay {:.2}, wait {:.2}, flush {:.2}, download {:.2})", tail_times.len(), p, eng.t_forward * 1e3, eng.t_phase[0] * 1e3, eng.t_phase[1] * 1e3, eng.t_phase[2] * 1e3, eng.t_phase[3] * 1e3, eng.t_phase[4] * 1e3);
                     }
                     tail_times.push(eng.t_forward);

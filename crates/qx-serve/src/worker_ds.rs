@@ -225,6 +225,9 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         let keep = eng.prompt_keep();
         let mut kv_only_windows = 0usize;
         let mut chunk_steps = 0usize;
+        let verbose_post = std::env::var("QX_DS_VERBOSE").is_ok();
+        let mut post_left = 0usize;
+        let mut post_t = std::time::Instant::now();
         let stats = std::env::var("QX_SCHED_STATS").is_ok();
         let group = eng.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
         let mut last_save: Option<std::time::Instant> = None;
@@ -319,12 +322,18 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     // the flex tail back to the tiers once this prompt's chunks are done and no other running request
                     // still has a prompt stretch that would run in chunks
                     if r.read == r.job.prompt.len() && !others_pending {
+                        let tr = std::time::Instant::now();
                         eng.chunk_release();
+                        if verbose_post {
+                            eprintln!("post-prompt: flex tail released in {:.1} ms", tr.elapsed().as_secs_f64() * 1e3);
+                        }
                     }
                     chunk_steps += 1;
                     if r.read == r.job.prompt.len() {
                         r.t_prompt = Some(r.t0.elapsed().as_secs_f64());
                         r.logits = Some(last);
+                        post_left = 12;
+                        post_t = std::time::Instant::now();
                     }
                     true
                 } else {
@@ -369,6 +378,13 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 kv_only_windows += 1;
             }
             out = eng.forward_segments_opt(&segs, None, kv_only);
+            if verbose_post && post_left > 0 {
+                // QX_DS_VERBOSE: the first steps after a prompt's last chunk (the forward's time and the wall time
+                // since the previous step or the chunk's end)
+                eprintln!("post-prompt step {}: forward {:.1} ms, {:.1} ms since the previous one ended (width {}; uploads {:.2}, launch {:.2}, wait {:.2}, flush {:.2}, download {:.2}){}", 12 - post_left, eng.t_forward * 1e3, post_t.elapsed().as_secs_f64() * 1e3, segs.len(), eng.t_phase[0] * 1e3, eng.t_phase[1] * 1e3, eng.t_phase[2] * 1e3, eng.t_phase[3] * 1e3, eng.t_phase[4] * 1e3, eng.tier_stats().unwrap_or_default());
+                post_left -= 1;
+                post_t = std::time::Instant::now();
+            }
             }
             steps += 1;
             if stats {
