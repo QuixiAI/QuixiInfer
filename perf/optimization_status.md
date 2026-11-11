@@ -2879,3 +2879,49 @@ Not done: `qx-ds-multi` all rows (no scheduler, window or job-path change); the 
 Against Strata on prefill we are at 599 of 765 tok/s. What is left, from the kernel tables: attention (Strata
 1.5 s, ours 9.4 s of kernel time on the 16k prompt), the experts' arithmetic (exact int8 tiles against FP16
 tiles), the cold first chunk, the upper layers on the kept rows only.
+
+## 2026-11-10 (evening): The FP16 prompt path, reviewed: HOLD from the adjudicator, a server crash found, cuBLAS fits no server, the engine's own f16 kernel — corrections to the entry above
+
+**The promotion of `setd-promo5-201304` (tree 25c7614) was not made.** Adjudicator (fresh context): "Verdict:
+HOLD. The set D numbers pass the bar and no new promotion run is needed, but two checks are missing and the entry
+needs corrections before it can carry a PROMOTE." Its findings, and the breaker's on 4ee0e73..25c7614:
+- Every identity session had `chunk steps 0` (40-46 token prompts): they prove the server's decode exact and say
+  nothing about the chunk path. With the 13,283-token prompt (`tools/longprompt.py --chars 60000`) **the
+  three-slot 256k server on 25c7614 panicked**: `raw: cuModuleLoadData of mgemv.cu: CUDA_ERROR_OUT_OF_MEMORY`
+  after cuBLAS took its handle from the 0.45 GiB the server has free after warm-up; the request returned nothing.
+  The exact arm: TTFT 31.6 s (420 tok/s), the repeat 2.2 s (prefix reuse).
+- In FP16 mode `mgemv.cu` was compiled and loaded after layer 0's experts were posted (the dry-pass rule).
+- Corrections to the entry above: the free-memory explanation of the slow decode256k runs is wrong (65 GB free was
+  also the state before clean runs; `sar` shows 111 GB free seconds before the slowest run); 5 slow candidate runs
+  of 11 in the 19:20-20:02 window (V5A's 42.1 included), 0 of 7 for the promoted binary, 0 of 11 after 20:04; the
+  same signature (pool +12%, gap 1190 -> 1500) is on earlier binaries the same day; cause unknown. serve256k1's
+  +6% is not noise: the second concurrency-1 request is slower in 8 of 8 sessions since 7f7117f (9.9-10.8 s
+  against 9.2-9.5; about twice the NVMe records), unattributed. Identity was 3 sessions on 25c7614 plus one on the
+  same binaries. The 599 tok/s (1.67 ms per token) was chunk74 (handle created at load); with the handle created
+  at the first chunk a cold 16k prompt reads 1.86 (538 tok/s). The "exact" screen row mixed two runs.
+  The larger flex tail (`ChunkBufs::extra`, ~0.8 GB at 8192 rows) leaves 102 VRAM slots empty after the server's
+  warm-up instead of 77: NVMe misses +4% and pool time +3.6% in six sessions against five, which fits serve256k3
+  at 90.3-91.0 against 89.5 (the breaker; not yet fixed).
+What followed (each run time-boxed):
+- chunk78: our modules preloaded before cuBLAS, a give-up when less than 768 MiB is free after the dry pass: the
+  three-slot server no longer panics (`cuBLAS: no handle`, exact kernels, 395 tok/s); prefill256k in `qx-ds-check`
+  gave up too (703 MiB free): 5.2.
+- chunk79: handle created at load again: the three-slot server still gave up (361 MiB free after the dry pass).
+- chunk80: handle from the headroom, floor 384 MiB, FP16 only with the raw launcher, side streams off for a
+  staging ring under 8 N or a chunk under 256 rows. Three-slot server: exact fallback, 393 tok/s, loadgen at
+  concurrency 3 after it fine, no panic, no compile after layer 0. **One-slot 256k server: the same fallback**
+  (411 tok/s): cuBLAS engages in no server configuration. prefill256k at the scored configuration, tail of 64
+  single steps: FP16 against exact KL mean 0.0052, max 0.035, top-1 100% (64 rows); exact with 8 side streams
+  against 1: 8192 / 8192 rows bit-identical. Chunks: FP16 19,229 / 33,032 ms, exact 20,446 / 42,290, exact with
+  one stream 22,751 / 46,955.
+- **chunk81: the engine's own f16 tile GEMM** (`qx_gemm16` in gemm.cu: `gemm_tile` without a decoder, f16
+  operands copied into the tile, `mma ... f16.f16.f32`; no library, no memory, no dry pass), the default;
+  `QX_DS_GEMM16=cublas` keeps cuBLAS. 16k prompt, 4096-row chunks: own 6,304 / 6,030 / 9,953 ms (chunks 1-3),
+  cuBLAS 4,816 / 4,554 / 7,511, exact 6,207 / 5,927 / 12,477; 511 positions against exact: own KL 0.0089, top-1
+  97.5%; cuBLAS 0.0084, 97.8%. prefill256k 4.7 (cuBLAS 4.0, exact 5.2). Three-slot 256k server, 13.3k prompt:
+  **434 tok/s** (TTFT 30.6 s; chunks 12,350 / 14,489 ms against 13,283-13,688 / 16,171-16,192 exact), loadgen
+  after it fine, no panic. The own kernel is at the exact kernels' speed on KV-only chunks: at 128-row slabs a
+  matrix with few output rows (`g_x`: 1,792 rows = 28 blocks) does not fill the card; cuBLAS splits K. Next: the
+  attention-side groups chunk-wide (the inputs of `g_x` depend only on the previous layer) or split-K.
+Presupposition rows 7, 10, 21 updated; new rows 32 (a vendor library is the cheap way: false for a server) and
+33 (short-prompt identity validates a chunk-path change: false).
