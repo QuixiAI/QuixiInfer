@@ -3273,3 +3273,10 @@ its first chunk in ~45 per-kernel NVRTC compiles and graph captures, which a ser
 (Whether Strata's prompt timer includes any start-up work of its own was not checked. The three-slot 256k server
 is a different configuration from Strata's single stream at 32k: its VRAM tier is 12.3 GiB, not 17, and its first
 tokens after a prompt are the 100-180 ms above.)
+serve256k1 checked (the gate prints REGRESSION on this companion row: 39.54 against the baseline run's 36.97):
+the two binaries alternated, one serve256k session each, twice (tag S1, `perf/results/2026-11-11/s1-*`): chunk104
+(ec8cb28) 39.57 and 38.43; chunk92 (a41128e, the baseline's binaries) 37.06 and 39.17. The concurrency-1 pair of
+requests reads (10.62, 9.61) and (8.97, 10.80) s on the new binaries and (9.24, 9.67) and (10.37, 9.64) s on the
+old: one request of a pair is about a second slower in three of the four sessions, on either binary. The same
+spread as the 8k server's; not this change (a serve256k session has no chunk tick). serve256k3 in the four
+sessions: 90.74, 91.16 (new), 91.32, 90.66 (old). Identity identical in all four.
