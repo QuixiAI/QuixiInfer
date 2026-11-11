@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "label": "setd-promo",
-  "date": "2026-11-10T05:38:02",
+  "label": "setd-promo6",
+  "date": "2026-11-10T21:23:21",
   "git": {
-    "commit": "4ee0e73",
+    "commit": "41dec22",
     "dirty": false,
     "modified": [],
     "diff_sha": null
@@ -41,8 +41,11 @@
     "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/route1k.tokens 1024"
   ],
   "attached": {
-    "serve1,serve3": "from perf/results/2026-11-10/val4-serve-053805 (same commit, binaries and settings; run 05:38-05:44 right after this run: the 10-minute test rule splits the set)",
-    "correctness": "tools/ds-checks.sh in two parts (DS_CHECKS_PART=a 05:44-05:51, b 05:51-05:55) on the same binaries; logs/ds-checks-part-*.timestamped.log",
-    "identity_second_session": "serve256k-1: identical (perf/results/2026-11-10/val4-serve-053805)"
+    "tree": "run.json records 41dec22 (a notebook-only commit made while the chain ran); the binaries (qx-ds-check 1a1d5cf9cb9d, quixiinfer bc1b41e0bb3d) were built from the code of 013f98c: git diff 013f98c 41dec22 touches perf/ only",
+    "serve1,serve3": "from perf/results/2026-11-10/v7-serve-212321 (same commit, settings and binaries; 21:23-21:29, right after this run)",
+    "correctness": "tools/ds-checks.sh in two parts (b 21:03-21:07, a 21:07-21:14) on the same binaries, before this run; logs/ds-checks-part-*.timestamped.log",
+    "identity_second_session": "serve256k-1: identical (perf/results/2026-11-10/v7-serve-212321)",
+    "server_long_prompt": "three-slot 256k server, 13,283-token prompt on the f16 path (chunk81, the same binaries): logs/longprompt-3slot.* (TTFT 30.6 s, 434 tok/s; repeat 2.2 s; loadgen at concurrency 3 after it)",
+    "prefill_accuracy": "own f16 kernel vs exact: 16k prompt, 511 positions: KL mean 0.0089, top-1 97.5% (chain OWN); prefill256k configuration, 64 tail rows: KL mean 0.0048, max 0.044, top-1 100% (chain KL3)"
   }
 }

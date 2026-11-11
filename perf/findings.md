@@ -64,6 +64,9 @@ driver JIT at first use.
 | Widths 2-3 (a 3-slot server's concurrent decode steps) on a 4/8 staged share, window share from width 4 (`QX_DS_STAGE_SHARE_NARROW`, `QX_DS_STAGE_WIDE_MIN`) | serve256k3 106.3 -> 95.3 (-10.4%), concurrency 2 74 -> 67, serve3 96.5 -> 87.9: on 8/8 the pool idled | 2026-11-10 |
 | Exclusive tiers (`QX_DS_RAM_DEDUP=2`): a VRAM victim is copied back from its slot into the RAM place of a duplicate; RAM promotions evict duplicates first | decode256k 42.0 -> 38.3 (-8.8%, same-binary interleaved), serve256k3 95.06 -> 90.01; NVMe records per 64 tokens 556 -> 285. Over half the NVMe fetches were promotion churn | 2026-11-10 |
 | Set D on the new host state (driver 620.70.06, VM off, compaction_proactiveness 0) | score 30.047 -> 26.925: decode256k 38.25, prefill256k 5.70, serve256k3 89.53 | 2026-11-10, `setd-promo-052925` |
+| Chunk-path experts on 8 side streams (`QX_DS_CHUNK_STREAMS`, `CUDA_DEVICE_MAX_CONNECTIONS=32`): N experts overlap on the card | 16k prompt 361 -> 461 tok/s, prefill256k 5.7 -> 5.2, bit-identical | 2026-11-10 |
+| Prompt chunks' dense products as f16 x f16 -> f32 tensor-core GEMMs by the own kernel `qx_gemm16`, weights decoded to f16 once per layer and chunk (KL-bounded; `QX_DS_PREFILL_EXACT=1` exact) | prefill256k 5.2 -> 4.7; three-slot 256k server, 13.3k prompt: second chunk 16.2 -> 14.5 s; KL 0.005-0.009, top-1 97.5-100% | 2026-11-10 |
+| Set D with both | score 26.925 -> 25.447: decode256k 38.5, prefill256k 4.7, serve256k3 91.07 | 2026-11-10, `setd-promo6-211440` |
 
 
 ## Strata on this box (2026-11-07, same files and ids; details in the notebook)
@@ -189,6 +192,16 @@ Read for the "bridge the gap" plan (families 11-13). Numbers are theirs, on thei
   (75% at confidence 0.5), serving hardening and a disk tier for parked states.
 
 ## Rejected: with the reason, so they are not retried
+- 2026-11-10: cuBLAS for the chunk path's GEMMs (`QX_DS_GEMM16=cublas`, kept as a knob): the fastest arithmetic
+  measured (16k prompt chunks 4.8 / 4.6 / 7.5 s against the own kernel's 6.3 / 6.0 / 10.0; prefill256k 4.0 in
+  `qx-ds-check`), but its handle and kernel libraries (~1.4 GiB) fit no server's headroom: a panic on the first
+  tree, then the exact fallback in a three-slot and a one-slot 256k server. Also: it loads a kernel library at a
+  shape's first use (a hang with an expert job posted; needs a dry pass). Re-open only with VRAM budgeted for it.
+- 2026-11-10: a slab's attention slices on side streams: -1% (the attention kernels fill the card). Whole-slab
+  pipelining: blocked by `ring_w = n_swa + DS_TMAX` and the saved states that carry it.
+- 2026-11-10: `QX_DS_ATTN=tile` in the chunk path: -4% on prefill, doubles the decode steps after the prompt.
+- Validation lesson (2026-11-10): short-prompt identity sessions never run a chunk (`chunk steps 0`); a change to
+  prompt processing needs a long prompt through the server (it crashed the first FP16 tree).
 - 2026-11-10: draft-and-verify at 256k (long shot): windows of 2/4/8 of one stream cost 33.5 / 33.2 / 31.3 ms per
   position against 38.3 for single steps; break-even acceptance 66-79% of 7 drafts. Host expert bytes scale with
   positions. Re-open under ~12 ms per position at width 4-8 (bigger VRAM tier, second card).

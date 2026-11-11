@@ -2,6 +2,35 @@
 
 
 
+## Resume 2026-11-10, night: set D 25.447 promoted (expert side streams + own f16 kernel for prompt chunks); Strata's prefill still ~2x ahead
+- 2026-11-10: the user's instruction: **match or exceed Strata's prefill and decode** (goal prompt, "Match Strata";
+  prompt chunks may be KL-bounded: mean KL <= 0.03, top-1 >= 95%; decode and windows exact). Decode is ahead
+  (32.3-32.8 tok/s against 27.2). Prefill is behind: Strata 765 (cold) to 905 (warm) tok/s on a 16k prompt; ours
+  in a three-slot 256k server on a 13.3k prompt 434 tok/s; `long16k` 361 this morning, 461 with the exact side
+  streams, ~480-500 with the own f16 kernel (599 with cuBLAS, which fits no server).
+- 2026-11-10: **promoted** `perf/results/2026-11-10/setd-promo6-211440` (code of 013f98c, binaries
+  `~/qx-bins/chunk81`): decode256k 38.5, prefill256k 4.7, serve256k3 91.07, score 25.447. Adjudicator PROMOTE
+  quoted in the notebook (after two HOLDs: a server crash on a long prompt with cuBLAS, then text corrections).
+- **Behaviour change the user should know:** the server uses chunks only while no slot decodes, so a long
+  prompt's temperature-0 output can depend on server load (f16 chunks idle, exact windows busy).
+  `QX_DS_PREFILL_EXACT=1` restores exact chunks.
+- Where Strata's speed comes from (nsys, same prompt): 6.6 s of GPU kernel time against our 38.4 s: FP16
+  tensor-core GEMMs for every dense product (cuBLAS, weights dequantized once per chunk), batched FP16 expert
+  tiles, attention at 256 queries per launch on packed keys, upper layers on 2,668 rows only. Its GPU idles two
+  thirds of the prompt.
+- Next, in order: (1) the attention-side dense groups (`g_x`, `g_qr`, `wo_a`, `g_ob`) chunk-wide or split-K on
+  `qx_gemm16` (per 128-row slab a matrix with few rows underfills the card; cuBLAS shows 4.8 / 4.6 / 7.5 s per
+  chunk is there to take); (2) attention (9.4 s of kernel time against Strata's 1.5); (3) FP16 expert tiles;
+  (4) upper layers on the kept rows only; (5) the cold first chunk.
+- Open costs carried into the baseline: serve256k3 about +1% (the larger flex tail leaves ~100 VRAM slots empty
+  after the server's warm-up chunk: refill them or shrink `ChunkBufs::extra`); serve256k1's second request slower
+  since 7f7117f (unattributed); a slow decode256k mode 19:20-20:02 (a second Claude Code session was on the box
+  from ~18:56: unconfirmed); the slow first token, 1 session in ~8.
+- Validation of a chunk-path change now includes: a long prompt through a three-slot 256k server, KL at the
+  prefill256k configuration, exact-knob bit-identity. `bench.sh --promo`, `DS_CHECKS_PART=a|b`, every chain run
+  under its own `timeout` (the user's 10-minute rule; two 40-minute hangs happened without one).
+- To do: the full `QX_NVCC_ARCHS=sm_86,sm_89,sm_120a cargo build` (only gemm.cu was compiled for the three).
+
 ## Resume 2026-11-10, morning: set D promoted at 26.925 on the new host state; tests are 10 minutes maximum
 - 2026-11-10: **promoted** `perf/results/2026-11-10/setd-promo-052925` (tree 4ee0e73, binaries `~/qx-bins/chunk60`):
   decode256k 38.25, prefill256k 5.70, serve256k3 89.53, score 26.925 (30.047 before; new host state: driver
