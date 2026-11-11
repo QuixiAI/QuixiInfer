@@ -135,14 +135,19 @@ fn main() -> anyhow::Result<()> {
                 save_if_due(&mut eng, p);
                 let cap = if p >= toks.len() - tail { 1 } else if chunk > 0 { chunk.min(toks.len() - tail - p) } else { window.min(toks.len() - tail - p) };
                 // (as the server: a KV-only chunk stops prompt_keep positions before the end, so only those run the full stack)
-                let cap = if chunk > 0 && skip && cap > 1 && toks.len() - p > keep { cap.min(toks.len() - p - keep) } else { cap };
+                // (QX_DS_CHUNK_MIXED=0: a KV-only chunk up to the kept rows, then a chunk of their own; default: one
+                // chunk whose rows before the kept ones stop at the last KV source)
+                let mixed = !std::env::var("QX_DS_CHUNK_MIXED").is_ok_and(|v| v == "0");
+                // (more rows left than a chunk holds: KV-only chunks up to the kept rows, as the server plans them)
+                let cap = if chunk > 0 && skip && cap > 1 && toks.len() - p > keep && (!mixed || toks.len() - tail - p > chunk) { cap.min(toks.len() - p - keep) } else { cap };
                 let w = &toks[p..(p + cap).min(toks.len())];
                 let kv_only = skip && w.len() > 1 && toks.len() - (p + w.len()) >= keep;
                 let logits = if chunk > 0 && w.len() > 1 {
                     if kv_only {
                         kv_only_windows += 1;
                     }
-                    let last = eng.forward_chunk_opt(0, w, kv_only);
+                    let keep_from = if skip { (toks.len() - p).saturating_sub(keep).min(w.len()) } else { 0 };
+                    let last = eng.forward_chunk_keep(0, w, keep_from);
                     if p + w.len() >= toks.len() - tail {
                         // the prompt's last chunk: the arena's flex tail goes back to the tiers (as the server does once
                         // no other prompt is pending), so the decode tail measures what a server's decode would

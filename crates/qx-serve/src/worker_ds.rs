@@ -307,11 +307,14 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     let others_pending = (0..running.len()).filter(|&i| i != ri).any(|i| running[i].job.prompt.len() - running[i].read >= window.max(256));
                     let r = &mut running[ri];
                     let rem = r.job.prompt.len() - r.read;
-                    // (the last prompt_keep positions alone need the full stack: the chunk before them stops there,
-                    // so the layers above the last KV source run on those rows only)
-                    let n = if skip_on && rem > keep { rem.min(chunk_rows).min(rem - keep) } else { rem.min(chunk_rows) };
-                    let kv_only = skip_on && rem - n >= keep;
-                    let last = eng.forward_chunk_opt(r.slot, &r.job.prompt[r.read..r.read + n], kv_only);
+                    // (the last prompt_keep positions alone need the full stack: a chunk's rows before them stop at
+                    // the last KV source. QX_DS_CHUNK_MIXED=0: a KV-only chunk up to them, then a chunk of their own)
+                    let mixed = !std::env::var("QX_DS_CHUNK_MIXED").is_ok_and(|v| v == "0");
+                    // (a prompt longer than a chunk: KV-only chunks up to the kept rows, so the full stack, whose
+                    // experts take about 6 s to stream however few the rows, runs in the last chunk only)
+                    let n = if skip_on && rem > keep && (!mixed || rem > chunk_rows) { rem.min(chunk_rows).min(rem - keep) } else { rem.min(chunk_rows) };
+                    let keep_from = if skip_on { (rem.saturating_sub(keep)).min(n) } else { 0 };
+                    let last = eng.forward_chunk_keep(r.slot, &r.job.prompt[r.read..r.read + n], keep_from);
                     r.read += n;
                     // the flex tail back to the tiers once this prompt's chunks are done and no other running request
                     // still has a prompt stretch that would run in chunks

@@ -52,6 +52,13 @@ fn main() -> Result<()> {
                 let h = row_hashes(&eng.forward_chunk_opt(slot, &toks, kv), 1);
                 last = Some((ln + 1, format!("C slot {slot} rows {} kv {}", toks.len(), kv as u8), h));
             }
+            "K" => {
+                let mut it = rest.splitn(3, ' ');
+                let (slot, keep_from, toks): (usize, usize, &str) = (it.next().unwrap().parse()?, it.next().unwrap().parse()?, it.next().unwrap());
+                let toks: Vec<u32> = toks.split(',').map(|t| t.parse().unwrap()).collect();
+                let h = row_hashes(&eng.forward_chunk_keep(slot, &toks, keep_from), 1);
+                last = Some((ln + 1, format!("K slot {slot} rows {} full stack from {keep_from}", toks.len()), h));
+            }
             "H" => {
                 let Some((l0, call, mine)) = last.take() else { continue };
                 calls += 1;

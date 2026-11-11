@@ -100,7 +100,7 @@ run in every full measurement as short-context guards (recorded, compared by `ga
 | set D case | what runs | metric |
 |---|---|---|
 | `decode256k` | resume the saved 262,144-token state of `wiki256k`, then 64 single steps | **ms per token over the last 32** (decode at 256k) |
-| `prefill256k` | resume the saved 245,760-token state, then the last 16,384 tokens in windows of 128 | **ms per token over the last 32** (prefill at 256k) |
+| `prefill256k` | resume the saved 245,760-token state, then the last 16,384 tokens as prompt chunks of 8,192 (`QX_DS_CHUNK=8192 QX_DS_SKIP=1`) | **ms per token over the last 8,192 rows** (prefill at 256k; `QX_DS_LAST=8192`). Until 2026-11-11 the harness read "the last 32", which was the same quantity while one full-stack chunk held the last 8,192 rows (the old binaries read 4.7 either way); since the full stack runs on the last `prompt_keep` rows only, the per-row time differs inside the chunk and the mean over the 8,192 rows is the like-for-like number |
 | `serve256k3` | the server at `--ctx 262144 --slots 3`, loadgen at concurrency 1 and 3 | **ms per token of per-request decode at concurrency 3** |
 
 The states are produced once by a full pass (`perf/states/README.md`); resuming replays the last window and is bit

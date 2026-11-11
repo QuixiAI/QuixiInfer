@@ -1942,6 +1942,10 @@ impl<'a> DsEngine<'a> {
             use io_uring::{opcode, types};
             use std::os::fd::AsRawFd;
             use std::os::unix::fs::OpenOptionsExt;
+            // (a thread inherits its creator's mask, and the engine thread is pinned to one CPU: these wait on the
+            // disk and decode rows, so they go wherever a CPU is free; nothing here spins)
+            let n_cpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as usize);
+            set_affinity(0, &(0..n_cpu).collect::<Vec<_>>());
             let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&path).expect("engram table, direct");
             let fd = f.as_raw_fd();
             let ty = qx_pack::ggml::GgmlType::from_id(13).unwrap(); // Q5_K
@@ -2209,19 +2213,35 @@ impl<'a> DsEngine<'a> {
     /// `prompt_keep` positions before its prompt's end): layers up to the last KV source, whose slab passes stop
     /// after the ring, store and index-key writes, and no experts there; returns no logits.
     pub fn forward_chunk_opt(&mut self, slot: usize, toks: &[u32], kv_only: bool) -> Vec<f32> {
-        let out = self.forward_chunk_inner(slot, toks, kv_only);
+        self.forward_chunk_keep(slot, toks, if kv_only { toks.len() } else { 0 })
+    }
+
+    /// `forward_chunk` with the full stack from row `keep_from` on only: the rows before it stop at the last KV
+    /// source (as a KV-only chunk's do), the rows from it on run every layer, and the last row's logits come back
+    /// (none when `keep_from` is the chunk's length: a KV-only chunk). One chunk in place of a KV-only chunk and a
+    /// full one: the layers up to the last KV source stream their experts once for both parts. The same bits as the
+    /// two chunks give.
+    pub fn forward_chunk_keep(&mut self, slot: usize, toks: &[u32], keep_from: usize) -> Vec<f32> {
+        let kv_only = keep_from >= toks.len();
+        let out = self.forward_chunk_inner(slot, toks, keep_from.min(toks.len()));
         if sched_trace_on() {
             let t: Vec<String> = toks.iter().map(|t| t.to_string()).collect();
-            sched_trace(&format!("C {slot} {} {}", kv_only as u8, t.join(",")));
+            // (`K slot keep_from tokens`: a chunk with the full stack from row keep_from on; `C` for the two pure forms)
+            if kv_only || keep_from == 0 {
+                sched_trace(&format!("C {slot} {} {}", kv_only as u8, t.join(",")));
+            } else {
+                sched_trace(&format!("K {slot} {keep_from} {}", t.join(",")));
+            }
             sched_trace(&format!("H {}", row_hashes(&out, 1)));
         }
         out
     }
 
-    fn forward_chunk_inner(&mut self, slot: usize, toks: &[u32], kv_only: bool) -> Vec<f32> {
+    fn forward_chunk_inner(&mut self, slot: usize, toks: &[u32], keep_from: usize) -> Vec<f32> {
         let tf = std::time::Instant::now();
         self.t_experts = 0.0;
         let rows = toks.len();
+        let kv_only = keep_from >= rows;
         let rows_max = self.chunk.as_ref().map(|c| c.rows).expect("QX_DS_CHUNK=N sets the chunk buffers at load");
         assert!((1..=rows_max).contains(&rows), "chunk of {rows} rows (buffers for {rows_max})");
         assert!(self.driver.is_some() && self.abufs.is_some(), "the chunk path needs the asynchronous driver");
@@ -2246,17 +2266,22 @@ impl<'a> DsEngine<'a> {
         };
         // the slabs: full ones of DS_TMAX, then the remainder in the widths every server warms (never 5 or 7:
         // their kernels are not loaded behind a sealed kernel set, and width 5's multi-GEMV is not bit-identical)
+        // (a slab ends at `keep_from`: the rows before it and the rows from it on part ways at the last KV source)
         let mut slabs: Vec<(usize, usize)> = Vec::new();
         let mut r0 = 0;
         while r0 < rows {
-            let left = rows - r0;
+            let left = if r0 < keep_from { keep_from - r0 } else { rows - r0 };
             let t = [128usize, 96, 64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1].into_iter().find(|&w| w <= left.min(DS_TMAX)).unwrap();
             slabs.push((r0, t));
             r0 += t;
         }
         // the dry passes of the slab widths, on the ordinary scratch with the first rows' arrays (the previous
         // forward synced, so nothing is in flight)
-        let t0 = slabs[0].1;
+        // (the widest slab's worth of arrays: a dry pass of width w writes the ring and store cells of the w positions
+        // its arrays name, and the real pass rewrites exactly those only if they are the chunk's first w. With the
+        // first slab narrower than a later one (a mixed chunk whose KV-only part is a few rows) the wider dry
+        // passes ran on stale positions and overwrote other positions' stored keys: 0 of 64 rows, 2026-11-11)
+        let t0 = slabs.iter().map(|&(_, t)| t).max().unwrap();
         self.s.tok.upload(&toks[..t0]);
         self.s.pos.upload(&positions[..t0]);
         self.s.slot.upload(&slots_v[..t0]);
@@ -2376,10 +2401,12 @@ impl<'a> DsEngine<'a> {
                 }
                 for g in [&w.g_ffn, &w.g_shd] {
                     for sg in g.segs.iter().filter(|sg| sg.qx != 0) {
-                        if seen.insert((sg.rows, sg.cols, rows)) {
-                            // (the output lands in the gate scratch or, for the down product, would not fit it: E > ff)
-                            let y = if sg.rows <= self.cfg.ff_exp { gate_scratch } else { self.chunk.as_ref().unwrap().shy.ptr };
-                            dry_ok = dry_ok && qx_gpu::blas::try_gemm_hss(w16c, sg.cols, sg.rows, x16c, rows, y, sg.rows).is_ok();
+                        for rows in [rows, rows - keep_from] {
+                            if rows > 0 && seen.insert((sg.rows, sg.cols, rows)) {
+                                // (the output lands in the gate scratch or, for the down product, would not fit it: E > ff)
+                                let y = if sg.rows <= self.cfg.ff_exp { gate_scratch } else { self.chunk.as_ref().unwrap().shy.ptr };
+                                dry_ok = dry_ok && qx_gpu::blas::try_gemm_hss(w16c, sg.cols, sg.rows, x16c, rows, y, sg.rows).is_ok();
+                            }
                         }
                     }
                 }
@@ -2414,9 +2441,11 @@ impl<'a> DsEngine<'a> {
                     }
                 }
             }
-            if let (Some((_, done)), Some(ei)) = (&engram_job, self.cfg.engram_layers.iter().position(|&x| x == l)) {
+            if let (Some((h, done)), Some(ei)) = (&engram_job, self.cfg.engram_layers.iter().position(|&x| x == l)) {
                 let tw = std::time::Instant::now();
                 while done.load(std::sync::atomic::Ordering::Acquire) <= ei {
+                    // (a failed read panics the thread: the engine stops with it instead of waiting for rows that never come)
+                    assert!(!h.is_finished() || done.load(std::sync::atomic::Ordering::Acquire) > ei, "the Engram thread stopped before layer {l}'s rows were read");
                     std::thread::sleep(std::time::Duration::from_micros(100));
                 }
                 self.t_engram += tw.elapsed().as_secs_f64();
@@ -2428,6 +2457,9 @@ impl<'a> DsEngine<'a> {
             let generation = self.chunk_gen % 65535 + 1;
             self.chunk_gen = generation;
             let ord0_pre = self.chunk_ord;
+            // the rows this layer's experts and the layers above run on: all of them up to the last KV source
+            let ra = if l >= kv_last { keep_from } else { 0 };
+            let n_act = rows - ra;
             let prefetch = if prefetch_on && n_ring > 0 && !(kv_only && l == kv_last) { n_ring } else { 0 };
             if prefetch > 0 {
                 let cb = self.chunk.as_ref().unwrap();
@@ -2437,6 +2469,9 @@ impl<'a> DsEngine<'a> {
             }
             for si in 0..n_slabs {
                 let (r0, t) = slab(si);
+                if l > kv_last && r0 < keep_from {
+                    continue;
+                }
                 self.chunk_views(r0, t);
                 if l == 0 {
                     self.layer_init(t, &mut None);
@@ -2444,7 +2479,7 @@ impl<'a> DsEngine<'a> {
                 if predict_mode() == 1 {
                     self.predict_pre(l, t, false);
                 }
-                went_on = self.layer_attn(l, t, pos0 + r0, pos0 + r0 + t - 1, &mut None, kv_only);
+                went_on = self.layer_attn(l, t, pos0 + r0, pos0 + r0 + t - 1, &mut None, r0 < keep_from);
                 if !went_on {
                     continue;
                 }
@@ -2469,22 +2504,24 @@ impl<'a> DsEngine<'a> {
                 let shy_c = self.chunk.as_ref().unwrap().shy.ptr + (r0 * E * 4) as u64;
                 self.k("qx_ds_copy_f32", 256, (((t * E) as u32).div_ceil(256), 1, 1), &[self.s.shy.ptr, shy_c, (t * E) as u64]);
             }
-            if !went_on {
+            let _ = went_on;
+            if kv_only && l == kv_last {
                 // KV-only: the last KV source's ring, store and keys are written; nothing above runs
                 break;
             }
             if chunk_ffn_wide {
-                self.chunk_ffn(l, rows, rows_max);
+                self.chunk_ffn(l, ra, n_act, rows_max);
             }
             // the experts of the whole chunk
             let cb = self.chunk.as_ref().unwrap();
-            self.gpu.run(MOE.kernel("qx_moe_q8k_rows", CubeDim::new_1d(256)), (rows as u32, 1, 1), &[cb.x.ptr, cb.xq.ptr, cb.xd.ptr, E as u64]);
+            // (the experts' rows are numbered from `ra`: xq, xd, the selection lists and the outputs)
+            self.gpu.run(MOE.kernel("qx_moe_q8k_rows", CubeDim::new_1d(256)), (n_act as u32, 1, 1), &[cb.x.ptr + (ra * E * 4) as u64, cb.xq.ptr, cb.xd.ptr, E as u64]);
             t_enq += te.elapsed().as_secs_f64();
             let ts = std::time::Instant::now();
             self.gpu.sync();
             t_sync += ts.elapsed().as_secs_f64();
             let tm = std::time::Instant::now();
-            let ids: Vec<i32> = cb.ids.download(rows * k);
+            let ids: Vec<i32> = cb.ids.download_at::<i32>(ra * k * 4, n_act * k);
             let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
             for (a, &e) in ids.iter().enumerate() {
                 lists[e as usize].push(a as u32);
@@ -2586,7 +2623,7 @@ impl<'a> DsEngine<'a> {
             // to this ordinal is done". The same kernels on the same inputs: the same bits.
             // (not with a staging ring too small to hold several groups of N, nor for a chunk of a few rows: the
             // driver frees a ring slot on the mark, which now comes once per N experts)
-            let ns = if mma && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) && n_ring >= 8 * chunk_streams() && rows >= 256 { chunk_streams() } else { 1 };
+            let ns = if mma && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) && n_ring >= 8 * chunk_streams() && n_act >= 256 { chunk_streams() } else { 1 };
             let side: Vec<[u64; 3]> = if ns > 1 { self.chunk_side[..ns].iter().map(|b| [b[0].ptr, b[1].ptr, b[2].ptr]).collect() } else { Vec::new() };
             if ns > 1 {
                 qx_gpu::raw::side_begin(ns);
@@ -2680,8 +2717,11 @@ impl<'a> DsEngine<'a> {
             let ones = self.s.ones_slots.ptr;
             for si in 0..n_slabs {
                 let (r0, t) = slab(si);
+                if r0 < ra {
+                    continue;
+                }
                 self.chunk_views(r0, t);
-                let o = out_ptr + (r0 * k * E * 4) as u64;
+                let o = out_ptr + ((r0 - ra) * k * E * 4) as u64;
                 self.layer_ffn_post(l, t, o, o, ones, shy_ptr + (r0 * E * 4) as u64, &mut None);
                 if trace && l < 8 {
                     self.gpu.sync();
@@ -2722,7 +2762,7 @@ impl<'a> DsEngine<'a> {
         self.t_phase = [0.0, t_moe, 0.0, 0.0, 0.0];
         self.t_forward = tf.elapsed().as_secs_f64();
         if std::env::var("QX_DS_VERBOSE").is_ok() {
-            eprintln!("chunk of {rows} rows at {pos0}{}: {:.0} ms ({:.2} ms per row; host: slab enqueue {:.0} ms, sync on the slab passes {:.0}, expert enqueue {:.0}, post enqueue {:.0}; {} distinct experts per layer, engram {:.0} ms)", if kv_only { " KV-only" } else { "" }, self.t_forward * 1e3, self.t_forward * 1e3 / rows as f64, t_enq * 1e3, t_sync * 1e3, t_moe * 1e3, t_post * 1e3, n_distinct / n_layers_run.max(1), self.t_engram * 1e3);
+            eprintln!("chunk of {rows} rows at {pos0}{}: {:.0} ms ({:.2} ms per row; host: slab enqueue {:.0} ms, sync on the slab passes {:.0}, expert enqueue {:.0}, post enqueue {:.0}; {} distinct experts per layer, engram {:.0} ms)", if kv_only { " KV-only".to_string() } else if keep_from > 0 { format!(" (full stack from row {keep_from})") } else { String::new() }, self.t_forward * 1e3, self.t_forward * 1e3 / rows as f64, t_enq * 1e3, t_sync * 1e3, t_moe * 1e3, t_post * 1e3, n_distinct / n_layers_run.max(1), self.t_engram * 1e3);
         }
         logits
     }
@@ -3163,16 +3203,18 @@ impl<'a> DsEngine<'a> {
         }
     }
 
-    fn chunk_ffn(&mut self, l: usize, rows: usize, rows_max: usize) {
+    fn chunk_ffn(&mut self, l: usize, ra: usize, rows: usize, rows_max: usize) {
         self.chunk_ffn_alloc(rows_max);
         let [lg, g, u, h, x16, w16] = { let (_, b) = self.chunk_ffn_bufs.as_ref().unwrap(); [b[0].ptr, b[1].ptr, b[2].ptr, b[3].ptr, b[4].ptr, b[5].ptr] };
         let c = &self.cfg;
         let w = &self.layers[l];
         let cb = self.chunk.as_ref().unwrap();
-        w.g_ffn.run_blas_to(&self.gpu, cb.x.ptr, rows, &[lg, g, u], x16, w16);
-        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr, cb.wts.ptr, bits(c.w_scale)]);
+        // (rows `ra` on: the chunk's rows from which this layer runs)
+        let ku = (ra * c.n_expert_used * 4) as u64;
+        w.g_ffn.run_blas_to(&self.gpu, cb.x.ptr + (ra * E * 4) as u64, rows, &[lg, g, u], x16, w16);
+        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr + ku, cb.wts.ptr + ku, bits(c.w_scale)]);
         self.k("qx_ds_silu_mul_clamp", 256, (((c.ff_exp * rows) as u32).div_ceil(256), 1, 1), &[g, u, h, (c.ff_exp * rows) as u64, bits(c.clamp_shexp[l])]);
-        w.g_shd.run_blas_to(&self.gpu, h, rows, &[cb.shy.ptr], x16, w16);
+        w.g_shd.run_blas_to(&self.gpu, h, rows, &[cb.shy.ptr + (ra * E * 4) as u64], x16, w16);
     }
 
     /// The shared expert of layer `l` (`shg`, `shu` from the FFN GEMV group into `shy`).
