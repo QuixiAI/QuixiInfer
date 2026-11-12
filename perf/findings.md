@@ -25,6 +25,7 @@ were 20-21 GiB VRAM and 88-100 GiB RAM. The settings before 2026-11-04 differ fr
 | The GPU-only step is flat in context up to 1k | 13.1 ms at 1k after flash-decoding attention (was 24); 24 ms at 16k for a single decode step | 2026-11-04 |
 | **The long-context cost was the tier's memory, not the position (fixed 2026-11-06).** The score decay ran once per adapt call, so in 128-token windows the half-life of 256 meant 32,768 tokens and the tier could not follow a text's topic drift; the forced 64k pass showed the VRAM share collapse from 56% to 17% at a topic shift and take 30k tokens to recover (14 to 57 ms per token). Decay per token: long16k decode 38.5 to 33.8 (equal to decode at 1k), 16k prefill 18.4 to 14.4, pool 12.2 to 7.6 ms per token. | `decay-per-step` against `decay-per-token`, 3 repeats | 2026-11-06 |
 | **End-to-end decode at 16k is 35-37 ms per token, not 53.** The 2026-11-04 figure averaged the width-1 graph capture (0.85-1.5 s, first tail step) over 64 steps. Steady steps at 16k: device wait 30-37 ms, pool 14.4 ms per token over the run. Prefill averaged over 0-16k is 19.5 ms per token against 12.3 at 1k. | harness `long16k`, three repeats: last-32 35.3-37.5, tail means 49.1-60.4 | 2026-11-06 |
+| **A short prompt is bounded by the staging lane, not by kernels (2026-11-12).** Warmed 2,040-row full-stack chunk, 3.84 s: the driver thread is busy 3.58 s of it: ~2.06 s inside the copy calls (13,412 records = 127 GB at ~62 GB/s: the link), 1.48 s waiting for NVMe reads (3,839 records, 96 per layer), 0.05 s for a ring slot. Slab passes 24 ms per layer, experts' phase 55-115 ms rising with the layer. 16k prompt: driver busy 2.2 of 4.8 s (KV-only chunk) and 4.4 of 7.3 s, ring-slot waits ~0.85 s each. The serve256k1 spread is a tier-state mode: a level-1 request is slow (10.2-10.9 s per 256 tokens) when it finds 31,600-35,600 of its selections in VRAM and reads ~1,150-1,480 records from NVMe, fast (9.0-9.7 s) at 36,400-39,900 and 685-955; the six warm-up requests decide which | 2026-11-12, notebook "Kernel modules loaded once per source..." |
 | Graph replay costs nothing; capture costs about 0.9 s per new width | replay 0.01 ms; capture fills CubeCL's info cache | 2026-11-04 |
 | A distinct expert set per window grows sublinearly with width | about 100 per layer at 32 tokens, all 384 past about 500 tokens | 2026-11-04 |
 | Run-to-run noise | same commit: decode 31.2-33.1 ms, prefill64 11.7-12.4 ms (spread up to 6%) | 2026-11-05, this scaffolding |
@@ -45,6 +46,8 @@ driver JIT at first use.
 
 | finding | effect | date / source |
 |---|---|---|
+| One loaded module per kernel source (CubeCL compiled and loaded a source once per kernel id: 44 compiles, `mgemv.cu` eight times), shared with the raw launcher; PTX on disk in `~/.cache/quixiinfer/ptx`; NVRTC programs freed | fresh process, 16k prompt 710-739 -> 1,132-1,158 tok/s (Strata 841-880); server warm-up 24.5-25.0 -> 12.0-12.1 s; free device memory after a three-slot 256k warm-up 0.45 -> 1.21 GiB; ~1,440 ms of prefill256k's scored chunk (two compiles sat inside it) | 2026-11-12 (24090ba) |
+| A chunk job's NVMe batches read while its RAM records copy (the disk and the link took turns before) | warmed 2,048-token prompt 4.81 -> 3.83 s; 16k 12.64 -> 12.02 s; three-slot 256k server 13,283 tokens 12.92 -> 11.34 s, 3,293 tokens 5.96 -> 4.95 s; bit-identical | 2026-11-12 (24090ba) |
 | Asynchronous driver: mailbox-driven pool on its own thread, no per-layer host round trip | 9.2 to 12.0 tok/s at the time; the base of everything after | 2026-11-03 |
 | Promotions off the critical path: event-ordered VRAM copies, async io_uring RAM promotions | steady token 64-68 to 52-57 ms | 2026-11-03 |
 | Pool computes RAM experts while NVMe reads are in flight (`fetch_submit` / `fetch_wait`) | NVMe wait overlapped; part of 52 to 42 ms | 2026-11-03 |
@@ -206,6 +209,11 @@ Read for the "bridge the gap" plan (families 11-13). Numbers are theirs, on thei
   (75% at confidence 0.5), serving hardening and a disk tier for parked states.
 
 ## Rejected: with the reason, so they are not retried
+- 2026-11-12: three more ways to feed a chunk layer's experts sooner, all flat on a warmed 2,048-token prompt
+  (3.84 s): the next layer's prefetch posted behind the current layer's experts job (`chunk-early.patch`: 3.81-3.90
+  s; the ring's 256 slots are held until the current layer's experts finish); the next NVMe batch submitted before
+  the current batch's copies are enqueued (`QX_DS_CHUNK_AHEAD` in `~/qx-wt/exp`: 3.87-3.90 s, NVMe wait unchanged at
+  1.48 s); 16 side streams (3.83 s); and a 512-slot ring is worse (4.09 s).
 - 2026-11-11: learning the tiers from the prompt, three forms, all flat in the three-slot 256k server: the
   chunk's selection counts as a per-token rate in the scores (`chunk-scores-fill.patch`), the layer's hottest
   NVMe-only records promoted to RAM during the chunk (NVMe selections on the first decode step 36 -> 38 -> 37 with

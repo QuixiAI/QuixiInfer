@@ -1,12 +1,22 @@
 {
  "schema": 1,
- "label": "setd-promo8",
- "date": "2026-11-11T03:33:03",
+ "label": "setd-promo13",
+ "date": "2026-11-12T16:19:09",
  "git": {
-  "commit": "a41128e",
-  "dirty": false,
-  "modified": [],
-  "diff_sha": null
+  "commit": "967476e",
+  "dirty": true,
+  "modified": [
+   "M crates/qx-engine/src/dsv41/driver.rs",
+   " M crates/qx-engine/src/dsv41/mod.rs",
+   " M crates/qx-engine/src/ops.rs",
+   " M crates/qx-engine/src/tiers.rs",
+   " M crates/qx-gpu/src/kernel.rs",
+   " M crates/qx-gpu/src/raw.rs",
+   " M third_party/cubecl-cuda/src/compute/context.rs",
+   " M third_party/cubecl-cuda/src/lib.rs",
+   " M tools/longprompt.py"
+  ],
+  "diff_sha": "955828554b0f"
  },
  "host": {
   "gpu": "NVIDIA GeForce RTX 5090",
@@ -25,8 +35,7 @@
   "prefill256k",
   "serve256k",
   "decode",
-  "prefill128",
-  "serve"
+  "prefill128"
  ],
  "repeats": 2,
  "correctness": "pass",
@@ -41,14 +50,15 @@
   "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/route1k.tokens 1024"
  ],
  "attached": {
-  "tree": "run.json records a41128e, clean; binaries chunk92 (qx-ds-check 514c699145bd, quixiinfer 124920a690f2) built from it at 03:13",
-  "serve1,serve3": "from perf/results/2026-11-11/hold-serve-035136 (the same binaries; 03:51-03:54, the first 8k session after this run: 34.77 / 79.55). A second session, hold2-serve-040119: 34.07 / 78.99. serve1's two concurrency-1 requests read 8.0-9.9 s in the ten sessions since 4ee0e73 on five trees (serve1 32.3-36.5); the baseline's pair (8.27, 8.21) is the fastest of the ten. The slow requests carry more pool and NVMe time (second request: pool +3,722 ms / NVMe +197 records in the baseline's 8.21 s, +4,270 / +566 in the 8.59 s, +4,844 / +665 in the 9.35 s): the tier state the warm-up schedule leaves; cause of the spread open",
-  "correctness": "tools/ds-checks.sh in two parts (b 03:13-03:17, a 03:18-03:24) on the same binaries, before this run; logs/ds-checks-part-*.timestamped.log",
-  "identity_second_session": "serve256k-1: identical (perf/results/2026-11-11/hold2-serve256k-035808, levels 1 and 3: serve256k1 37.09, serve256k3 91.41). A levels-3-only session (hold-serve256k-034848): serve256k3 91.41",
-  "server_long_prompt": "three-slot 256k server, 13,283-token prompt on the f16 path: 12.97 s (1,024 tok/s), a 3,293-token prompt 5.94 s, loadgen at concurrency 3 after them; logs/longprompt-3slot.server.log (chain V9)",
-  "prefill_accuracy": "f16 default vs exact: prefill256k configuration, 64 tail rows: KL mean 0.0085, max 0.115, top-1 63/64 (chain V9, po3.bin vs pe.bin); 16k prompt, 511 positions: KL 0.0087, top-1 97.7% (chunk88; the f16 bits of 09e123f and a41128e are identical, po2.bin vs po3.bin 64/64); 15,153-token prompt, 511 positions: KL 0.0091, top-1 486/511 = 95.1% (chain HOLD; with the exact attention kernels 0.0082 and 488/511 = 95.5%)",
-  "prefill_exact_knob": "QX_DS_PREFILL_EXACT=1: prefill256k configuration 64/64 tail rows bit-identical to the exact dump of 2026-11-10 (pe.bin); 16,383-token prompt 64/64 against a no-skip exact reference (chain V9)",
-  "prefill256k_metric": "QX_DS_LAST=8192: the mean over the last 8,192 rows (4.690 on the baseline's log: one full-stack chunk of 38,425 ms; 2.241 here). Whole case 59.0 s -> 32.4 s",
-  "breaker": "fresh-context review of 09e123f, its tests run on chunk90-92 (chains BRK, BRK2, SRV); one defect found in the mixed chunk (dry passes on stale arrays) and fixed before this run"
+  "tree": "run.json records 967476e + working tree (diff_sha 955828554b0f): the tree committed with the notebook entry of 2026-11-12; binaries chunk110 (qx-ds-check a78bd7bb6b73, quixiinfer 8c2ca42d5df6) built from it at 15:55",
+  "correctness": "tools/ds-checks.sh on the same binaries: part a 16:04-16:11 and part b 16:00-16:04 immediately before this run (lines 1-5 of part b on chunk110; line 6 then used chunk109's qx-ds-multi, which target/release still held), part b re-run in full 16:53-16:57 with chunk110's qx-ds-multi (fee1a777cb2d): line 6 reads 3/3 three times; logs/ds-checks-part-a.timestamped.log, logs/ds-checks-part-b.timestamped.log (the re-run); text-identical to the previous validated binary (v11)",
+  "serve1,serve3": "from perf/results/2026-11-12/hold3-serve-165723 (chunk110, 16:57-17:00: 35.06 / 79.18; rows appended to results.jsonl). Earlier builds of the same work: chunk109 34.22 / 79.74, chunk105 32.44 / 78.86",
+  "identity_other_sessions": "serve256k-1 identical in v13-new1-162902, v13-new2-163512, v13-new3-164124 (chunk110: serve256k1 38.43, 38.36, 39.26; serve256k3 90.91, 89.29, 91.24), alternated with chunk104 (v13-old1..3: 39.06, 38.45, 40.77; 91.32, 91.16, 90.99)",
+  "prefill_default_path": "prefill256k configuration, 64 tail rows: the dump is byte-identical to the promoted tree a41128e (po3.bin): the accuracy figures of setd-promo8 stand unchanged",
+  "prefill_exact_knob": "QX_DS_PREFILL_EXACT=1: prefill256k configuration 64/64 tail rows bit-identical to the exact dump of 2026-11-10 (pe.bin) on chunk110; 16,383-token prompt 64/64 against the no-skip exact reference on chunk109 (chain V12)",
+  "server_long_prompt": "three-slot 256k server on chunk110: 13,283 tokens 11.34 s, 3,293 tokens 4.95 s, 1,638 tokens 4.53 s; the 64-token replies equal chunk104 byte for byte; logs/longprompt-3slot.server.log (chain V13). Two prompts at once with the exact knob: 60/60 row hashes equal the reference trace on both slots",
+  "breaker": "two fresh-context reviews (module loading on chunk105; staging overlap on chunk109, with its own runs incl. three-slot server traces byte-identical on vs off); no defect; the fixes and hardening notes they listed are in chunk110",
+  "prefill256k_attribution": "the scored chunk (8,192 rows at 253,952) on chunk110: 16,455 ms default; 16,916 with QX_DS_CHUNK_OVERLAP=0; 17,898 with QX_MODULE_SHARE=0; baseline 18,360 (its measured chunk contains two mgemv.cu compiles). The KV-only chunk before it: 9,514 / 9,512 / 14,173; baseline 14,062 (hold3-p256-*)",
+  "ptx_cache": "every module in this run loaded its PTX from ~/.cache/quixiinfer/ptx (benchmark state from this change on; a first run after a kernel edit pays the compile)"
  }
 }

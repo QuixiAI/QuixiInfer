@@ -1,6 +1,29 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-11)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-12)
 
 
+
+## Resume 2026-11-12: set D 19.166 promoted (kernel modules loaded once per source, PTX on disk; NVMe reads beside RAM copies in chunk jobs); ahead of Strata as a fresh process too
+- **Promoted** `perf/results/2026-11-12/setd-promo13-161136` (24090ba, binaries `~/qx-bins/chunk110`, in
+  `target/release`): decode256k 38.55, prefill256k 2.0 (2.241 -> 2.003 unrounded), serve256k3 91.32, score 19.166.
+  Two breaker reviews (no defect), adjudicator HOLD (two checks had run on the previous build) then PROMOTE.
+- Fresh process, 16,384-token prompt: 710-739 -> 1,132-1,158 tok/s (Strata 841-880 on 2026-11-11, not rerun).
+  Warmed: 2,048 tokens 4.81 -> 3.83 s; 16k 1,160 -> ~1,320-1,340 tok/s (tool timer). Three-slot 256k server:
+  13,283 tokens 12.92 -> 11.34 s, 3,293 tokens 5.96 -> 4.95 s, 1,638 tokens 5.59 -> 4.53 s. Warm-up 25 -> 12 s.
+- **Benchmark state:** `~/.cache/quixiinfer/ptx` holds each kernel source's PTX. After a kernel edit run the
+  binary once before timing it (the first run compiles and writes ~113 MB). `QX_MODULE_SHARE=0` /
+  `QX_PTX_CACHE=0` restore the old loading; `QX_DS_CHUNK_OVERLAP=0` the old staging order. The Qwen engine gets
+  the module sharing too and was not run (rule: DeepSeek only); run its gate before restarting its service on a
+  new binary.
+- What bounds a short prompt now: the staging lane (one driver thread: copies at the link's ~62 GB/s, 2.06 s,
+  plus 1.48 s of NVMe wait, of a 3.84 s chunk). Three variations measured flat (early prefetch, one batch of
+  read-ahead, more streams); see the backlog's queue of 2026-11-12 for what is not tried.
+- serve256k1 / serve1 are two-mode rows (tier state after the warm-up requests): compare sessions by pattern, or
+  alternate binaries. No new-binary session has matched the baseline's both-fast 36.97 yet (open).
+- Experiments now live in a worktree (`~/qx-wt/exp`, target dir `~/qx-targets/exp`), so the main tree and
+  `target/release` stay what an adjudicator reads. `validation chains must install all four binaries` (qx-ds-check,
+  quixiinfer, qx-ds-multi, qx-ds-replay): ds-checks line 6 takes `qx-ds-multi` from beside `qx-ds-check`.
+- Knobs added: `QX_MODULE_SHARE`, `QX_PTX_CACHE`, `QX_DS_CHUNK_OVERLAP`, `QX_DS_CHUNK_TIMING`;
+  `tools/longprompt.py --text-out` (reply text, reasoning included).
 
 ## Resume 2026-11-11: set D 19.770 promoted (f16 attention, filled GEMM launches, mixed chunks, Engram thread); prefill ahead of Strata in a warm server, 4-8% behind as a one-shot process
 - **Promoted** `perf/results/2026-11-11/setd-promo8-032500` (a41128e, binaries `~/qx-bins/chunk92`): decode256k

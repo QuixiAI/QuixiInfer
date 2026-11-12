@@ -9,6 +9,24 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-12 (after set D 19.166; a short prompt is bounded by the staging lane)
+1. **The staging lane of a prompt chunk** (driver busy 3.58 of a 2,040-row chunk's 3.84 s: copies 2.06 s at
+   ~62 GB/s, NVMe wait 1.48 s). Not tried: a second staging thread (NVMe reads and their copies on their own
+   thread and streams, so the disk never waits for the link); fewer NVMe records for a prompt (96 per layer: a
+   larger RAM share while a prompt runs, or the landing places counted into it); the rest job's copies while the
+   next layer's NVMe reads fly (needs reads in flight across jobs). Tried and flat: early prefetch, read-ahead by
+   one batch, 16 streams, a 512-slot ring.
+2. **Chunks while another slot decodes** (unchanged: slot 1's 10,031-token prompt 83 s with the exact knob, 54.8 s
+   default, beside a 13k prompt).
+3. **The tokens right after a long prompt in the three-slot server** (unchanged: first steps 174, 102, 82, 79 ms).
+4. **serve256k1's two modes**: which warm-up arrival order leaves the fast tier state, and why no session of
+   the new binaries (12 s warm-up) has been both-fast (0 of 11). A fixed warm-up schedule in loadgen would make
+   the row reproducible.
+5. **The ring-slot waits of long prompts** (~0.85 s per 8,192-row chunk): the mark is written once per eight
+   experts after a join.
+6. Carried: the Engram projection in f16; expert arithmetic in f16; the outlier of a fresh process (3.7 s before
+   the first kernel line, once in ~15 runs, old and new binaries).
+
 ### Queue as of 2026-11-11 (after set D 19.770; the prompt path is bounded by the experts now)
 1. **The tokens right after a long prompt** (partly done 2026-11-11: the chunk-tick eviction cap, 3.76 -> 3.55 s
    and 3.33 -> 2.72 s for the 64 tokens after a first and a second 13k prompt). What is left is the three-slot
