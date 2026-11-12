@@ -2342,8 +2342,9 @@ impl<'a> DsEngine<'a> {
         // (our own modules are loaded first: cuBLAS's handle and kernel libraries come out of the same headroom, and
         // a module load after them failed in a three-slot 256k server, 2026-11-10)
         // The handle and its kernel libraries (about 1.4 GiB in all) come out of the headroom at the first chunk:
-        // a one-slot engine has it (0.7 GiB left after the dry pass); a three-slot 256k server does not (0.45 GiB
-        // free after its warm-up), and its prompts keep the exact kernels (`cuBLAS: no handle`), as they do when
+        // a one-slot engine has it (0.7 GiB left after the dry pass); a three-slot 256k server did not (0.45 GiB
+        // free after its warm-up until 2026-11-12; 1.21 GiB since the kernel modules are loaded once per source, not
+        // re-measured with cuBLAS), and its prompts keep the exact kernels (`cuBLAS: no handle`), as they do when
         // the launches do not go through the raw launcher (cuBLAS queues on the stream directly).
         let mut chunk_ffn_wide = chunk_gemm() && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) && self.layers.iter().all(|w| w.g_ffn.blas_ok() && w.g_shd.blas_ok()) && {
             for m in [&MOE, &DSV41, &LAYER, &qx_gpu::kernel::modules::GEMV, &qx_gpu::kernel::modules::MGEMV, &qx_gpu::kernel::modules::GEMM] {
@@ -2712,6 +2713,13 @@ impl<'a> DsEngine<'a> {
                 eprintln!("  chunk layer {l}: {} used experts, {} prefetched ({} of them used), {} streamed after the routing", n_used, picked.len(), n_pick_used, rest.len());
             }
             t_moe += tm.elapsed().as_secs_f64();
+            // QX_DS_CHUNK_TIMING=1: a sync after the experts, so the layer's phases can be told apart (the next
+            // layer's slab enqueue otherwise absorbs the experts' GPU time); costs the overlap it removes
+            if std::env::var("QX_DS_CHUNK_TIMING").is_ok() {
+                let host = tm.elapsed().as_secs_f64();
+                self.gpu.sync();
+                eprintln!("  timing layer {l}: slabs {:.1} ms (to the sync), experts {:.1} ms ({:.1} of host work before the sync; {} used, {} rows), layer start to here {:.1} ms", (tm - te).as_secs_f64() * 1e3, tm.elapsed().as_secs_f64() * 1e3, host * 1e3, n_used, n_act, te.elapsed().as_secs_f64() * 1e3);
+            }
             let tp = std::time::Instant::now();
             let (out_ptr, shy_ptr) = (cb.out.ptr, cb.shy.ptr);
             let ones = self.s.ones_slots.ptr;

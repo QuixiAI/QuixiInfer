@@ -332,6 +332,27 @@ impl CudaContext {
             }
         }
 
+        // QuixiInfer: a precompiled source is one module with many entry points. One compile and one load per
+        // source text; every kernel id takes its function from that module (see `crate::QX_MODULES`).
+        if jitc_kernel.repr.is_none() && crate::qx_module_share() {
+            logger.log_compilation(&jitc_kernel);
+            let module = self.qx_shared_module(&jitc_kernel.source)?;
+            let func_name = CString::new(jitc_kernel.entrypoint_name.clone()).unwrap();
+            // SAFETY: `module` is a module this context loaded and never unloads; `func_name` is NUL-terminated.
+            let func = unsafe { cudarc::driver::result::module::get_function(module as _, func_name) }.map_err(|err| {
+                CompilationError::Generic {
+                    reason: format!("Unable to fetch {} from the shared module: {err:?}", jitc_kernel.entrypoint_name),
+                    backtrace: BackTrace::capture(),
+                }
+            })?;
+            self.modules.insert(
+                kernel_id.clone(),
+                CudaCompiledKernel { cube_dim: jitc_kernel.cube_dim, shared_mem_bytes: 0, func, io: jitc_kernel.io.take().map(Arc::from) },
+            );
+            recording.compiled(false);
+            return Ok(());
+        }
+
         let cpp_hash = if let Some(cache) = self.ptx_cache.as_mut() {
             let key = key.unwrap();
             let second_line_cache = self.second_line_ptx_cache.as_mut().unwrap();
@@ -400,6 +421,71 @@ impl CudaContext {
         Ok(())
     }
 
+    /// QuixiInfer: the module of a precompiled `source`, loaded once per process (the raw `CUmodule` as usize).
+    fn qx_shared_module(&mut self, source: &str) -> Result<usize, CompilationError> {
+        let hash = crate::qx_fnv1a(source.as_bytes());
+        if let Some(&(_, m)) = crate::QX_MODULES.lock().unwrap().iter().find(|(h, _)| *h == hash) {
+            return Ok(m);
+        }
+        let owned = self.nvrtc_options();
+        let key: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let verbose = std::env::var("QX_DS_VERBOSE").is_ok();
+        let load_err = |err: DriverError| -> CompilationError {
+            match poisons_device(err.0) {
+                true => driver_error("cuModuleLoadData", err).into(),
+                false => CompilationError::Generic { reason: format!("Unable to load the PTX: {err}"), backtrace: BackTrace::capture() },
+            }
+        };
+        let t0 = std::time::Instant::now();
+        let mut module = None;
+        if let Some(ptx) = crate::qx_ptx_cached(source, &key) {
+            // SAFETY: NUL-terminated text (the cache checks the terminator).
+            match unsafe { cudarc::driver::result::module::load_data(ptx.as_ptr() as *const _) } {
+                Ok(m) => {
+                    if verbose {
+                        eprintln!("module {hash:016x}: PTX from the cache, loaded in {:.2} s", t0.elapsed().as_secs_f64());
+                    }
+                    module = Some(m as usize);
+                }
+                // out of device memory or a poisoned device: the entry is not at fault, and compiling again cannot help
+                Err(err) if poisons_device(err.0) || err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY => return Err(load_err(err)),
+                // PTX the driver refuses (a driver or toolkit change the key did not see): drop it, compile again
+                Err(_) => crate::qx_ptx_forget(source, &key),
+            }
+        }
+        let module = match module {
+            Some(m) => m,
+            None => {
+                let ptx = self.compile_to_ptx(source)?;
+                // SAFETY: NUL-terminated PTX text from NVRTC.
+                let m = unsafe { cudarc::driver::result::module::load_data(ptx.as_ptr() as *const _) }.map_err(load_err)? as usize;
+                // stored after the load, so PTX the driver rejects is not handed back on the next run
+                crate::qx_ptx_store(source, &key, &ptx);
+                if verbose {
+                    eprintln!("module {hash:016x}: compiled and loaded in {:.2} s (PTX cache miss)", t0.elapsed().as_secs_f64());
+                }
+                m
+            }
+        };
+        crate::QX_MODULES.lock().unwrap().push((hash, module));
+        Ok(module)
+    }
+
+    /// The options NVRTC compiles with (the device's target, the toolkit's include paths).
+    fn nvrtc_options(&self) -> Vec<String> {
+        let arch = if self.arch.version >= 90 {
+            format!("--gpu-architecture=sm_{}a", self.arch)
+        } else {
+            format!("--gpu-architecture=sm_{}", self.arch)
+        };
+        let mut options = vec![arch, format!("--include-path={}", include_path().to_str().unwrap()), "-lineinfo".to_string()];
+        let cccl_include_path = cccl_include_path();
+        if cccl_include_path.exists() {
+            options.push(format!("--include-path={}", cccl_include_path.to_str().unwrap()));
+        }
+        options
+    }
+
     /// Compiles `source` to PTX with NVRTC.
     ///
     /// # Errors
@@ -407,20 +493,8 @@ impl CudaContext {
     /// [`CompilationError::Generic`] carrying the compiler's own log, and the source that
     /// produced it, so a kernel the compiler refuses says why.
     fn compile_to_ptx(&self, source: &str) -> Result<Vec<c_char>, CompilationError> {
-        let arch = if self.arch.version >= 90 {
-            format!("--gpu-architecture=sm_{}a", self.arch)
-        } else {
-            format!("--gpu-architecture=sm_{}", self.arch)
-        };
-
-        let include_path = include_path();
-        let include_option = format!("--include-path={}", include_path.to_str().unwrap());
-        let cccl_include_path = cccl_include_path();
-        let cccl_include_option = format!("--include-path={}", cccl_include_path.to_str().unwrap());
-        let mut options = vec![arch.as_str(), include_option.as_str(), "-lineinfo"];
-        if cccl_include_path.exists() {
-            options.push(&cccl_include_option);
-        }
+        let owned = self.nvrtc_options();
+        let options: Vec<&str> = owned.iter().map(String::as_str).collect();
 
         // SAFETY: Calling NVRTC FFI to create, compile, and extract PTX from a program.
         // The `CString` source is null-terminated and outlives the program. On compilation
@@ -455,10 +529,13 @@ impl CudaContext {
                     backtrace: BackTrace::capture(),
                 })?;
             };
-            cudarc::nvrtc::result::get_ptx(program).map_err(|err| CompilationError::Generic {
+            let ptx = cudarc::nvrtc::result::get_ptx(program).map_err(|err| CompilationError::Generic {
                 reason: format!("{err}"),
                 backtrace: BackTrace::capture(),
-            })
+            })?;
+            // upstream never frees the program: about 63 MiB of host memory per compile (2026-11-06)
+            let _ = cudarc::nvrtc::result::destroy_program(program);
+            Ok(ptx)
         }
     }
 

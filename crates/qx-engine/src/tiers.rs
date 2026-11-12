@@ -149,6 +149,11 @@ impl ExpertStore {
         self.pack.offset[1] + self.pack.experts.layer_offset[l] + e as u64 * self.pack.experts.record[l]
     }
 
+    /// The number of NVMe landing (staging) places of `g`'s size class.
+    pub fn stage_places(&self, g: usize) -> usize {
+        self.classes[self.layer_class[g / self.n_expert]].stage.len()
+    }
+
     /// Whether `g` is in RAM.
     pub fn in_ram(&self, g: usize) -> bool {
         self.place[g] != 0 && !self.pending.iter().any(|&(h, _)| h == g)

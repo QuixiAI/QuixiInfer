@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """One long prompt through the OpenAI-compatible API: `longprompt.py --chars N [--url URL] [--api-key KEY]
-[--max-tokens 64]`. Sends the first N characters of a text file as a user message (streamed), reports prompt
-tokens (from usage), time to first token, prefill tok/s and decode tok/s after it."""
+[--max-tokens 64] [--text-out FILE]`. Sends the first N characters of a text file as a user message (streamed), reports prompt
+tokens (from usage), time to first token, prefill tok/s and decode tok/s after it; `--text-out` writes the reply's
+text to a file (to compare two servers' replies)."""
 import argparse
 import json
 import time
@@ -13,6 +14,7 @@ ap.add_argument("--api-key", default=None)
 ap.add_argument("--file", default="golden/data/wikitext-2-raw/wiki.train.raw")
 ap.add_argument("--chars", type=int, default=100000)
 ap.add_argument("--max-tokens", type=int, default=64)
+ap.add_argument("--text-out", default=None)
 a = ap.parse_args()
 text = open(a.file, encoding="utf-8").read()[: a.chars]
 body = {"model": "default", "messages": [{"role": "user", "content": text + "\n\nSummarize the above in one sentence."}], "max_tokens": a.max_tokens, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
@@ -24,6 +26,7 @@ t0 = time.time()
 first = None
 n = 0
 usage = None
+reply = []
 with urllib.request.urlopen(req, timeout=3600) as r:
     for line in r:
         line = line.decode().strip()
@@ -33,11 +36,16 @@ with urllib.request.urlopen(req, timeout=3600) as r:
         if ev.get("usage"):
             usage = ev["usage"]
         for c in ev.get("choices", []):
-            if c.get("delta", {}).get("content"):
+            d = c.get("delta", {})
+            # (the reply text for --text-out includes the reasoning stream: a 64-token reply is often all reasoning)
+            reply.append((d.get("reasoning_content") or "") + (d.get("content") or ""))
+            if d.get("content"):
                 if first is None:
                     first = time.time()
                 n += 1
 t1 = time.time()
+if a.text_out:
+    open(a.text_out, "w", encoding="utf-8").write("".join(reply))
 pt = usage["prompt_tokens"] if usage else -1
 ct = usage["completion_tokens"] if usage else n
 ttft = (first or t1) - t0

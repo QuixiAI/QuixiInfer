@@ -99,3 +99,62 @@ mod tests {
 /// engine's raw launcher (`qx_gpu::raw`) enqueues on the first one, the client's default stream, so its launches
 /// stay ordered with CubeCL's.
 pub static QX_STREAMS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// QuixiInfer: the modules loaded from precompiled CUDA C++ sources, as (FNV-1a of the source text, raw `CUmodule`
+/// handle as usize). A precompiled source holds many entry points; upstream compiles and loads the whole text once
+/// per kernel id (0.75-1.3 s each for the largest module, 2026-11-12), so the context keeps one module per source
+/// and takes each entry point from it. `qx_gpu::raw` reads and fills the same table. `QX_MODULE_SHARE=0` restores
+/// one module per kernel id.
+pub static QX_MODULES: std::sync::Mutex<Vec<(u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// FNV-1a of `s`, the hash `qx-gpu`'s build script keys its modules with.
+pub fn qx_fnv1a(s: &[u8]) -> u64 {
+    s.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
+}
+
+/// Whether precompiled sources share one module per source text.
+pub fn qx_module_share() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| !std::env::var("QX_MODULE_SHARE").is_ok_and(|v| v == "0"))
+}
+
+/// The PTX of `source` compiled with `options`, from `~/.cache/quixiinfer/ptx` (`QX_PTX_CACHE=0` disables it), or
+/// `None`. The key covers the source text, every compiler option (target, include paths) and NVRTC's version. A
+/// caller stores an entry only after the driver loaded it, and forgets one the driver refuses.
+pub fn qx_ptx_cached(source: &str, options: &[&str]) -> Option<Vec<std::ffi::c_char>> {
+    let bytes = std::fs::read(qx_ptx_path(source, options)?).ok()?;
+    // a PTX text ends with its NUL; anything else is a torn or foreign file
+    if bytes.len() < 64 || *bytes.last()? != 0 || bytes[..bytes.len() - 1].contains(&0) {
+        return None;
+    }
+    Some(bytes.into_iter().map(|b| b as std::ffi::c_char).collect())
+}
+
+/// Stores `ptx` for [`qx_ptx_cached`] (written beside and renamed, so a reader never sees half a file).
+pub fn qx_ptx_store(source: &str, options: &[&str], ptx: &[std::ffi::c_char]) {
+    let Some(path) = qx_ptx_path(source, options) else { return };
+    let Some(dir) = path.parent() else { return };
+    let bytes: Vec<u8> = ptx.iter().map(|&c| c as u8).collect();
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let _ = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&tmp, &bytes)).and_then(|_| std::fs::rename(&tmp, &path));
+}
+
+/// Drops the cached PTX of `source` (the driver refused it).
+pub fn qx_ptx_forget(source: &str, options: &[&str]) {
+    if let Some(path) = qx_ptx_path(source, options) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn qx_ptx_path(source: &str, options: &[&str]) -> Option<std::path::PathBuf> {
+    if std::env::var("QX_PTX_CACHE").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    let home = std::env::var("HOME").ok()?;
+    // the NVRTC that loads is chosen by the dynamic linker, not by an option: its version is part of the key
+    let (mut major, mut minor) = (0, 0);
+    // SAFETY: two valid out-pointers.
+    unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) };
+    let opts = options.iter().fold(qx_fnv1a(format!("nvrtc {major}.{minor}").as_bytes()), |h, o| qx_fnv1a(o.as_bytes()) ^ h.rotate_left(17));
+    Some(std::path::PathBuf::from(home).join(format!(".cache/quixiinfer/ptx/{:016x}-{:016x}.ptx", qx_fnv1a(source.as_bytes()), opts)))
+}

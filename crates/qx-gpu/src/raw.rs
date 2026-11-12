@@ -78,21 +78,46 @@ fn launcher() -> std::sync::MutexGuard<'static, Option<Launcher>> {
 /// Compiles and loads `module` if it is not loaded yet.
 fn ensure(l: &mut Launcher, module: &crate::kernel::Module) {
     if !l.modules.contains_key(&module.source_hash) {
-        if std::env::var("QX_DS_VERBOSE").is_ok() {
-            eprintln!("raw: compiling {}.cu", module.name);
-        }
-        // the same target CubeCL compiles with (the device's own, `sm_120a` on an RTX 50-series card; NVRTC still hands
-        // back PTX), so the PTX text, and with it the driver's JIT cache entry, is the one CubeCL's launches of the
-        // same module already produced
-        let opts = cudarc::nvrtc::CompileOptions { options: vec![crate::mem::nvrtc_arch(false), "-lineinfo".into()], ..Default::default() };
-        let t0 = std::time::Instant::now();
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(module.source, opts).unwrap_or_else(|e| panic!("raw: kernels/{}.cu does not compile with NVRTC:\n{e}", module.name));
-        let src = CString::new(ptx.to_src()).expect("PTX text");
-        let t1 = std::time::Instant::now();
-        let m = unsafe { result::module::load_data(src.as_ptr() as *const c_void) }.unwrap_or_else(|e| panic!("raw: cuModuleLoadData of {}.cu: {e:?}", module.name));
-        if std::env::var("QX_DS_VERBOSE").is_ok() {
-            eprintln!("raw: {}.cu compiled in {:.1} s, loaded in {:.1} s", module.name, (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
-        }
+        // CubeCL's context keeps one module per precompiled source (the vendored cubecl-cuda's `QX_MODULES`), and it
+        // has usually loaded this one already: take it from there, or load it here and leave it there for CubeCL
+        let shared = cubecl::cuda::qx_module_share();
+        let have = if shared { cubecl::cuda::QX_MODULES.lock().unwrap().iter().find(|(h, _)| *h == module.source_hash).map(|&(_, m)| m) } else { None };
+        let m = match have {
+            Some(m) => m as sys::CUmodule,
+            None => {
+                // the same target CubeCL compiles with (the device's own, `sm_120a` on an RTX 50-series card; NVRTC
+                // still hands back PTX)
+                let arch = crate::mem::nvrtc_arch(false);
+                let key = [arch.as_str(), "-lineinfo", "raw"];
+                let t0 = std::time::Instant::now();
+                let mut loaded = None;
+                if let Some(ptx) = cubecl::cuda::qx_ptx_cached(module.source, &key) {
+                    match unsafe { result::module::load_data(ptx.as_ptr() as *const c_void) } {
+                        Ok(m) => loaded = Some((m, "PTX from the cache")),
+                        Err(e) if e.0 == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY => panic!("raw: cuModuleLoadData of {}.cu: out of device memory", module.name),
+                        // PTX the driver refuses: drop the entry and compile again
+                        Err(_) => cubecl::cuda::qx_ptx_forget(module.source, &key),
+                    }
+                }
+                let (m, how) = loaded.unwrap_or_else(|| {
+                    let opts = cudarc::nvrtc::CompileOptions { options: vec![arch.clone(), "-lineinfo".into()], ..Default::default() };
+                    let ptx = cudarc::nvrtc::compile_ptx_with_opts(module.source, opts).unwrap_or_else(|e| panic!("raw: kernels/{}.cu does not compile with NVRTC:\n{e}", module.name));
+                    let src = CString::new(ptx.to_src()).expect("PTX text");
+                    let m = unsafe { result::module::load_data(src.as_ptr() as *const c_void) }.unwrap_or_else(|e| panic!("raw: cuModuleLoadData of {}.cu: {e:?}", module.name));
+                    // stored after the load: PTX the driver rejects is not handed back on the next run
+                    let chars: Vec<std::ffi::c_char> = src.as_bytes_with_nul().iter().map(|&b| b as std::ffi::c_char).collect();
+                    cubecl::cuda::qx_ptx_store(module.source, &key, &chars);
+                    (m, "compiled")
+                });
+                if std::env::var("QX_DS_VERBOSE").is_ok() {
+                    eprintln!("raw: {}.cu {how}, loaded after {:.2} s", module.name, t0.elapsed().as_secs_f64());
+                }
+                if shared {
+                    cubecl::cuda::QX_MODULES.lock().unwrap().push((module.source_hash, m as usize));
+                }
+                m
+            }
+        };
         let mut funcs = HashMap::new();
         for &name in module.entries {
             let cname = CString::new(name).unwrap();

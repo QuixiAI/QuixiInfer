@@ -66,8 +66,8 @@ pub fn dequant_gather(gpu: &Gpu, t: GgmlType, w: u64, out: u64, rows: usize, col
 
 /// Whether the f16 GEMMs of prompt chunks go to cuBLAS (`QX_DS_GEMM16=cublas`) instead of the engine's own tile
 /// kernel `qx_gemm16` (the default): cuBLAS's handle and kernel libraries take about 1.4 GiB of the headroom, which
-/// no server configuration has (2026-11-10: a three-slot and a one-slot 256k server both fell back to the exact
-/// kernels); the own kernel needs nothing.
+/// no server configuration had (2026-11-10: a three-slot and a one-slot 256k server both fell back to the exact
+/// kernels; the headroom grew on 2026-11-12 and this was not re-measured); the own kernel needs nothing.
 pub fn gemm16_cublas() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("QX_DS_GEMM16").is_ok_and(|v| v == "cublas"))

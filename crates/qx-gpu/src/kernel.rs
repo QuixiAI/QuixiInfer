@@ -113,7 +113,7 @@ impl CubeKernel for CudaSource {
             std::process::abort();
         }
         if std::env::var("QX_DS_VERBOSE").is_ok() {
-            eprintln!("nvrtc compile: {}.cu {} (block {:?})", self.module.name, self.entry, self.cube_dim);
+            eprintln!("kernel load: {}.cu {} (block {:?})", self.module.name, self.entry, self.cube_dim);
         }
         Some(PrecompiledSource {
             source: self.module.source.to_string(),

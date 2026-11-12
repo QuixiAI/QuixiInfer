@@ -284,6 +284,16 @@ struct Loop {
     /// an event per stream.
     stage_streams: Vec<cudarc::driver::sys::CUstream>,
     stage_events: Vec<cudarc::driver::sys::CUevent>,
+    /// The chunk path's NVMe batches overlap the RAM copies (`chunk_overlap`): an event per stream recorded behind
+    /// each batch's copies, two sets used in turn, and whether a set has copies that were not waited for. A batch
+    /// takes at most half its class's landing places, so it never shares a place with the batch before it; before
+    /// its reads are submitted the set recorded two batches ago is waited for (the streams are FIFO: every earlier
+    /// copy is then done too).
+    chunk_events: [Vec<cudarc::driver::sys::CUevent>; 2],
+    chunk_events_pending: [bool; 2],
+    chunk_parity: usize,
+    /// A chunk job staged copies since the last `chunk_settle`.
+    chunk_staged: bool,
     /// Whether the GPU learns of the staged records' landing from the ready words (`stage_ready_by_words`) rather
     /// than from a done word this thread posts after waiting for the copies (and after the pool's share).
     stg_words: bool,
@@ -380,6 +390,21 @@ impl Loop {
             let tier = |h: &Host, g: usize| if h.store.in_ram(g) { 1 } else { 0 };
             cand.sort_by(|&a, &b| tier(&self.host, l * ne + a).cmp(&tier(&self.host, l * ne + b)).then(self.host.score[l * ne + b].partial_cmp(&self.host.score[l * ne + a]).unwrap_or(std::cmp::Ordering::Equal)).then(a.cmp(&b)));
             cand.truncate(job.prefetch.min(n_slots));
+            if chunk_overlap() && !cand.is_empty() {
+                // the NVMe reads and the RAM copies run side by side: a share of the RAM records ahead of each
+                // NVMe batch (their copies fill the batch's read time), in the order the GPU will meet them
+                let half = (self.host.store.stage_places(l * ne) / 2).clamp(1, 32);
+                let (nv, ram): (Vec<usize>, Vec<usize>) = cand.iter().partition(|&&e| tier(&self.host, l * ne + e) == 0);
+                let nb = nv.len().div_ceil(half);
+                let share = if nb > 0 { ram.len().div_ceil(nb) } else { ram.len() };
+                let mut order = Vec::with_capacity(cand.len());
+                for b in 0..nb {
+                    order.extend_from_slice(&ram[(b * share).min(ram.len())..((b + 1) * share).min(ram.len())]);
+                    order.extend_from_slice(&nv[b * half..((b + 1) * half).min(nv.len())]);
+                }
+                order.extend_from_slice(&ram[(nb * share).min(ram.len())..]);
+                cand = order;
+            }
             job.experts = cand.iter().map(|&e| e as u32).collect();
             *sh.chunk_pick.lock().unwrap() = Some(job.experts.clone());
         }
@@ -391,7 +416,7 @@ impl Loop {
         let t0 = std::time::Instant::now();
         let (mut n_vram, mut n_ram, mut n_nvme) = (0u64, 0u64, 0u64);
         // the copy of one record from `src` into the next staging slot, its word written behind it
-        let mut stage = |lp: &mut Loop, g: usize, e: u32, src: *const u8, ord: u64, slot_user: &mut Vec<u64>, next_slot: &mut usize, next_stream: &mut usize| {
+        let stage = |lp: &mut Loop, g: usize, e: u32, src: *const u8, ord: u64, slot_user: &mut Vec<u64>, next_slot: &mut usize, next_stream: &mut usize| {
             let s = *next_slot;
             *next_slot = (*next_slot + 1) % n_slots;
             // the slot's previous user must be done on the GPU (its ordinal marked)
@@ -409,6 +434,74 @@ impl Loop {
             let st = lp.stage_streams[si];
             lp.write_word_on(st, job.slots_dev + 8 * e as u64, dst | (job.generation << 48));
         };
+        // (two consecutive batches must not share a landing place: a class with a single one keeps the old form)
+        let places = self.host.store.stage_places(l * ne);
+        if chunk_overlap() && places >= 2 {
+            // The next run of NVMe records is read while the records before it are staged: its reads are
+            // submitted as soon as the previous batch's copies are enqueued (a batch is at most half the class's
+            // landing places, so two consecutive batches never share one; the batch before those is waited for).
+            let n = job.experts.len();
+            let is_nvme = |lp: &Loop, i: usize| { let g = l * ne + job.experts[i] as usize; lp.host.table[g] == 0 && !lp.host.store.in_ram(g) };
+            let mut inflight: Option<(usize, usize, Vec<*const u8>, Vec<(usize, usize)>)> = None;
+            let mut more_nvme = true;
+            let mut i = 0usize;
+            while i < n {
+                if inflight.is_none() && more_nvme {
+                    let mut j = i;
+                    while j < n && !is_nvme(self, j) {
+                        j += 1;
+                    }
+                    if j == n {
+                        more_nvme = false;
+                    } else {
+                        // (at most half the class's places, and within the store's read queue)
+                        let half = (places / 2).clamp(1, 32);
+                        let mut batch: Vec<usize> = Vec::new();
+                        let mut end = j;
+                        while end < n && batch.len() < half && is_nvme(self, end) {
+                            batch.push(l * ne + job.experts[end] as usize);
+                            end += 1;
+                        }
+                        self.chunk_wait_set(self.chunk_parity);
+                        let (ptrs, jobs) = self.host.store.fetch_submit(&batch).expect("chunk NVMe fetch");
+                        inflight = Some((j, end, ptrs, jobs));
+                    }
+                }
+                let e = job.experts[i];
+                let g = l * ne + e as usize;
+                let ord = job.ord0 + i as u64 + 1;
+                if self.host.table[g] != 0 {
+                    let v = self.host.table[g] | (job.generation << 48);
+                    self.write_word(job.slots_dev + 8 * e as u64, v);
+                    n_vram += 1;
+                    i += 1;
+                } else if self.host.store.in_ram(g) {
+                    let src = self.host.store.place[g] as *const u8;
+                    stage(self, g, e, src, ord, &mut slot_user, &mut next_slot, &mut next_stream);
+                    n_ram += 1;
+                    i += 1;
+                } else {
+                    let (j, end, ptrs, jobs) = inflight.take().expect("an NVMe record with no read in flight");
+                    assert_eq!(j, i, "the NVMe batch in flight starts elsewhere");
+                    let tw = std::time::Instant::now();
+                    self.host.store.fetch_wait(&jobs).expect("chunk NVMe fetch");
+                    sh.fetch_ns.fetch_add(tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    for bi in 0..end - i {
+                        let ej = job.experts[i + bi];
+                        stage(self, l * ne + ej as usize, ej, ptrs[bi], job.ord0 + (i + bi) as u64 + 1, &mut slot_user, &mut next_slot, &mut next_stream);
+                    }
+                    let p = self.chunk_parity;
+                    for si in 0..self.stage_streams.len() {
+                        unsafe { cudarc::driver::result::event::record(self.chunk_events[p][si], self.stage_streams[si]).expect("event record") };
+                    }
+                    self.chunk_events_pending[p] = true;
+                    self.chunk_parity = 1 - p;
+                    n_nvme += (end - i) as u64;
+                    i = end;
+                }
+            }
+            assert!(inflight.is_none());
+        } else {
         // NVMe records: the ones not in RAM when their turn comes, read in batches of the landing places
         let mut i = 0usize;
         while i < job.experts.len() {
@@ -455,6 +548,8 @@ impl Loop {
                 i = j;
             }
         }
+        }
+        self.chunk_staged |= n_ram + n_nvme > 0;
         self.ring_user = slot_user;
         self.ring_next = next_slot;
         sh.vram_hits.fetch_add(n_vram, Ordering::Relaxed);
@@ -466,8 +561,34 @@ impl Loop {
         }
     }
 
+    /// Waits for the copies behind chunk event set `p` (and so for every staging copy enqueued before them).
+    fn chunk_wait_set(&mut self, p: usize) {
+        if self.chunk_events_pending[p] {
+            for si in 0..self.stage_streams.len() {
+                unsafe { cudarc::driver::result::event::synchronize(self.chunk_events[p][si]).expect("chunk stage copies") };
+            }
+            self.chunk_events_pending[p] = false;
+        }
+    }
+
+    /// Waits for every staging copy the chunk jobs enqueued (out of the NVMe landing places and into the staging
+    /// area): whoever uses either next (a window's misses) may then overwrite them.
+    fn chunk_settle(&mut self) {
+        if self.chunk_staged {
+            for si in 0..self.stage_streams.len() {
+                unsafe {
+                    cudarc::driver::result::event::record(self.stage_events[si], self.stage_streams[si]).expect("event record");
+                    cudarc::driver::result::event::synchronize(self.stage_events[si]).expect("chunk stage copies");
+                }
+            }
+            self.chunk_staged = false;
+            self.chunk_events_pending = [false; 2];
+        }
+    }
+
     /// Answers one MoE job.
     fn serve(&mut self, sh: &Shared, seq: u64) {
+        self.chunk_settle();
         let t_start = std::time::Instant::now();
         if let Some(prev) = self.last_serve_end {
             sh.tl_gap_ns.fetch_add(t_start.duration_since(prev).as_nanos() as u64, Ordering::Relaxed);
@@ -1148,6 +1269,13 @@ pub fn swap_mode() -> bool {
 const MB_ALL_OFF: usize = mailbox::MB_ALL;
 
 /// The copy streams the staged records are spread over (`QX_DS_STAGE_STREAMS`, default 4, at most 8).
+/// `QX_DS_CHUNK_OVERLAP=0`: a chunk job's NVMe batches are read and copied one after another, ahead of its RAM
+/// records (the form until 2026-11-12). Default: the reads of the next NVMe batch run while RAM records copy.
+pub fn chunk_overlap() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| !std::env::var("QX_DS_CHUNK_OVERLAP").is_ok_and(|v| v == "0"))
+}
+
 pub fn n_stage_streams() -> usize {
     std::env::var("QX_DS_STAGE_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 8)
 }
@@ -1170,7 +1298,9 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     let n_stage_streams = n_stage_streams();
     let stage_streams: Vec<cudarc::driver::sys::CUstream> = (0..n_stage_streams).map(|_| unsafe { cudarc::driver::result::stream::create(cudarc::driver::result::stream::StreamKind::NonBlocking) }.expect("stage stream")).collect();
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
-    let mut lp = Loop { host, pool, shared: Some(sh.clone()), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), wb: Vec::new(), d2h: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
+    let mk_events = || -> Vec<cudarc::driver::sys::CUevent> { (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect() };
+    let chunk_events = [mk_events(), mk_events()];
+    let mut lp = Loop { host, pool, shared: Some(sh.clone()), chunk_events, chunk_events_pending: [false; 2], chunk_parity: 0, chunk_staged: false, ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), wb: Vec::new(), d2h: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
     for par in 0..2 {
         lp.pre_free[par] = (0..lp.host.pre_slots).map(|i| lp.host.pred_stage_base + ((par * lp.host.pre_slots + i) * lp.host.rec_max) as u64).collect();
     }
