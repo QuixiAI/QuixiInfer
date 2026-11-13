@@ -1,5 +1,5 @@
-//! The DeepSeek-V4.1-Flash engine thread: continuous batching over the engine's sequence slots. Every step runs
-//! one window: a token for each decoding request, then prompt chunks for the requests still reading theirs; the
+//! The DeepSeek-V4.1-Flash engine thread: continuous batching over the engine's sequence slots. A step is one
+//! window (a token per decoding request, then prompt tokens) or one chunk of a long prompt stretch; the
 //! samples are drawn on the host (structured outputs mask the logits first) and streamed back as text deltas.
 use crate::worker::{Detok, Event, Job};
 use anyhow::{anyhow, Result};
@@ -225,6 +225,10 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         let keep = eng.prompt_keep();
         let mut kv_only_windows = 0usize;
         let mut chunk_steps = 0usize;
+        let chunk_beside = !std::env::var("QX_DS_CHUNK_BESIDE").is_ok_and(|v| v == "0");
+        let chunk_gap: usize = std::env::var("QX_DS_CHUNK_GAP").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        // window steps since the last chunk
+        let mut gap_steps = usize::MAX / 2;
         let verbose_post = std::env::var("QX_DS_VERBOSE").is_ok();
         let mut post_left = 0usize;
         let mut post_t = std::time::Instant::now();
@@ -296,14 +300,20 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             let mut segs: Vec<(usize, u32)> = Vec::new();
             let mut plan: Vec<(usize, usize, bool)> = Vec::new(); // (request index, tokens, completes the prompt or decodes)
             let mut out: Vec<f32> = Vec::new();
-            // the chunk path (QX_DS_CHUNK=N at start): while nobody decodes, the longest remaining prompt goes
-            // through forward_chunk, up to N rows at once, KV-only when at least prompt_keep positions follow
-            // (decoders would wait seconds behind a chunk, so only prompt-only steps take it. Since 2026-11-10 a
-            // chunk's dense products are f16 tensor-core GEMMs, KL-bounded against the exact path, while windows
-            // stay exact: a long prompt's temperature-0 output can therefore depend on whether another slot was
-            // decoding when it arrived. QX_DS_PREFILL_EXACT=1 keeps chunks exact.)
+            // the chunk path (QX_DS_CHUNK=N at start): the longest remaining prompt stretch of at least
+            // max(window, 256) tokens goes through forward_chunk, up to N rows at once, KV-only when at least
+            // prompt_keep positions follow. (Since 2026-11-10 a chunk's dense products are f16 tensor-core GEMMs,
+            // KL-bounded against the exact path, while windows stay exact; until 2026-11-13 a prompt that arrived
+            // beside a decoder ran in exact windows, so its temperature-0 output depended on that.
+            // QX_DS_PREFILL_EXACT=1 keeps chunks exact.)
             let chunk_rows = eng.chunk_rows();
-            let chunked = if chunk_rows > 0 && running.iter().all(|r| r.next.is_none()) {
+            // Beside decoders (since 2026-11-13; QX_DS_CHUNK_BESIDE=0: chunks only while nobody decodes): such a
+            // stretch still runs in chunks, and the decoders get `chunk_gap` steps of their own between two chunks
+            // (QX_DS_CHUNK_GAP, default 4). A decoder waits a chunk (4-6 s), but a 128-wide full-stack window beside
+            // it took 2.5 s: a 10,031-token prompt arriving beside a reply 196.6 -> 9.1 s, the reply 197 -> 18.9 s.
+            let decoding = running.iter().any(|r| r.next.is_some());
+            let chunk_due = !decoding || (chunk_beside && gap_steps >= chunk_gap);
+            let chunked = if chunk_rows > 0 && chunk_due {
                 let pick = (0..running.len()).filter(|&i| running[i].job.prompt.len() - running[i].read >= window.max(256)).max_by_key(|&i| running[i].job.prompt.len() - running[i].read);
                 if let Some(ri) = pick {
                     // whether another running request still has a prompt stretch that would run in chunks
@@ -329,6 +339,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                         }
                     }
                     chunk_steps += 1;
+                    gap_steps = 0;
                     if r.read == r.job.prompt.len() {
                         r.t_prompt = Some(r.t0.elapsed().as_secs_f64());
                         r.logits = Some(last);
@@ -352,7 +363,10 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 }
             }
             let d = segs.len();
-            let avail: usize = running.iter().filter(|r| r.next.is_none() && r.read < r.job.prompt.len()).map(|r| (r.job.prompt.len() - r.read).min(window)).sum();
+            gap_steps += 1;
+            // a prompt stretch waiting for its chunk (beside decoders) stays out of the windows between chunks
+            let held = |r: &Req| chunk_rows > 0 && chunk_beside && d > 0 && r.job.prompt.len() - r.read >= window.max(256);
+            let avail: usize = running.iter().filter(|r| r.next.is_none() && r.read < r.job.prompt.len() && !held(r)).map(|r| (r.job.prompt.len() - r.read).min(window)).sum();
             let need = (d + avail).min(DS_TMAX);
             let width = WIDTHS.iter().copied().filter(|&w| w <= need && w <= DS_TMAX).max().unwrap_or(d).max(d);
             let mut room = width - d;
@@ -360,7 +374,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 if room == 0 {
                     break;
                 }
-                if r.next.is_none() && r.read < r.job.prompt.len() {
+                if r.next.is_none() && r.read < r.job.prompt.len() && !held(r) {
                     let n = (r.job.prompt.len() - r.read).min(window).min(room);
                     segs.extend(r.job.prompt[r.read..r.read + n].iter().map(|&t| (r.slot, t)));
                     plan.push((ri, n, r.read + n == r.job.prompt.len()));
@@ -402,18 +416,25 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 last_step_end = Some(now);
             }
             let mut row = 0;
+            let mut prompt_done = false;
             for &(ri, n, samples) in &plan {
                 let r = &mut running[ri];
                 if r.next.is_none() {
                     r.read += n;
                     if r.read == r.job.prompt.len() {
                         r.t_prompt = Some(r.t0.elapsed().as_secs_f64());
+                        prompt_done = true;
                     }
                 }
                 if samples {
                     r.logits = Some(out[(row + n - 1) * n_vocab..(row + n) * n_vocab].to_vec());
                 }
                 row += n;
+            }
+            // a prompt that ended in a window (a remainder under 256 tokens after its chunks: QX_DS_SKIP=0 or a small
+            // QX_DS_CHUNK) gives the flex tail back too, once no stretch waits for a chunk (a no-op when not held)
+            if prompt_done && chunk_rows > 0 && !running.iter().any(|r| r.next.is_none() && r.job.prompt.len() - r.read >= window.max(256)) {
+                eng.chunk_release();
             }
             // sample for every request with a distribution
             for r in running.iter_mut() {
