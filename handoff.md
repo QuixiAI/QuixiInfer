@@ -2,6 +2,20 @@
 
 
 
+## Resume 2026-11-12 (evening): short prompts 15-58% faster (prefetch picks skipped once the routing is known, NVMe batches of 8, eight event sets); baseline unchanged (19.166)
+- **Landed** (adjudicator: LANDED) `perf/results/2026-11-12/setd-promo15-215438` (binaries `~/qx-bins/chunk113`, in
+  `target/release`): set D 19.213 against 19.166, within noise (not promoted: set D scores no short prompt).
+  Warmed prompt chunk: a forced 32-row chunk in `qx-ds-check` 4.50 -> 1.88 s (the server chunks only stretches of 256 tokens or more), 264 tokens 3.63 -> 1.84 s, 2,048 tokens 3.83 -> 3.24 s; three-slot
+  256k server: 1,638 tokens 4.53 -> 3.37 s, 3,293 tokens 4.95 -> 4.47 s, 13,283 tokens 11.34 -> 11.00 s. Logits
+  byte-identical everywhere compared.
+- **A short prompt is disk-bound**, not link-bound (the earlier "2.06 s of copies" was wrong: it is the io_uring
+  submit blocking on 128 KiB requests). The drive gives 11-12 GB/s on the pack alone, ~10 in the engine.
+- Knobs: `QX_DS_CHUNK_SKIP=0`, `QX_DS_CHUNK_READS=32`, `QX_DS_CHUNK_SETS=2` (the three together: the old form).
+  `QX_DS_CHUNK_BATCH` is still the (rejected, dead) batched grouped kernels' knob, not the read batch.
+  `QX_DS_VERBOSE` prints a `chunk lane:` line per chunk.
+- Open from the breaker (pre-existing): `promote_one` right after a chunk job against a queued staging copy.
+- Next: the backlog's queue of 2026-11-12 evening.
+
 ## Resume 2026-11-12: set D 19.166 promoted (kernel modules loaded once per source, PTX on disk; NVMe reads beside RAM copies in chunk jobs); ahead of Strata as a fresh process too
 - **Promoted** `perf/results/2026-11-12/setd-promo13-161136` (24090ba, binaries `~/qx-bins/chunk110`, in
   `target/release`): decode256k 38.55, prefill256k 2.0 (2.241 -> 2.003 unrounded), serve256k3 91.32, score 19.166.

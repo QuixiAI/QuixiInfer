@@ -9,6 +9,25 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-12, evening (picks skipped after the routing landed; a short prompt is bounded by the disk)
+1. **Chunks while another slot decodes** (unchanged: slot 1's 10,031-token prompt 83 s with the exact knob, 54.8 s
+   default, beside a 13k prompt). The largest gap under load.
+2. **The NVMe reads of a prompt chunk** (2k chunk 3.24 s: 3,048 reads, 2,356 of them used, ~0.95 ms each; the
+   disk is busy ~2.9 s of it). Not tried: the next layer's routing predicted from this layer's router input
+   (the union over a chunk's rows may be predictable where single rows are not); picks ordered by a per-expert
+   rate of use in chunks rather than by rows; VRAM a short prompt does not need (the 256k KV reservation) lent
+   to NVMe-tier experts; a sliding window of reads (one submitted as one completes) instead of batches. Tried
+   and flat or weak: see findings' Rejected of 2026-11-12 evening.
+3. **`promote_one` after a chunk job** may take a RAM place whose staging copy is still queued (breaker,
+   2026-11-12 evening; pre-existing, narrow): a counter on a replayed three-slot schedule, then exclude records
+   staged since the last settle or settle before promoting.
+4. **The tokens right after a long prompt in the three-slot server** (unchanged: first steps 174, 102, 82, 79 ms).
+5. **serve256k1's two modes** (a fixed warm-up schedule in loadgen would make the row reproducible).
+6. **The ring-slot waits of long prompts** (~0.9-1.05 s per 8,192-row chunk at 256k).
+7. `time1.sh`'s GPU-free gate can pass while the previous context tears down (one start-up OOM): wait for the
+   free-memory figure, not only the used one.
+8. Carried: the Engram projection in f16; expert arithmetic in f16; the outlier of a fresh process.
+
 ### Queue as of 2026-11-12 (after set D 19.166; a short prompt is bounded by the staging lane)
 1. **The staging lane of a prompt chunk** (driver busy 3.58 of a 2,040-row chunk's 3.84 s: copies 2.06 s at
    ~62 GB/s, NVMe wait 1.48 s). Not tried: a second staging thread (NVMe reads and their copies on their own

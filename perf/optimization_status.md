@@ -3487,3 +3487,123 @@ shorter warm-up (12 s against 25 s) may shift which state the warm-up requests l
 on every binary: in the last six alternated sessions the old binary reads 38.45-40.77 (one session with both
 requests slow) and the new one 38.36-39.26. serve256k3 over the same six: old 91.32, 91.16, 90.99; new 90.91,
 89.29, 91.24.
+
+## 2026-11-12 (evening): A prefetch job skips the picks the routing leaves without rows; NVMe batches of 8 over all the landing places — LANDED (warmed prompt chunk: 2,048 tokens 3.81-3.84 -> 3.22-3.26 s, 264 tokens 3.63 -> 1.84 s (one pair); a forced 32-row chunk in `qx-ds-check` 4.50 -> 1.88 s (one pair, not a server path); set D within noise, 19.213 against 19.166); run `perf/results/2026-11-12/setd-promo15-215438` (adjudication below)
+
+Tree: 30100a2 plus a dirty working tree (diff_sha 2f82331319e9), committed with this entry; binaries
+`~/qx-bins/chunk113` (qx-ds-check d3d90a47d3c3, quixiinfer a6d44b86d70f, qx-ds-multi 13b74d8190b0, qx-ds-replay
+e15babcd04d9). Earlier builds of the same work: exp3-exp10 (worktree `~/qx-wt/exp`), chunk111 (the knob was named
+`QX_DS_CHUNK_BATCH`, which the engine already reads for the batched grouped kernels), chunk112 (renamed
+`QX_DS_CHUNK_READS`), chunk113 (chunk112 with the doc comment's numbers corrected: no code difference).
+
+### Correction to the entry before this one
+"~2,060 ms inside the copy calls ... the link's speed" was an attribution by subtraction and is wrong. Counters
+around each call (exp3, the 2,040-row chunk of a warmed 2,048-token prompt, 3,926 ms, driver busy 3,641): the copy
+calls take 56 ms; `fetch_submit` (the io_uring submit) blocks 1,988 ms; `fetch_wait` 1,488 ms; landing places
+56 ms; a ring slot 50 ms. The drive's largest request is 128 KiB (`max_hw_sectors_kb`), so a 9.5 MB record is 74
+requests and a batch of 32 is ~2,400 against 1,023 tags: the submit blocks until the queue drains. The disk is
+busy ~3.5 of the chunk's 3.9 s at ~10.4 GB/s; `fio` on the pack alone (O_DIRECT, 9,728 KiB blocks, random) reads
+11.1 GB/s at depth 8 and 11.8 at 32. A short prompt is bounded by the disk, not the link (presupposition 42 revised).
+
+### What the disk was reading
+The prefetch job picks up to 256 non-resident experts of a layer before the routing is known, NVMe-tier first.
+Of the 2,040-row chunk's 3,839 NVMe reads, 2,356 were of experts the chunk routes to (`QX_DS_CHUNK_PREFETCH=0`
+reads exactly those and takes 4,371 ms: no head start); of 10,240 picks, 12,259 - 4,313 = ~7,950 were used.
+
+### Change (`driver.rs`, `mod.rs`)
+- The engine publishes a layer's routing (which experts have rows) as soon as it has the lists
+  (`Shared::chunk_used`, tagged with the job's generation); the prefetch job, still staging its pick, skips every
+  pick without rows from then on: no read, no copy, no ring slot, no word (the engine only marks an unused
+  pick's ordinal, as before). `QX_DS_CHUNK_SKIP=0`: stage them all.
+- NVMe batches of 8 records instead of 32 (`QX_DS_CHUNK_READS`): a batch is read blind once submitted, and 8
+  records are ~600 requests in flight, the disk's full rate. A batch passes over skipped picks.
+- Up to eight event sets instead of two (`QX_DS_CHUNK_SETS`): batch j waits for the copies of batch j - nsets
+  before its reads go out (nsets x batch <= the class's 64 landing places, handed out in rotation), so the disk
+  no longer waits for the copies of the batch just before (410-420 ms of the chunk with two sets and batches of 8).
+- Verbose: a `chunk lane:` line per chunk (driver busy, ring-slot wait, NVMe wait and submit, landing places,
+  copy calls, records staged per tier, picks skipped).
+
+| warmed `qx-ds-check`, chunk ms (alternated; chunk113 unless noted) | new | chunk110 | new with `READS=32 SETS=2 SKIP=0` |
+|---|--:|--:|--:|
+| 2,048 tokens | 3,239; 3,216 (chunk112 3,262; chunk111 3,259, 3,238) | 3,813 (3,842) | 3,847 (3,863) |
+| 16,384 tokens: KV-only chunk + mixed chunk | 4,818 + 6,964 | 4,758 + 7,277 | |
+| 264 tokens (chunk112; one pair, old binary first) | 1,840 | 3,634 | |
+| 40 tokens, `QX_DS_WARM=0`: not warmed, a forced 32-row chunk (chunk112; one pair, old binary first) | 1,882 | 4,498 | |
+
+The server takes the chunk path only for a prompt stretch of at least 256 tokens (`worker_ds.rs`), so the
+40-token row exists in `qx-ds-check` only: the loadgen requests of 42-46 tokens in the server log make no chunk.
+
+Lane line of the 2k chunk, old form by knobs -> default, on chunk113: NVMe records staged 3,839 -> 3,044 / 3,033,
+RAM 9,573 -> ~9,340, 1,021 / 1,035 picks skipped, driver busy 3,588 -> 2,983 / 2,986 ms. Time per NVMe record (wait + submit) is unchanged (0.91 ->
+0.95 ms): the gain is reads not made. 264 tokens: 4,251 picks skipped, 1,607 NVMe records; 40 tokens: 6,808
+skipped, 962 NVMe records.
+By knob on chunk112 (2k chunk): `READS` 4: 3,280; 8: 3,262; 16: 3,263; 32: 3,513; 8 with `SKIP=0`: 3,956 (against
+3,847 for the old form, which also has two sets: small batches pay only with the skip). prefill256k's scored chunk (8,192 rows at 253,952; the
+skip fires 326-333 times there): 16,128 / 16,113 ms with 8, 16,298 / 16,292 with 32; this run 16,126 (baseline
+run 16,410); the KV-only chunk before it 9,225-9,591 against 9,288-9,679 (0 skipped: its prefetch is done before
+the routing; no difference).
+Three-slot 256k server (chunk113 against chunk110, same prompts): 13,283 tokens 11.34 -> 11.00 s; 3,293 tokens
+4.95 -> 4.47 s; 1,638 tokens 4.53 -> 3.37 s; the 64-token replies byte-identical.
+
+Set D (`setd-promo15-215438`, chunk113): decode256k 39.3, 38.5 (38.9; baseline 38.55, noise 2.1%), prefill256k
+2.0, serve256k1 36.98, serve256k3 91.16, decode 30.9, prefill128 10.5, serve1 35.01, serve3 78.93 (from
+`v15-serve-220848`): score 19.213 against 19.166, every case within noise or under the bar except serve256k1
+(-5.0%, a two-mode row: alternated sessions read old 39.15, 38.39 and new 39.11, 37.09). Not a promotion: set D
+does not score a short prompt. Identity identical in all three sessions.
+Preflight (log.out 21:54:38, before the set D run of 21:54-22:02): VM shut off, swap 982 MiB used, memory
+pressure avg10 0.00, no build tool, compaction proactiveness 0; the timing runs (21:26-21:43) and the server
+session (22:05) have no preflight line of their own. `summary.md` reads "correctness skipped" (`--promo` runs
+without `--check`); run.json's "pass" was attached from the chain's ds-checks.
+Exactness: the same kernels on the same inputs; only which records are staged, and when, changes. The skip is
+covered by the default-path dumps (40, 264, 2k, 16k; prefill256k with 326-335 picks skipped) and the three
+server replies (428, 678 and 1,623 picks skipped); the exact-knob checks and the two-prompts trace ran with 0
+picks skipped (they cover the batches of 8 and the event sets), and the serve256k identity sessions make no
+chunk at all. Tail logits
+byte-identical to chunk104's dumps (and chunk110's) at 2,048 and 16,384 tokens and to chunk110 at 40 and 264; prefill256k default dump byte-identical to
+po3.bin; exact knob 64/64 against pe.bin; two prompts at once (exact knob) 60/60 row hashes on both slots against
+t0; ds-checks parts b and a text-identical to v11 (all four binaries installed).
+
+The exp6-exp10 arms and chunk111's "(3,863)" set the read batch through `QX_DS_CHUNK_BATCH`, which the engine
+also reads for the batched grouped kernels (dead unless `QX_DS_CHUNK_GROUPED=0`, by the breaker's reading); the
+chunk112 / chunk113 numbers use `QX_DS_CHUNK_READS`. The `fio` figures and the disk-busy estimate were read off the
+terminal and the lane counters; no log of the `fio` run was kept (`fio --readonly --direct=1 --rw=randread
+--bs=9728k --ioengine=io_uring --iodepth=8|32 --runtime=6` on the pack).
+
+### Adjudication (fresh context): LANDED
+Gate recomputed (19.166 -> 19.213, every scored case within noise or under the bar; serve256k1's -5.0% is the
+two-mode row, not a win); the landing bar (8%) is cleared on the targeted case (2k chunk -15%, ranges disjoint);
+ds-checks and every dump re-compared; chunk112 and chunk113 are byte-identical in `.text`, `.rodata`, `.data`
+(27 panic line numbers differ), so chunk112's evidence stands for chunk113. No promotion, no scoreboard row. Its
+twelve text corrections are applied above (the 40-token row is not a server path; preflight; what the exact-knob
+checks do not cover).
+
+### Breaker (fresh context, on chunk111's diff; code reading, no runs)
+No defect in the diff: landing-place reuse holds for every `READS` 1-32 and `SETS` 2-8 (all classes have 64
+places; only batches j - nsets + 1 .. j - 1 can have copies not waited for); a skipped pick has an empty list by
+the same `lists` the launches use, so it is in neither `rest` nor `extra_scores`; the generation is re-checked
+under the lock; ring ordinals stay monotone; no path to the panic, to double staging or to an unstaged record.
+Its notes, handled: batch 8 without skips on long chunks (measured above: no cost at 256k); the doc comment's
+numbers came from three binaries (re-measured on chunk112); short prompts untested (264 and 40 tokens: identical,
+and the largest gains); `QX_DS_CHUNK_BATCH` read twice (renamed). Pre-existing and open: `promote_one` on the
+first idle iteration after a chunk job may evict a RAM record whose staging copy is still queued (the victim
+filter excludes only `inflight` / `pre_inflight`); narrow (the class's coldest RAM record with a copy queued);
+needs a counter on a replayed three-slot schedule.
+
+### Tried and not landed
+- A cap on the RAM records of the prefetch (`QX_DS_CHUNK_PRE_RAM`, exp4): 0: 3,997 ms; 64: 3,872; all: 3,891-3,926.
+- The skip with batches of 32 and one batch of read-ahead (exp5): 3,740-3,751 against 3,877-3,911 off; only 178
+  NVMe reads cancelled (all of a layer's batches are submitted before its routing arrives).
+- Read-ahead by one batch with batches of 8 (exp8/exp9): 3,285-3,325 against 3,237-3,261 without; removed.
+- Registered io_uring buffers for the landing places (exp7): registration fails with ENOMEM under the 8 MiB
+  memlock limit (hard limit: raising it needs root), and with batches of 8 the submits take 0.43 s for 2,965
+  records, so the per-read page pinning is not what blocked.
+- Predicting a layer's NVMe-tier use from the previous chunk of the same prompt (exp9, 16k in 2,048-row chunks,
+  `QX_DS_SKIP=0`): of the NVMe-tier experts used before, 68% are used now against a base rate of 50% (1,325 of
+  1,939; later chunks 47-69%). Too weak to order the picks by. The same run: the NVMe-tier experts a chunk uses
+  fall 2,355 -> 924 over the eight chunks (the tiers adapt to the prompt), chunks 3.0-3.3 s each.
+- One run of the session (`sets1-b16-noahead`) died at start with CUDA out of memory: 0.46 GiB free after load
+  against 2.14-2.15 in the others (one read 2.97); `time1.sh`'s gate can pass while the previous context is still tearing down
+  (the later chains wait 3 s more; all nine runs of chain BRK1 read 2.14).
+
+What is left of a 2k chunk: ~700 NVMe reads of experts not used (the blind part of each layer's prefetch) and
+2,356 that are (22 GB: 2.0 s at the disk's rate, against a chunk of 3.2 s).
