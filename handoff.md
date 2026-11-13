@@ -2,6 +2,24 @@
 
 
 
+## Resume 2026-11-13 (morning): prompts of 64+ tokens run in chunks, bit-identical to before (four cold prompts 2.3-3.9x faster, warm repeats 1.1-1.3x); the promotion race guarded; baseline unchanged (19.166)
+- **Landed** (adjudicator: HOLD twice, then LANDED) `perf/results/2026-11-13/setd-promo25-074000` (binaries `~/qx-bins/chunk120`, in
+  `target/release`): set D 19.164 against 19.166 (set D has no prompt of 64 tokens: not promoted). Fresh
+  three-slot 256k server, prompt time: 79 tokens 3.58 -> 1.54 s, 128: 7.02 -> 1.78, 186: 8.52 -> 2.22, 232: 9.35
+  -> 2.52; the fifth prompt (111 tokens, tiers warmed) 2.27 -> 1.64. Three-turn loadgen at three clients: wall
+  61.3 -> 55.9 s, TTFT median 2.95 -> 1.45 s, per-request decode 9.31 -> 8.43 tok/s.
+- Chunks under 256 rows use the exact kernels and post no blind prefetch: replies to short prompts are
+  bit-identical to the windows' (316/316 rows in default mode). f16 stays for chunks of 256 rows or more.
+- Knobs: `QX_DS_CHUNK_MIN` (default 64; `=256` is the old threshold, a huge value sends every prompt through
+  windows), `QX_DS_CHUNK_F16_MIN` (default 256; 0 = f16 for every chunk), `QX_DS_CHUNK_PREFETCH_MIN` (default
+  256; 0 = always prefetch), `QX_DS_PANIC_AFTER_CHUNKS=N` (test of the exit).
+- The race of 2026-11-12 (a RAM place given away under a queued chunk copy) is guarded (`chunk_guard`); the lane
+  line counts the settles (0-3 per run).
+- A panic of the engine or driver thread ends the process with 101 (it used to leave the server up, answering nothing).
+- The ring-slot waits are back-pressure (closed). serve256k1 reads 36.9-40.9 by the warm-up's arrival order; a
+  50 ms stagger between clients makes it reproducible (not adopted yet: needs a re-measured baseline).
+- Next: the backlog's queue of 2026-11-13, morning.
+
 ## Resume 2026-11-13: long prompts run in chunks beside decoders (a 10k prompt arriving mid-reply 197 -> 9 s); baseline unchanged (19.166)
 - **Landed** (adjudicator: HOLD, then LANDED) `perf/results/2026-11-13/setd-promo17-032618` and
   `setd-promo18-034659` (binaries `~/qx-bins/chunk115`, in

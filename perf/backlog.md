@@ -9,6 +9,33 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-13, morning (short prompts in chunks; the guard for the promotion race; the ring item closed)
+1. **The NVMe reads of a prompt chunk** (2k chunk 3.24 s: 3,048 reads, 2,356 of them used; a 79-row chunk 1.54 s:
+   1,053 NVMe records, 137 experts per layer). Not tried: the next layer's routing predicted from this layer's
+   router input, which would give short chunks their head start back and cut the long chunks' blind reads; VRAM
+   a short prompt does not need lent to NVMe-tier experts; a sliding window of reads.
+2. **The per-request decode rate under several clients with short prompts** (three-turn loadgen at three clients:
+   9.31 -> 8.43 tok/s per request since stretches of 64+ tokens chunk; wall and TTFT are better). A decoder waits
+   one chunk (1.5-2.5 s) per arriving short prompt. Try: two short stretches in one chunk (multi-slot chunks).
+3. **Windows for prompts under 64 tokens** (a fresh 79-token prompt took 3.6 s in windows; 42-46 tokens warm 0.9-1.1
+   s, 3.4-6.0 s for the first three at once on a fresh three-slot 256k server). The chunk floor is ~1.2 s (sync on the slab
+   passes 0.70-0.73 s at 40-46 rows, 0.84-0.87 s at 79-88 rows): a cheaper small-chunk pass would move the
+   threshold down.
+4. **The tokens right after a prompt** (first steps 174, 102, 82, 79 ms after a long prompt: entry of 2026-11-11
+   morning; a reply after a short chunk is 0.14-0.26 s slower over 64 tokens than after windows).
+5. **serve256k1's spread** (36.9-40.9: each of its two requests is fast or slow by the warm-up's arrival order;
+   loadgen's six warm-up requests race for three slots). Measured: clients started 50 ms apart give the same
+   order in 4 of 4 sessions and 10.12-10.21 / 10.42-10.51 s in 3 of them (one 11.42). Adopt `--stagger` in
+   loadgen and bench.sh with a re-measured baseline.
+6. **A start-up capture panic** (once in ~35 starts: entry of 2026-11-13; the server now exits with 101 instead of staying
+   up dead): CubeCL's pool finds no room for a 56-byte buffer while a capture records.
+7. The longest gap between two stream deltas beside a long prompt is one chunk (9-16 s at 250k by prefill256k's
+   chunks in `qx-ds-check`, not measured beside a decoder): a smaller chunk beside decoders would trade the
+   prompt's time for it.
+8. f16 for chunks under 256 rows (0.03-0.27 s per short prompt) needs accuracy evidence on more than one text
+   (top-1 95.7% over 513 rows of one, contract 95%); `QX_DS_CHUNK_F16_MIN=0`.
+9. Carried: the Engram projection in f16; expert arithmetic in f16; the outlier of a fresh process.
+
 ### Queue as of 2026-11-13 (chunks beside decoders landed)
 1. **`promote_one` after a chunk job** may take a RAM place whose staging copy is still queued (breaker,
    2026-11-12 evening; pre-existing, narrow). A guard is written in the worktree (`chunk_guard`: settle before a

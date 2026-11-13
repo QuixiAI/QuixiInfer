@@ -3726,3 +3726,172 @@ default A 177/177, B 64/64); `worker_ds.rs` equal to the run directories' diff; 
 prompts, offsets and settings. The landing bar (8%) is cleared on the targeted cases by factors of 4.7 to 22.
 Its corrections are applied above (the old reply never finished: cut at 93 of 176 tokens; the two gate "wins"
 are two-mode rows; which figures are besd1's or chunk114's).
+
+## 2026-11-13 (morning): Prompt stretches of 64 tokens or more run in chunks (exact under 256 rows, no blind prefetch there); a RAM place staged by a chunk is settled before it changes hands; a dead engine thread ends the server — LANDED (fresh three-slot 256k server, prompt time: 79 tokens 3.58 -> 1.54 s, 128: 7.02 -> 1.78, 186: 8.52 -> 2.22, 232: 9.35 -> 2.52, replies bit-identical; set D within noise, 19.164 against 19.166); run `perf/results/2026-11-13/setd-promo25-074000` (adjudication below)
+
+Tree: 6c50cde plus `driver.rs`, `mod.rs`, `worker_ds.rs` (`git diff -- crates` sha 8d0fb658ea88), committed with
+this entry; binaries `~/qx-bins/chunk120` (qx-ds-check 3ad605200855, quixiinfer 8d6080d8d5c0, qx-ds-multi
+66e901c7895b, qx-ds-replay 7fb63b6c6260; `build-chunk120.log`). Earlier builds of the same work, each superseded
+after a breaker or adjudicator note: exp11-exp13 (worktree), chunk116 (guard, abort on panic, `CHUNK_MIN` 64),
+chunk117 (capture lock in `chunk_settle`, `chunk_tick`, `_exit`), chunk118 (`CHUNK_PREFETCH_MIN`), chunk119 (panic
+hook, `chunk_used_gen` zeroed, the test knob; validated by chain V23, held by the adjudicator), chunk120
+(`CHUNK_F16_MIN`). Chains V20-V22 were stopped (screening); V25 is the validation of chunk120.
+
+### What was measured first
+- **Windows are the slow path for a short prompt.** Fresh three-slot 256k server, distinct prompts in sequence:
+  79 tokens 3.6 s, 128: 6.8-7.3 s, 186: 8.5-9.6 s, 232: 9.2-9.6 s in windows (the first request reads 5,951 NVMe
+  records in windows against 2,823 in a chunk on chunk120: a full-stack window fetches its misses per window). The same
+  prompts through the chunk path (`QX_DS_CHUNK_MIN`, exp12, f16 chunks): 1.8, 1.8, 2.2, 2.4 s.
+- **At 32 the loadgen's 42-46-token prompts chunk too and lose** (exp12, two sessions each: first token 0.92 /
+  0.93 -> 1.22 / 1.22 s alone; three at once 13.35 / 12.55 -> 10.24 / 10.35 tok/s per request, TTFT p90 2.23 /
+  2.37 -> 3.93 / 3.96 s); at 64 they stay in windows and the loadgen reads as before. 128 against 64 (exp13,
+  three-turn loadgen at c3): wall 56.8 / 58.5 s, TTFT p90 3.65 / 2.09 s, and the cold 79-token prompt stays at
+  3.6 s: 64.
+- **A short chunk's blind prefetch reads for nothing.** 79 rows route to 137 of a layer's experts; the prefetch
+  job picks before the routing. chunk117, `QX_DS_CHUNK_PREFETCH=0` against default, twice each (equal to ~5 ms):
+  79 rows 1,805 -> 1,523 ms (NVMe records 1,731 -> 1,050), 128: 1,809 -> 1,680, 186: 2,145 -> 2,059, 232: 2,370
+  -> 2,285; 413: 2,176 -> 2,337, 1,638: 3,406 -> 4,040, 3,293: 4,531 -> 5,741. The crossover is between 232 and
+  413 rows.
+- **f16 on short chunks is inside the contract by three rows** (chunk119, default against the exact knob in
+  `qx-ds-check`, the start of `route16k.tokens`: an 88-row chunk and the 512 single steps after it): 513 rows, KL
+  mean 0.0186, median 0.0011, p99 0.24, max 1.00 (row 98: not a near-tie), top-1 491/513 = 95.7% (bound: 488);
+  rows 471-599 read 117/129 = 90.7%. A 136-row chunk and 64 steps of the same text (exp13; dumps not kept): KL
+  0.0212, top-1 62/65. The adjudicator held chunk119 on this: one text, no margin. The exact kernels cost
+  0.03-0.27 s on such a chunk, so short chunks keep them (below).
+- **The ring size is back-pressure, not loss** (backlog item 6): `QX_DS_STAGE_CAP=512` on a 16k prompt takes the
+  ring-slot waits from 961 + 944 ms to 56 + 0 and leaves the chunks at 4,779 + 7,070 / 4,784 + 7,074 ms against
+  4,794 + 6,972 / 4,802 + 6,961. Closed.
+
+### Change
+- `worker_ds.rs`: `QX_DS_CHUNK_MIN` (default 64; was max(window, 256)): the shortest prompt stretch that runs in
+  chunks, alone or beside decoders.
+- `mod.rs`: `QX_DS_CHUNK_F16_MIN` (default 256): a chunk of fewer rows keeps the exact kernels, so the 64-255-token
+  prompts stay bit-identical to the windows they ran in until now, in default mode too. (The comment at
+  `chunk_min` in `worker_ds.rs` quotes exp12's f16 times, 2.2 and 2.4 s at 186 and 232 tokens; exact: 2.22, 2.52.)
+- `mod.rs`: `QX_DS_CHUNK_PREFETCH_MIN` (default 256): a chunk of fewer rows posts no prefetch job (the path of
+  `QX_DS_CHUNK_PREFETCH=0`); a layer without one zeroes `chunk_used_gen` (breaker: the generation counter wraps
+  after 65,535 layers and a later prefetch job could otherwise skip by a stale routing).
+- `driver.rs`, the race the breaker flagged on 2026-11-12: `chunk_ram` holds the records a chunk job staged from
+  their RAM places since the last settle; `chunk_guard` settles before such a place changes hands (`promote_one`'s
+  victim, the swap's duplicate in `adapt`). Counted in the lane line: 0 settles in a warmed 2k prompt, 1 in a 16k
+  prompt, 3 in the four chunks of two prompts at once, 0 in prefill256k's two chunks and in the short chunks.
+  `chunk_settle` takes `Shared::capture` (it can now run from the idle loop).
+- `driver.rs`: a prompt chunk flags its tick (`Shared::chunk_tick`), so the eviction cap of 2026-11-11 applies to
+  chunks of 128 rows or fewer too (they did not exist in the server before).
+- A panic of the engine thread ends the process from a panic hook (`_exit(101)` before any unwinding: dropping
+  the engine joins the driver thread); a panic of the driver thread does the same from a drop guard.
+  `QX_DS_PANIC_AFTER_CHUNKS=N` panics the engine thread after its Nth chunk (test).
+
+Three-slot server, `--ctx 262144 --window 128`, `QX_DS_VRAM=20 QX_DS_RAM=95`, chunk120, default mode, one run
+each (windows = `QX_DS_CHUNK_MIN=100000`; prompt time + the 64-token reply):
+
+| prompt (fresh server, in this order) | windows | chunks (default) | with the blind prefetch (`PREFETCH_MIN=0`) | in f16 (`F16_MIN=0`) |
+|---|--:|--:|--:|--:|
+| 79 tokens | 3.58 + 4.14 s | 1.54 + 3.91 s | 1.80 s | 1.52 s |
+| 186 tokens | 8.52 + 2.82 | 2.22 + 2.96 | 2.31 | 2.06 |
+| 232 tokens | 9.35 + 2.72 | 2.52 + 2.98 | 2.60 | 2.27 |
+| 128 tokens | 7.02 + 2.94 | 1.78 + 2.93 | 1.89 | 1.67 |
+| 111 tokens (the fifth request: tiers warmed) | 2.27 + 2.36 | 1.64 + 2.53 | 1.77 | 1.57 |
+| 79 tokens, three times (warm repeats) | 3.56, 2.08, 1.55 | 1.54, 1.46, 1.45 | | |
+| 128 tokens, three times | 7.13, 2.54, 2.32 | 1.78, 1.75, 1.74 | | |
+| after a shared prefix (exact knob): 156 new tokens at 1,626 | 3.09 | 1.94 | | |
+| 127 new tokens at 1,770 | 2.03 | 1.65 | | |
+
+The reply after a chunk is 0.14-0.26 s slower than after windows on the 186-, 232- and 111-token rows (a chunk
+leaves the tiers less adapted to the prompt than its windows did); prompt plus reply: 7.72 -> 5.45, 11.34 -> 5.18,
+12.07 -> 5.50, 9.96 -> 4.71, 4.63 -> 4.17 s.
+
+Three-turn loadgen (`--levels 1,3 --rounds 2 --turns 3 --max-tokens 64 --warmup 6`; turns 2 and 3 are stretches
+of ~120-230 tokens), windows -> chunks: one client: wall 23.4 -> 22.1 s, TTFT median / p90 1.43 / 2.59 -> 1.33 /
+1.87 s, per-request decode 25.94 -> 25.63 tok/s; three clients: wall 61.3 -> 55.9 s, aggregate 18.78 -> 20.60
+tok/s, TTFT 2.95 / 5.77 -> 1.45 / 2.03 s, per-request decode 9.31 -> 8.43 tok/s (-9%: a decoder waits behind the
+others' chunks; chunk119 read 9.00 -> 8.32, chunk117 9.33 -> 8.08, exp13 9.19 -> 8.08, those three with f16
+short chunks). The trade: the first token comes in half the time and the session ends 9% sooner; each stream
+decodes 8-13% slower under three clients.
+
+Long prompts: three sequential prompts 10.97 / 4.51 / 3.41 s (default; as before); two at once and A beside B
+were rerun with the exact knob only (31.49 / 30.13 s; 18.78 s and A's reply 24.37 s: as chunk115).
+
+### Exactness (chunk120, chain V25)
+- Tail dumps of the warmed 2,048- and 16,384-token prompts byte-identical to chunk113's; prefill256k's default
+  dump byte-identical to `po3.bin` (f16 on long chunks unchanged); exact knob 64 / 64 tail rows bit-identical to
+  `pe.bin`.
+- `tools/ds-checks.sh` parts b and a: text-identical to the previous validated runs (v11).
+- Server identity: identical in set D's serve256k session and in a second one (`v26-serve256k-082814`: 39.62 /
+  88.57). Three sequential long prompts: replies byte-identical
+  to the previous builds' (`v12b-old.*`).
+- **Default mode, short prompts (79, 186, 232, 128, 111 tokens in sequence) by chunks against by windows: all 316
+  single-row steps' hashes equal, the five replies' texts identical.** The same with the exact knob: 316 / 316,
+  texts identical. An 88-row chunk and the 512 steps after it in `qx-ds-check`, default against the exact knob:
+  600 of 600 rows identical.
+- Exact knob, two prompts at once against the old binary's trace `t0`: 60/60 on both slots. A alone against A
+  beside B: 98/98; B 64/64.
+- Exact knob, a 79-token chunk beside a decoder: A 98/98 against alone, C's last 60 rows equal to C alone in
+  windows (chunk115's trace), text identical.
+- Exact knob, a rewind then a short chunk (156 rows at 1,626, 127 rows at 1,770) against windows: the three
+  replies identical; single-row steps 190 against 191 (the windows arm ends one prompt with a one-row window),
+  equal 127 from the start and 63 from the end: all 190. (These arms set the exact knob, so their 1,638-row
+  chunk is exact too.)
+- Default mode, a short exact chunk after an f16 chunk in the same process (chain V26: the same three prompts
+  without the exact knob; `ffn wide true` on the 1,638-row chunk; default against `QX_DS_CHUNK_MIN=256`, where
+  the short stretches run in windows): single-row steps 190 against 191, equal 127 from the start and 63 from
+  the end; the three replies identical. The short stretches: 1.94 and 1.65 s against 5.21 and 2.84 s.
+- Exact knob, four-turn conversation, chunks against windows (exp13): the four replies identical.
+- A short exact chunk first, then the process's first f16 chunk (chain X1, default mode): `gemm.cu` loads at the
+  second chunk, no panic, the 1,638-token prompt's reply byte-identical to the previous builds'; the same with
+  the short prompt's reply still decoding (200 tokens): identical.
+- The panic hook: with `QX_DS_PANIC_AFTER_CHUNKS=1` the server printed the panic and "fatal: the engine thread
+  panicked; exiting" once and the process was gone 7.6 s after the request was sent (a 1.9 s chunk, then the
+  kernel releasing ~100 GB of pinned tiers). The load-error path was
+  not exercised (an attempt with `QX_DS_VRAM=200` was clamped and loaded normally); by reading it returns
+  without panicking.
+
+### Set D and guards
+Preflight at 07:40:00 (VM shut off, 64,001 MiB free, swap 1,124 of 8,191 MiB used, pressure avg10 0.00, no build
+tools, driver 620.70.06, binaries 3ad605200855 / 8d6080d8d5c0). `setd-promo25-074000`: decode256k 38.9, 38.8
+(baseline 38.55), prefill256k 2.0, serve256k1 39.82, serve256k3 90.58, decode 31.0, prefill128 10.5, serve1
+35.06, serve3 78.49 (from `v25-serve-074732`): 19.164 against 19.166, every case within noise or under the bar.
+Set D has no prompt of 64 tokens (chunk steps 0 in its server sessions): a no-regression guard, no promotion.
+chunk119 (`setd-promo23-060658`): 19.127 with serve256k1 40.57, which the gate printed as a +4.2% regression;
+chunk117 (`setd-promo21-045620`): 19.182, serve256k1 40.92. serve256k1 is the sum of two single-stream requests
+after the six warm-up requests, each "fast" (9.0-9.7 s; 688-852 NVMe misses, 5.0-5.4 s of pool) or "slow"
+(10.2-10.9 s; 1,285-1,449 misses, 6.2-6.8 s) by the tier state the warm-up's arrival order left. Slow-slow was 3
+of the 37 sessions of earlier builds since 2026-11-11 (`setd-promo12`, `v12-serve256k`, `v13-old3`) and 3 of 5 on
+chunk117/119. Alternated sessions (chain V24, chunk115 = 03404da against chunk119, same day): old 39.45, 39.75,
+39.57 (each slow-fast; `v24-old1` and `v24-old3` had the same warm-up order and the same pattern); new 40.63
+(slow-slow), 36.94 (fast-fast), 38.37 (fast-slow); serve256k3 90.58, 90.58, 90.66 against 90.91, 90.91, 90.83;
+identity identical in all six. The row's spread, not a regression; these sessions make no chunk.
+With the level's clients started 50 ms apart (a scratch copy of loadgen, chain STG1, chunk119) the warm-up order
+is the same in four of four sessions and the two requests read 10.21 / 11.42, 10.12 / 10.42, 10.21 / 10.51,
+10.20 / 10.51 s (without: 9.11 / 10.50, 9.07 / 10.62): reproducible; adopting it needs a re-measured baseline
+(backlog).
+
+### Breaker (fresh context, three passes: chunk116's, chunk118's and chunk120's diffs; code reading, no runs)
+No defect that corrupts results. Its notes, handled: `chunk_settle` synced events without the capture lock
+(taken now); a short chunk beside a decoder and a rewind followed by a short chunk were unrun paths (run:
+above); the default of 64 was shown only on cold, solitary prompts (warm repeats and the three-turn loadgen:
+above, with the per-request decode cost); the reply after a chunk is slower (in the table); the eviction cap
+classed chunks of 128 rows or fewer as window ticks (`chunk_tick`; no measurement shows a change: the reply after
+the 79-token chunk 3.91 against 4.44 s once, the others equal); a drop guard would hang in the engine's drop when
+the driver is the cause (panic hook); the generation wrap (zeroed); a short exact chunk before the first f16
+chunk (chain X1). Confirmed by reading: no other path gives a RAM place away while a chunk copy may read it;
+`chunk_ffn_wide` is the only f16 switch (`blas_map` is filled under it and cleared at each chunk's end); the
+hook acts only on the thread named `qx-ds-engine` and `start` has one call site; set D's prompts make no chunk;
+the 8k server has no chunk path (`QX_DS_CHUNK` is set only from 32k of context).
+
+### Adjudication (fresh context)
+HOLD on chunk119: the speed claims, the guard, the panic exit, the gate arithmetic, ds-checks, like-for-like
+and every recomputed figure held; what did not was making f16 the default for 64-255-token prompts on the
+evidence above (one text, the top-1 bound cleared by three rows, a tail at 90.7%). Answered by not doing it:
+short chunks keep the exact kernels (`CHUNK_F16_MIN`), which the adjudicator had noted costs 0.03-0.27 s.
+HOLD on chunk120 for two missing checks (a second identity session on the binary; a short exact chunk after an
+f16 chunk in default mode), LANDED once both read as specified: chain V26, above. Not a promotion: no
+scoreboard row, the baseline stays 19.166. Verified on chunk120: the gate (no flagged row), ds-checks, the
+crates diff equal to the run directory's, every table and trace figure recomputed, `ffn wide` false on the
+short chunks and true on the long ones.
+
+### Tried and not kept
+- `QX_DS_CHUNK_MIN=32` and 128 (above).
+- f16 for chunks under 256 rows (above): 1.52 / 2.06 / 2.27 / 1.67 / 1.57 s against 1.54 / 2.22 / 2.52 / 1.78 /
+  1.64 exact; behind `QX_DS_CHUNK_F16_MIN=0`.
+- V21's KL run (200 tokens with a 512-token tail) made no chunk and compared two identical runs: void.
