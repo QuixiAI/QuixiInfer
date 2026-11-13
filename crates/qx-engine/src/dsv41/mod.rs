@@ -2320,6 +2320,7 @@ impl<'a> DsEngine<'a> {
         let d = self.driver.as_ref().unwrap().shared.clone();
         let mut t_moe = 0f64;
         let (mut t_enq, mut t_sync, mut t_post) = (0f64, 0f64, 0f64);
+        let lane0: Vec<u64> = d.chunk_lane.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
         let mut n_distinct = 0usize;
         let verbose = std::env::var("QX_DS_VERBOSE").is_ok();
         let trace = std::env::var("QX_DS_CHUNK_TRACE").is_ok();
@@ -2526,6 +2527,14 @@ impl<'a> DsEngine<'a> {
             let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
             for (a, &e) in ids.iter().enumerate() {
                 lists[e as usize].push(a as u32);
+            }
+            if prefetch > 0 {
+                // the routing, for the prefetch job still staging its pick: it skips the experts without rows
+                let mut u = d.chunk_used.lock().unwrap();
+                u.0 = generation;
+                u.1.clear();
+                u.1.extend(lists.iter().map(|x| !x.is_empty()));
+                d.chunk_used_gen.store(generation, std::sync::atomic::Ordering::Release);
             }
             // the prefetched experts (the driver's pick, in its copy order), then the used ones it did not cover
             let picked: Vec<u32> = if prefetch > 0 {
@@ -2771,6 +2780,8 @@ impl<'a> DsEngine<'a> {
         self.t_forward = tf.elapsed().as_secs_f64();
         if std::env::var("QX_DS_VERBOSE").is_ok() {
             eprintln!("chunk of {rows} rows at {pos0}{}: {:.0} ms ({:.2} ms per row; host: slab enqueue {:.0} ms, sync on the slab passes {:.0}, expert enqueue {:.0}, post enqueue {:.0}; {} distinct experts per layer, engram {:.0} ms)", if kv_only { " KV-only".to_string() } else if keep_from > 0 { format!(" (full stack from row {keep_from})") } else { String::new() }, self.t_forward * 1e3, self.t_forward * 1e3 / rows as f64, t_enq * 1e3, t_sync * 1e3, t_moe * 1e3, t_post * 1e3, n_distinct / n_layers_run.max(1), self.t_engram * 1e3);
+            let lane: Vec<u64> = d.chunk_lane.iter().zip(&lane0).map(|(a, b)| a.load(std::sync::atomic::Ordering::Relaxed) - b).collect();
+            eprintln!("  chunk lane: driver busy {:.0} ms of the chunk (waiting for a ring slot {:.0} ms, for NVMe reads {:.0} ms and {:.0} ms in their submits, for landing places {:.0} ms, copy calls {:.0} ms); staged {} from RAM, {} from NVMe, {} picks skipped", lane[0] as f64 / 1e6, lane[1] as f64 / 1e6, lane[2] as f64 / 1e6, lane[7] as f64 / 1e6, lane[6] as f64 / 1e6, lane[5] as f64 / 1e6, lane[3], lane[4], lane[8]);
         }
         logits
     }
