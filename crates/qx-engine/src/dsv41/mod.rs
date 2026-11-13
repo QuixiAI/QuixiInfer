@@ -2326,8 +2326,15 @@ impl<'a> DsEngine<'a> {
         let trace = std::env::var("QX_DS_CHUNK_TRACE").is_ok();
         let kv_last = self.kv_last();
         let n_layers_run = if kv_only { kv_last + 1 } else { n_layer };
-        // QX_DS_CHUNK_PREFETCH=0 disables the prefetch job (the experts stream only after the routing is known)
-        let prefetch_on = !std::env::var("QX_DS_CHUNK_PREFETCH").is_ok_and(|v| v == "0");
+        // QX_DS_CHUNK_PREFETCH=0 disables the prefetch job (the experts stream only after the routing is known).
+        // A chunk of fewer than QX_DS_CHUNK_PREFETCH_MIN rows (default 256) posts none: its rows route to a
+        // minority of a layer's experts (137 of them for 79 rows), so most of a blind pick is read for nothing and
+        // the reads it needs queue behind (three-slot 256k server, fresh, with -> without: 79 rows 1,805 -> 1,523
+        // ms and 1,731 -> 1,050 NVMe records; 128: 1,809 -> 1,680; 232: 2,370 -> 2,285; 413: 2,176 -> 2,337;
+        // 1,638: 3,406 -> 4,040; 2026-11-13).
+        static PREFETCH_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let prefetch_min = *PREFETCH_MIN.get_or_init(|| std::env::var("QX_DS_CHUNK_PREFETCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(256));
+        let prefetch_on = !std::env::var("QX_DS_CHUNK_PREFETCH").is_ok_and(|v| v == "0") && rows >= prefetch_min;
         let n_ring = self.abufs.as_ref().map(|ab| ab.stage_cap as usize).unwrap_or(0);
         if chunk_streams() > 1 && self.chunk_side.len() < chunk_streams() {
             let ff = self.cfg.ff_exp;
@@ -2347,7 +2354,14 @@ impl<'a> DsEngine<'a> {
         // free after its warm-up until 2026-11-12; 1.21 GiB since the kernel modules are loaded once per source, not
         // re-measured with cuBLAS), and its prompts keep the exact kernels (`cuBLAS: no handle`), as they do when
         // the launches do not go through the raw launcher (cuBLAS queues on the stream directly).
-        let mut chunk_ffn_wide = chunk_gemm() && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) && self.layers.iter().all(|w| w.g_ffn.blas_ok() && w.g_shd.blas_ok()) && {
+        // A chunk of fewer than QX_DS_CHUNK_F16_MIN rows (default 256) keeps the exact kernels: the server's short
+        // prompts (64-255 tokens, in chunks since 2026-11-13) stay bit-identical to the windows they ran in before,
+        // for 0.03-0.27 s of the 1.5-2.3 s such a chunk takes (f16 against exact: 1.52 / 1.55, 1.67 / 1.79, 2.05 /
+        // 2.24, 2.27 / 2.54 s at 79, 128, 186, 232 rows). f16 on them measured KL 0.019, top-1 95.7% against exact
+        // over 513 rows of one text: inside the contract by three rows, not enough to make it their default.
+        static F16_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let f16_min = *F16_MIN.get_or_init(|| std::env::var("QX_DS_CHUNK_F16_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(256));
+        let mut chunk_ffn_wide = chunk_gemm() && rows >= f16_min && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) && self.layers.iter().all(|w| w.g_ffn.blas_ok() && w.g_shd.blas_ok()) && {
             for m in [&MOE, &DSV41, &LAYER, &qx_gpu::kernel::modules::GEMV, &qx_gpu::kernel::modules::MGEMV, &qx_gpu::kernel::modules::GEMM] {
                 qx_gpu::raw::preload(m);
             }
@@ -2535,6 +2549,11 @@ impl<'a> DsEngine<'a> {
                 u.1.clear();
                 u.1.extend(lists.iter().map(|x| !x.is_empty()));
                 d.chunk_used_gen.store(generation, std::sync::atomic::Ordering::Release);
+            } else {
+                // no routing published for this generation: after 65,535 such layers the counter comes back to the
+                // last published one, and a prefetch job of that generation would skip by a stale routing
+                // (generations are never 0)
+                d.chunk_used_gen.store(0, std::sync::atomic::Ordering::Release);
             }
             // the prefetched experts (the driver's pick, in its copy order), then the used ones it did not cover
             let picked: Vec<u32> = if prefetch > 0 {
@@ -2774,6 +2793,7 @@ impl<'a> DsEngine<'a> {
         self.erows_stride = DS_TMAX;
         self.erows_row0 = 0;
         self.st.pos[slot] += rows;
+        d.chunk_tick.store(true, std::sync::atomic::Ordering::Release);
         d.tokens_done.fetch_add(rows as u64, std::sync::atomic::Ordering::Release);
         self.adapt().expect("tier promotions");
         self.t_phase = [0.0, t_moe, 0.0, 0.0, 0.0];
@@ -2781,7 +2801,7 @@ impl<'a> DsEngine<'a> {
         if std::env::var("QX_DS_VERBOSE").is_ok() {
             eprintln!("chunk of {rows} rows at {pos0}{}: {:.0} ms ({:.2} ms per row; host: slab enqueue {:.0} ms, sync on the slab passes {:.0}, expert enqueue {:.0}, post enqueue {:.0}; {} distinct experts per layer, engram {:.0} ms)", if kv_only { " KV-only".to_string() } else if keep_from > 0 { format!(" (full stack from row {keep_from})") } else { String::new() }, self.t_forward * 1e3, self.t_forward * 1e3 / rows as f64, t_enq * 1e3, t_sync * 1e3, t_moe * 1e3, t_post * 1e3, n_distinct / n_layers_run.max(1), self.t_engram * 1e3);
             let lane: Vec<u64> = d.chunk_lane.iter().zip(&lane0).map(|(a, b)| a.load(std::sync::atomic::Ordering::Relaxed) - b).collect();
-            eprintln!("  chunk lane: driver busy {:.0} ms of the chunk (waiting for a ring slot {:.0} ms, for NVMe reads {:.0} ms and {:.0} ms in their submits, for landing places {:.0} ms, copy calls {:.0} ms); staged {} from RAM, {} from NVMe, {} picks skipped", lane[0] as f64 / 1e6, lane[1] as f64 / 1e6, lane[2] as f64 / 1e6, lane[7] as f64 / 1e6, lane[6] as f64 / 1e6, lane[5] as f64 / 1e6, lane[3], lane[4], lane[8]);
+            eprintln!("  chunk lane: driver busy {:.0} ms of the chunk (waiting for a ring slot {:.0} ms, for NVMe reads {:.0} ms and {:.0} ms in their submits, for landing places {:.0} ms, copy calls {:.0} ms); staged {} from RAM, {} from NVMe, {} picks skipped, {} settles before a RAM place changed hands", lane[0] as f64 / 1e6, lane[1] as f64 / 1e6, lane[2] as f64 / 1e6, lane[7] as f64 / 1e6, lane[6] as f64 / 1e6, lane[5] as f64 / 1e6, lane[3], lane[4], lane[8], lane[9]);
         }
         logits
     }

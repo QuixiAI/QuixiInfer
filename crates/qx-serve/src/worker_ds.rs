@@ -159,11 +159,25 @@ impl Req<'_> {
     }
 }
 
+const ENGINE_THREAD: &str = "qx-ds-engine";
+
 pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc::Sender<Job>> {
     let (tx, rx) = mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let pack: &'static Gguf = Box::leak(Box::new(Gguf::open(&opt.pack).map_err(|e| anyhow!("pack {}: {e}", opt.pack.display()))?));
-    std::thread::spawn(move || {
+    // A panic of the engine thread leaves a server that accepts requests and answers none (seen 2026-11-13: a
+    // start-up graph capture failed and the process stayed up): leave instead, so a supervisor restarts it. In the
+    // panic hook, before any unwinding: dropping the engine joins the driver thread, which may never return when
+    // the panic is about the driver (`_exit`: no exit handlers under CUDA, no core image of the pinned tiers).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        if std::thread::current().name() == Some(ENGINE_THREAD) {
+            eprintln!("fatal: the engine thread panicked; exiting");
+            unsafe { libc::_exit(101) };
+        }
+    }));
+    std::thread::Builder::new().name(ENGINE_THREAD.into()).spawn(move || {
         // the engine thread off the pool's cores before this thread touches CUDA (rayon built wide first);
         // `dsv41::place_threads` tidies the rest inside the tiered load
         qx_engine::dsv41::pin_engine_early();
@@ -226,6 +240,12 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         let mut kv_only_windows = 0usize;
         let mut chunk_steps = 0usize;
         let chunk_beside = !std::env::var("QX_DS_CHUNK_BESIDE").is_ok_and(|v| v == "0");
+        let panic_after: Option<usize> = std::env::var("QX_DS_PANIC_AFTER_CHUNKS").ok().and_then(|v| v.parse().ok());
+        // The shortest prompt stretch that runs in chunks (QX_DS_CHUNK_MIN; 64 since 2026-11-13, max(window, 256)
+        // before). Fresh three-slot 256k server, windows -> chunks: 79 tokens 3.6 -> 1.8 s, 128: 7.3 -> 1.8,
+        // 186: 9.6 -> 2.2, 232: 9.5 -> 2.4. At 32 the 42-46-token loadgen prompts chunk too and lose (first
+        // token 0.92 -> 1.22 s alone, three at once 13.3 -> 10.2 tok/s per request).
+        let chunk_min: usize = std::env::var("QX_DS_CHUNK_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64).max(1);
         let chunk_gap: usize = std::env::var("QX_DS_CHUNK_GAP").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
         // window steps since the last chunk
         let mut gap_steps = usize::MAX / 2;
@@ -301,11 +321,11 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             let mut plan: Vec<(usize, usize, bool)> = Vec::new(); // (request index, tokens, completes the prompt or decodes)
             let mut out: Vec<f32> = Vec::new();
             // the chunk path (QX_DS_CHUNK=N at start): the longest remaining prompt stretch of at least
-            // max(window, 256) tokens goes through forward_chunk, up to N rows at once, KV-only when at least
+            // `chunk_min` tokens goes through forward_chunk, up to N rows at once, KV-only when at least
             // prompt_keep positions follow. (Since 2026-11-10 a chunk's dense products are f16 tensor-core GEMMs,
             // KL-bounded against the exact path, while windows stay exact; until 2026-11-13 a prompt that arrived
             // beside a decoder ran in exact windows, so its temperature-0 output depended on that.
-            // QX_DS_PREFILL_EXACT=1 keeps chunks exact.)
+            // QX_DS_PREFILL_EXACT=1 keeps chunks exact; chunks under 256 rows are exact anyway: QX_DS_CHUNK_F16_MIN.)
             let chunk_rows = eng.chunk_rows();
             // Beside decoders (since 2026-11-13; QX_DS_CHUNK_BESIDE=0: chunks only while nobody decodes): such a
             // stretch still runs in chunks, and the decoders get `chunk_gap` steps of their own between two chunks
@@ -314,10 +334,10 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             let decoding = running.iter().any(|r| r.next.is_some());
             let chunk_due = !decoding || (chunk_beside && gap_steps >= chunk_gap);
             let chunked = if chunk_rows > 0 && chunk_due {
-                let pick = (0..running.len()).filter(|&i| running[i].job.prompt.len() - running[i].read >= window.max(256)).max_by_key(|&i| running[i].job.prompt.len() - running[i].read);
+                let pick = (0..running.len()).filter(|&i| running[i].job.prompt.len() - running[i].read >= chunk_min).max_by_key(|&i| running[i].job.prompt.len() - running[i].read);
                 if let Some(ri) = pick {
                     // whether another running request still has a prompt stretch that would run in chunks
-                    let others_pending = (0..running.len()).filter(|&i| i != ri).any(|i| running[i].job.prompt.len() - running[i].read >= window.max(256));
+                    let others_pending = (0..running.len()).filter(|&i| i != ri).any(|i| running[i].job.prompt.len() - running[i].read >= chunk_min);
                     let r = &mut running[ri];
                     let rem = r.job.prompt.len() - r.read;
                     // (the last prompt_keep positions alone need the full stack: a chunk's rows before them stop at
@@ -340,6 +360,10 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     }
                     chunk_steps += 1;
                     gap_steps = 0;
+                    // (a test of the panic hook above: QX_DS_PANIC_AFTER_CHUNKS=N panics here after the Nth chunk)
+                    if panic_after == Some(chunk_steps) {
+                        panic!("QX_DS_PANIC_AFTER_CHUNKS={chunk_steps}");
+                    }
                     if r.read == r.job.prompt.len() {
                         r.t_prompt = Some(r.t0.elapsed().as_secs_f64());
                         r.logits = Some(last);
@@ -365,7 +389,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             let d = segs.len();
             gap_steps += 1;
             // a prompt stretch waiting for its chunk (beside decoders) stays out of the windows between chunks
-            let held = |r: &Req| chunk_rows > 0 && chunk_beside && d > 0 && r.job.prompt.len() - r.read >= window.max(256);
+            let held = |r: &Req| chunk_rows > 0 && chunk_beside && d > 0 && r.job.prompt.len() - r.read >= chunk_min;
             let avail: usize = running.iter().filter(|r| r.next.is_none() && r.read < r.job.prompt.len() && !held(r)).map(|r| (r.job.prompt.len() - r.read).min(window)).sum();
             let need = (d + avail).min(DS_TMAX);
             let width = WIDTHS.iter().copied().filter(|&w| w <= need && w <= DS_TMAX).max().unwrap_or(d).max(d);
@@ -431,9 +455,9 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 }
                 row += n;
             }
-            // a prompt that ended in a window (a remainder under 256 tokens after its chunks: QX_DS_SKIP=0 or a small
+            // a prompt that ended in a window (a remainder under `chunk_min` after its chunks: QX_DS_SKIP=0 or a small
             // QX_DS_CHUNK) gives the flex tail back too, once no stretch waits for a chunk (a no-op when not held)
-            if prompt_done && chunk_rows > 0 && !running.iter().any(|r| r.next.is_none() && r.job.prompt.len() - r.read >= window.max(256)) {
+            if prompt_done && chunk_rows > 0 && !running.iter().any(|r| r.next.is_none() && r.job.prompt.len() - r.read >= chunk_min) {
                 eng.chunk_release();
             }
             // sample for every request with a distribution
@@ -507,7 +531,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 }
             }
         }
-    });
+    }).map_err(|e| anyhow!("engine thread: {e}"))?;
     ready_rx.recv().map_err(|_| anyhow!("engine thread ended"))?.map_err(|e| anyhow!(e))?;
     Ok(tx)
 }

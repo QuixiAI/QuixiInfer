@@ -68,13 +68,15 @@ pub struct Shared {
     /// Chunk jobs, for the chunk's verbose line (ns and counts): [time inside serve_chunk, of it waiting for a ring
     /// slot, of it waiting for NVMe reads, records staged from RAM, records staged from NVMe, time in the copy
     /// calls, waiting for landing places, in the read submits, picks skipped].
-    pub chunk_lane: [AtomicU64; 9],
+    pub chunk_lane: [AtomicU64; 10],
     /// The routing of the chunk layer whose prefetch job has generation `chunk_used_gen`: which experts have rows
     /// (the engine publishes it as soon as it has the lists; the prefetch job then skips the picks without rows).
     pub chunk_used: std::sync::Mutex<(u64, Vec<bool>)>,
     pub chunk_used_gen: AtomicU64,
     /// Set by the host after each token (the sampled token is known): the driver may run its promotions.
     pub tokens_done: AtomicU64,
+    /// Set with `tokens_done` by a prompt chunk: the next `adapt` is a chunk's tick whatever its row count.
+    pub chunk_tick: std::sync::atomic::AtomicBool,
     /// A request for the live ranking (every expert, hottest first: VRAM residents, then RAM, then NVMe, each by
     /// decayed score), answered by the driver into `profile`.
     pub profile_req: AtomicBool,
@@ -225,6 +227,7 @@ impl Driver {
             pre_nvme: Default::default(),
             pre_skipped: Default::default(),
             tokens_done: Default::default(),
+            chunk_tick: Default::default(),
             profile_req: AtomicBool::new(false),
             profile: std::sync::Mutex::new(None),
             capture: std::sync::Mutex::new(()),
@@ -238,7 +241,21 @@ impl Driver {
         // a host allocation that synchronizes with the device would otherwise deadlock against the first post
         // kernel spinning on the mailbox
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-        let thread = std::thread::spawn(move || run(sh, host, cpus, ready_tx));
+        let thread = std::thread::spawn(move || {
+            // a panic here leaves the engine waiting for a job nobody answers: leave the process instead
+            // (`_exit`: no exit handlers under CUDA, no core image of the pinned tiers)
+            struct Fatal;
+            impl Drop for Fatal {
+                fn drop(&mut self) {
+                    if std::thread::panicking() {
+                        eprintln!("fatal: the expert driver thread panicked; exiting");
+                        unsafe { libc::_exit(101) };
+                    }
+                }
+            }
+            let _fatal = Fatal;
+            run(sh, host, cpus, ready_tx)
+        });
         let _ = ready_rx.recv();
         Self { shared, thread: Some(thread) }
     }
@@ -306,6 +323,9 @@ struct Loop {
     chunk_batch_no: usize,
     /// A chunk job staged copies since the last `chunk_settle`.
     chunk_staged: bool,
+    /// The records staged from their RAM places since the last `chunk_settle`: a place among them may still be
+    /// read by a queued copy, so whoever reuses it settles first (`chunk_guard`).
+    chunk_ram: std::collections::HashSet<usize>,
     /// Whether the GPU learns of the staged records' landing from the ready words (`stage_ready_by_words`) rather
     /// than from a done word this thread posts after waiting for the copies (and after the pool's share).
     stg_words: bool,
@@ -554,6 +574,7 @@ impl Loop {
                 } else if self.host.store.in_ram(g) {
                     let src = self.host.store.place[g] as *const u8;
                     stage(self, g, e, src, ord, &mut slot_user, &mut next_slot, &mut next_stream);
+                    self.chunk_ram.insert(g);
                     n_ram += 1;
                     i += 1;
                 } else {
@@ -576,6 +597,7 @@ impl Loop {
             } else if self.host.store.in_ram(g) {
                 let src = self.host.store.place[g] as *const u8;
                 stage(self, g, e, src, ord, &mut slot_user, &mut next_slot, &mut next_stream);
+                self.chunk_ram.insert(g);
                 n_ram += 1;
                 i += 1;
             } else {
@@ -638,6 +660,10 @@ impl Loop {
     /// area): whoever uses either next (a window's misses) may then overwrite them.
     fn chunk_settle(&mut self) {
         if self.chunk_staged {
+            // (an event sync during a graph capture fails and spoils the capture: `Shared::capture`. `serve` cannot
+            // coincide with one, but `chunk_guard` calls this from the idle loop.)
+            let sh = self.shared.clone();
+            let _not_capturing = sh.as_ref().map(|s| s.capture.lock().unwrap());
             for si in 0..self.stage_streams.len() {
                 unsafe {
                     cudarc::driver::result::event::record(self.stage_events[si], self.stage_streams[si]).expect("event record");
@@ -646,6 +672,17 @@ impl Loop {
             }
             self.chunk_staged = false;
             self.chunk_events_pending = [false; 8];
+        }
+        self.chunk_ram.clear();
+    }
+
+    /// Before the RAM place of record `g` is given to another record: if a chunk job staged `g` from it since
+    /// the last settle, its copy may still be queued, so wait for the chunk copies (2026-11-13; until then a
+    /// promotion right after a chunk job could overwrite a place a queued copy had yet to read).
+    fn chunk_guard(&mut self, sh: &Shared, g: usize) {
+        if self.chunk_ram.contains(&g) {
+            sh.chunk_lane[9].fetch_add(1, Ordering::Relaxed);
+            self.chunk_settle();
         }
     }
 
@@ -917,7 +954,9 @@ impl Loop {
         // refilled by the next ticks' own budgets (capping them too read prefill128 10.5 -> 15.8 and decode256k
         // 38.6 -> 39.4, 2026-11-11). QX_DS_EVICT_CAP=N (default the per-token budget; 0: no cap, as before).
         static EVICT_CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-        let evict_cap = if dt <= crate::dsv41::DS_TMAX {
+        // (a chunk of at most DS_TMAX rows is a chunk's tick too: the engine flags it, 2026-11-13)
+        let chunk_tick = sh.chunk_tick.swap(false, Ordering::AcqRel);
+        let evict_cap = if dt <= crate::dsv41::DS_TMAX && !chunk_tick {
             usize::MAX
         } else {
             match *EVICT_CAP.get_or_init(|| std::env::var("QX_DS_EVICT_CAP").ok().and_then(|v| v.parse::<usize>().ok())) {
@@ -964,6 +1003,7 @@ impl Loop {
                             let (inflight, pre_inflight, d2h) = (&self.inflight, &self.pre_inflight, &self.d2h);
                             let dup = h.holder.values().copied().filter(|&x| x != v && h.layer_class[x / ne] == c && h.table[x] != 0 && h.store.in_ram(x) && !(fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp) && !inflight.contains(&x) && !pre_inflight.contains(&x) && !d2h.iter().any(|d| d.0 == x)).max_by(|&p, &q| h.score[p].partial_cmp(&h.score[q]).unwrap());
                             if let Some(x) = dup {
+                                self.chunk_guard(sh, x);
                                 if let Some((_, p)) = self.host.store.evict_deferred(x) {
                                     self.write_rentry(x, 0);
                                     let nb = self.host.store.record_bytes(v);
@@ -1294,6 +1334,7 @@ impl Loop {
             if dup.is_some() {
                 sh.ram_dedups.fetch_add(1, Ordering::Relaxed);
             }
+            self.chunk_guard(sh, v);
             self.write_rentry(v, 0);
             if self.host.gpu_reads_ram {
                 if let Some((cc, p)) = self.host.store.evict_deferred(v) {
@@ -1385,7 +1426,7 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
     let mk_events = || -> Vec<cudarc::driver::sys::CUevent> { (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect() };
     let chunk_events = std::array::from_fn(|_| mk_events());
-    let mut lp = Loop { host, pool, shared: Some(sh.clone()), chunk_events, chunk_events_pending: [false; 8], chunk_batch_no: 0, chunk_staged: false, ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), wb: Vec::new(), d2h: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
+    let mut lp = Loop { host, pool, shared: Some(sh.clone()), chunk_events, chunk_events_pending: [false; 8], chunk_batch_no: 0, chunk_staged: false, chunk_ram: Default::default(), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), wb: Vec::new(), d2h: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
     for par in 0..2 {
         lp.pre_free[par] = (0..lp.host.pre_slots).map(|i| lp.host.pred_stage_base + ((par * lp.host.pre_slots + i) * lp.host.rec_max) as u64).collect();
     }
