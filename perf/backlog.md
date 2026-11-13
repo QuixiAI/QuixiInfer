@@ -9,6 +9,23 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-13 (chunks beside decoders landed)
+1. **`promote_one` after a chunk job** may take a RAM place whose staging copy is still queued (breaker,
+   2026-11-12 evening; pre-existing, narrow). A guard is written in the worktree (`chunk_guard`: settle before a
+   place staged since the last settle changes hands, with a counter in the lane line): build, count, validate.
+2. **The NVMe reads of a prompt chunk** (2k chunk 3.24 s: 3,048 reads, 2,356 of them used). Not tried: the next
+   layer's routing predicted from this layer's router input; VRAM a short prompt does not need lent to NVMe-tier
+   experts; a sliding window of reads.
+3. **Windows beside a decoder** (2.5-6 s per 128-wide window in the three-slot 256k server; stretches under 256
+   tokens still take them: a 79-token prompt 3.1 s with the exact knob, 3.6 s alone on a fresh server). Why a full-stack window is that slow with the tail out.
+4. **The tokens right after a long prompt in the three-slot server** (first steps 174, 102, 82, 79 ms).
+5. **serve256k1's spread** (37.0-39.2 over six sessions): loadgen's six warm-up requests race for three slots.
+6. **The ring-slot waits of long prompts** (~0.9-1.05 s per 8,192-row chunk): back-pressure or loss? (`QX_DS_STAGE_CAP`).
+7. **A start-up capture panic** (once in ~30 starts, 2026-11-13): the engine thread dies, the process stays up.
+8. The longest gap between two stream deltas beside a long prompt is one chunk (9-16 s at 250k by prefill256k's chunks in `qx-ds-check`, not measured beside a decoder): untimed; a
+   smaller chunk beside decoders would trade the prompt's time for it.
+9. Carried: the Engram projection in f16; expert arithmetic in f16; the outlier of a fresh process.
+
 ### Queue as of 2026-11-12, evening (picks skipped after the routing landed; a short prompt is bounded by the disk)
 1. **Chunks while another slot decodes** (unchanged: slot 1's 10,031-token prompt 83 s with the exact knob, 54.8 s
    default, beside a 13k prompt). The largest gap under load.

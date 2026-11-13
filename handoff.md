@@ -1,6 +1,21 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-12)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-13)
 
 
+
+## Resume 2026-11-13: long prompts run in chunks beside decoders (a 10k prompt arriving mid-reply 197 -> 9 s); baseline unchanged (19.166)
+- **Landed** (adjudicator: HOLD, then LANDED) `perf/results/2026-11-13/setd-promo17-032618` and
+  `setd-promo18-034659` (binaries `~/qx-bins/chunk115`, in
+  `target/release`; only `quixiinfer` differs from chunk113): set D 19.353 and 19.224 against 19.166, within noise (set D
+  has no such prompt: not promoted). Three-slot 256k server: a 10,031-token prompt arriving beside a reply
+  196.6 -> 9.0 s, the reply over 197 s (cut at 93 of 176 tokens by the client's limit) -> 18.7 s; two long prompts at once: second 72.0 -> 15.4 s, first's reply
+  64.9 -> 9.1 s; a 413-token prompt mid-reply 23.9 -> 2.4 s. Row hashes alone vs beside equal, exact and default.
+- Knobs: `QX_DS_CHUNK_BESIDE=0` (old policy), `QX_DS_CHUNK_GAP` (decode steps between two chunks, default 4).
+- A decoder waits one chunk at a time (4-6 s at 10k; 9-16 s at 250k positions by prefill256k's chunks, not
+  measured beside a decoder).
+- Seen once: a start-up graph-capture panic ("No room for 56 bytes ... a graph capture is recording"); the
+  process stays up with a dead engine thread.
+- `~/qx-chains/time1.sh` now waits for free GPU memory, not only used.
+- Next: the backlog's queue of 2026-11-13 (the `chunk_guard` patch is in `~/qx-wt/exp`, unbuilt).
 
 ## Resume 2026-11-12 (evening): short prompts 15-58% faster (prefetch picks skipped once the routing is known, NVMe batches of 8, eight event sets); baseline unchanged (19.166)
 - **Landed** (adjudicator: LANDED) `perf/results/2026-11-12/setd-promo15-215438` (binaries `~/qx-bins/chunk113`, in
