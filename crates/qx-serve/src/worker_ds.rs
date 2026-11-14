@@ -239,6 +239,9 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         let keep = eng.prompt_keep();
         let mut kv_only_windows = 0usize;
         let mut chunk_steps = 0usize;
+        let mut multi_chunks = 0usize;
+        let chunk_multi = !std::env::var("QX_DS_CHUNK_MULTI").is_ok_and(|v| v == "0");
+        let chunk_f16_min: usize = std::env::var("QX_DS_CHUNK_F16_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
         let chunk_beside = !std::env::var("QX_DS_CHUNK_BESIDE").is_ok_and(|v| v == "0");
         let panic_after: Option<usize> = std::env::var("QX_DS_PANIC_AFTER_CHUNKS").ok().and_then(|v| v.parse().ok());
         // The shortest prompt stretch that runs in chunks (QX_DS_CHUNK_MIN; 64 since 2026-11-13, max(window, 256)
@@ -336,9 +339,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             let chunked = if chunk_rows > 0 && chunk_due {
                 let pick = (0..running.len()).filter(|&i| running[i].job.prompt.len() - running[i].read >= chunk_min).max_by_key(|&i| running[i].job.prompt.len() - running[i].read);
                 if let Some(ri) = pick {
-                    // whether another running request still has a prompt stretch that would run in chunks
-                    let others_pending = (0..running.len()).filter(|&i| i != ri).any(|i| running[i].job.prompt.len() - running[i].read >= chunk_min);
-                    let r = &mut running[ri];
+                    let r = &running[ri];
                     let rem = r.job.prompt.len() - r.read;
                     // (the last prompt_keep positions alone need the full stack: a chunk's rows before them stop at
                     // the last KV source. QX_DS_CHUNK_MIXED=0: a KV-only chunk up to them, then a chunk of their own)
@@ -347,7 +348,43 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     // experts take about 6 s to stream however few the rows, runs in the last chunk only)
                     let n = if skip_on && rem > keep && (!mixed || rem > chunk_rows) { rem.min(chunk_rows).min(rem - keep) } else { rem.min(chunk_rows) };
                     let keep_from = if skip_on { (rem.saturating_sub(keep)).min(n) } else { 0 };
-                    let last = eng.forward_chunk_keep(r.slot, &r.job.prompt[r.read..r.read + n], keep_from);
+                    // Several short stretches in one chunk (QX_DS_CHUNK_MULTI=0: one request per chunk): the other
+                    // running requests whose remaining prompt stretch would run in a chunk of its own, exact like
+                    // this one (each under the f16 threshold: a part's values are those of its own chunk, so a reply
+                    // does not depend on its company), while the rows fit. The layer's experts are staged once.
+                    let mut mates: Vec<usize> = Vec::new();
+                    if chunk_multi && keep_from == 0 && n == rem && rem < chunk_f16_min {
+                        let mut total = n;
+                        for i in 0..running.len() {
+                            let q = &running[i];
+                            let m = q.job.prompt.len() - q.read;
+                            if i != ri && q.next.is_none() && m >= chunk_min && m < chunk_f16_min && !(skip_on && m > keep) && total + m <= chunk_rows {
+                                mates.push(i);
+                                total += m;
+                            }
+                        }
+                    }
+                    let mut first_out: Option<Vec<f32>> = None;
+                    if !mates.is_empty() {
+                        let mut idx = vec![ri];
+                        idx.extend(&mates);
+                        let mut outs = {
+                            let parts: Vec<(usize, &[u32])> = idx.iter().map(|&i| (running[i].slot, &running[i].job.prompt[running[i].read..])).collect();
+                            eng.forward_chunk_parts(&parts)
+                        };
+                        first_out = Some(std::mem::take(&mut outs[0]));
+                        for (&i, o) in idx.iter().zip(outs).skip(1) {
+                            let q = &mut running[i];
+                            q.read = q.job.prompt.len();
+                            q.t_prompt = Some(q.t0.elapsed().as_secs_f64());
+                            q.logits = Some(o);
+                        }
+                        multi_chunks += 1;
+                    }
+                    // whether another running request still has a prompt stretch that would run in chunks
+                    let others_pending = (0..running.len()).filter(|&i| i != ri).any(|i| running[i].job.prompt.len() - running[i].read >= chunk_min);
+                    let r = &mut running[ri];
+                    let last = match first_out { Some(o) => o, None => eng.forward_chunk_keep(r.slot, &r.job.prompt[r.read..r.read + n], keep_from) };
                     r.read += n;
                     // the flex tail back to the tiers once this prompt's chunks are done and no other running request
                     // still has a prompt stretch that would run in chunks
@@ -504,7 +541,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 }
             }
             if stats && (steps % 200 == 0 || running.is_empty()) {
-                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}, chunk steps {chunk_steps}", running.len(), waiting.len(), width_hist);
+                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}, chunk steps {chunk_steps} ({multi_chunks} of several slots)", running.len(), waiting.len(), width_hist);
                 if acc_steps > 0 {
                     let k = acc_steps as f64 / 1e3;
                     // the wall between forwards is everything outside the engine: host sampling, detokenizing,

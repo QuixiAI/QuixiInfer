@@ -2223,7 +2223,7 @@ impl<'a> DsEngine<'a> {
     /// two chunks give.
     pub fn forward_chunk_keep(&mut self, slot: usize, toks: &[u32], keep_from: usize) -> Vec<f32> {
         let kv_only = keep_from >= toks.len();
-        let out = self.forward_chunk_inner(slot, toks, keep_from.min(toks.len()));
+        let out = self.forward_chunk_inner(&[(slot, toks)], keep_from.min(toks.len())).pop().unwrap_or_default();
         if sched_trace_on() {
             let t: Vec<String> = toks.iter().map(|t| t.to_string()).collect();
             // (`K slot keep_from tokens`: a chunk with the full stack from row keep_from on; `C` for the two pure forms)
@@ -2237,24 +2237,52 @@ impl<'a> DsEngine<'a> {
         out
     }
 
-    fn forward_chunk_inner(&mut self, slot: usize, toks: &[u32], keep_from: usize) -> Vec<f32> {
+    /// One chunk over the prompt stretches of several slots (`parts`: a slot and its next tokens, each slot once),
+    /// every row through the full stack; returns each part's last row's logits. The rows of a part run in the slabs
+    /// they would run in alone, and no kernel mixes rows, so a part's values are those of a chunk of its own; the
+    /// experts of the layer are staged once for all the parts.
+    pub fn forward_chunk_parts(&mut self, parts: &[(usize, &[u32])]) -> Vec<Vec<f32>> {
+        let out = self.forward_chunk_inner(parts, 0);
+        if sched_trace_on() {
+            // (traced as the chunks of their own they are equal to: a replay runs them one by one)
+            for (&(slot, toks), o) in parts.iter().zip(&out) {
+                let t: Vec<String> = toks.iter().map(|t| t.to_string()).collect();
+                sched_trace(&format!("C {slot} 0 {}", t.join(",")));
+                sched_trace(&format!("H {}", row_hashes(o, 1)));
+            }
+        }
+        out
+    }
+
+    fn forward_chunk_inner(&mut self, parts: &[(usize, &[u32])], keep_from: usize) -> Vec<Vec<f32>> {
         let tf = std::time::Instant::now();
         self.t_experts = 0.0;
+        assert!(!parts.is_empty() && (parts.len() == 1 || keep_from == 0), "a chunk of several slots runs every row through the full stack");
+        for (i, a) in parts.iter().enumerate() {
+            assert!(a.0 < self.slots && !a.1.is_empty() && parts[..i].iter().all(|b| b.0 != a.0), "chunk parts: a slot twice, an empty part or a slot out of range");
+        }
+        let toks_all: Vec<u32> = parts.iter().flat_map(|p| p.1.iter().copied()).collect();
+        let toks = &toks_all[..];
+        let slot = parts[0].0;
         let rows = toks.len();
         let kv_only = keep_from >= rows;
         let rows_max = self.chunk.as_ref().map(|c| c.rows).expect("QX_DS_CHUNK=N sets the chunk buffers at load");
         assert!((1..=rows_max).contains(&rows), "chunk of {rows} rows (buffers for {rows_max})");
         assert!(self.driver.is_some() && self.abufs.is_some(), "the chunk path needs the asynchronous driver");
-        assert!(slot < self.slots);
         let (k, ne, ff, n_layer, n_vocab) = (self.cfg.n_expert_used, self.cfg.n_expert, self.cfg.ff_exp, self.cfg.n_layer, self.cfg.n_vocab);
         let clamp_exp: Vec<f32> = self.cfg.clamp_exp.clone();
         let pos0 = self.st.pos[slot];
-        let positions: Vec<u32> = (0..rows).map(|i| (pos0 + i) as u32).collect();
-        let slots_v: Vec<u32> = vec![slot as u32; rows];
-        let segs: Vec<(usize, u32)> = toks.iter().map(|&t| (slot, t)).collect();
-        for &t in toks {
-            assert!((t as usize) < n_vocab, "token id {t} outside the vocabulary");
-            self.st.tokens[slot].push(t);
+        let (mut positions, mut slots_v, mut segs, mut part_r0): (Vec<u32>, Vec<u32>, Vec<(usize, u32)>, Vec<usize>) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for &(sl, pt) in parts {
+            part_r0.push(positions.len());
+            let p0 = self.st.pos[sl];
+            for (i, &t) in pt.iter().enumerate() {
+                assert!((t as usize) < n_vocab, "token id {t} outside the vocabulary");
+                positions.push((p0 + i) as u32);
+                slots_v.push(sl as u32);
+                segs.push((sl, t));
+                self.st.tokens[sl].push(t);
+            }
         }
         // the Engram rows of every row: on a thread from here on, while the dry passes and the first layers run
         // (each engram layer waits for its rows)
@@ -2267,13 +2295,16 @@ impl<'a> DsEngine<'a> {
         // the slabs: full ones of DS_TMAX, then the remainder in the widths every server warms (never 5 or 7:
         // their kernels are not loaded behind a sealed kernel set, and width 5's multi-GEMV is not bit-identical)
         // (a slab ends at `keep_from`: the rows before it and the rows from it on part ways at the last KV source)
+        // (a slab lies within one part: a part's rows run at the widths they would run at alone)
         let mut slabs: Vec<(usize, usize)> = Vec::new();
-        let mut r0 = 0;
-        while r0 < rows {
-            let left = if r0 < keep_from { keep_from - r0 } else { rows - r0 };
-            let t = [128usize, 96, 64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1].into_iter().find(|&w| w <= left.min(DS_TMAX)).unwrap();
-            slabs.push((r0, t));
-            r0 += t;
+        for (pi, &(_, pt)) in parts.iter().enumerate() {
+            let (mut r0, end) = (part_r0[pi], part_r0[pi] + pt.len());
+            while r0 < end {
+                let left = if r0 < keep_from { keep_from - r0 } else { end - r0 };
+                let t = [128usize, 96, 64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1].into_iter().find(|&w| w <= left.min(DS_TMAX)).unwrap();
+                slabs.push((r0, t));
+                r0 += t;
+            }
         }
         // the dry passes of the slab widths, on the ordinary scratch with the first rows' arrays (the previous
         // forward synced, so nothing is in flight)
@@ -2289,7 +2320,8 @@ impl<'a> DsEngine<'a> {
         widths.sort_unstable();
         widths.dedup();
         for &w in &widths {
-            self.warm_width(w, pos0, pos0 + w - 1);
+            let (lo, hi) = (positions[..w].iter().copied().min().unwrap() as usize, positions[..w].iter().copied().max().unwrap() as usize);
+            self.warm_width(w, lo, hi);
         }
         // QX_RAW_LAUNCH=1: this pass's launches through the driver API on CubeCL's stream (qx_gpu::raw)
         let _raw = qx_gpu::raw::Scope::enter();
@@ -2361,7 +2393,7 @@ impl<'a> DsEngine<'a> {
         // over 513 rows of one text: inside the contract by three rows, not enough to make it their default.
         static F16_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let f16_min = *F16_MIN.get_or_init(|| std::env::var("QX_DS_CHUNK_F16_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(256));
-        let mut chunk_ffn_wide = chunk_gemm() && rows >= f16_min && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) && self.layers.iter().all(|w| w.g_ffn.blas_ok() && w.g_shd.blas_ok()) && {
+        let mut chunk_ffn_wide = chunk_gemm() && parts.iter().all(|p| p.1.len() >= f16_min) && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) && self.layers.iter().all(|w| w.g_ffn.blas_ok() && w.g_shd.blas_ok()) && {
             for m in [&MOE, &DSV41, &LAYER, &qx_gpu::kernel::modules::GEMV, &qx_gpu::kernel::modules::MGEMV, &qx_gpu::kernel::modules::GEMM] {
                 qx_gpu::raw::preload(m);
             }
@@ -2530,7 +2562,7 @@ impl<'a> DsEngine<'a> {
                 if predict_mode() == 1 {
                     self.predict_pre(l, t, false);
                 }
-                went_on = self.layer_attn(l, t, pos0 + r0, pos0 + r0 + t - 1, &mut None, r0 < keep_from);
+                went_on = self.layer_attn(l, t, positions[r0] as usize, positions[r0 + t - 1] as usize, &mut None, r0 < keep_from);
                 if !went_on {
                     continue;
                 }
@@ -2858,13 +2890,22 @@ impl<'a> DsEngine<'a> {
         if let Some((h, _)) = engram_job.take() {
             h.join().expect("engram thread");
         }
-        let (r0, t) = slab(n_slabs - 1);
-        self.chunk_views(r0, t);
-        if !kv_only {
-            self.layer_head(t, &mut None);
+        // each part's last row's logits (its last slab's head)
+        let mut logits: Vec<Vec<f32>> = Vec::new();
+        if kv_only {
+            let (r0, t) = slab(n_slabs - 1);
+            self.chunk_views(r0, t);
+            self.gpu.sync();
+        } else {
+            for (pi, &(_, pt)) in parts.iter().enumerate() {
+                let end = part_r0[pi] + pt.len();
+                let (r0, t) = slabs.iter().copied().find(|&(r0, t)| r0 + t == end).unwrap();
+                self.chunk_views(r0, t);
+                self.layer_head(t, &mut None);
+                self.gpu.sync();
+                logits.push(self.s.logits.download_at::<f32>((t - 1) * n_vocab * 4, n_vocab));
+            }
         }
-        self.gpu.sync();
-        let logits = if kv_only { Vec::new() } else { self.s.logits.download_at::<f32>((t - 1) * n_vocab * 4, n_vocab) };
         // the window scratch back
         self.blas_map.borrow_mut().clear();
         let [r, pre_prev, pre_f, post, comb, x, ids_b, wts, tok, pos, slot_b] = saved;
@@ -2876,14 +2917,16 @@ impl<'a> DsEngine<'a> {
         self.st.sels = saved_sels;
         self.erows_stride = DS_TMAX;
         self.erows_row0 = 0;
-        self.st.pos[slot] += rows;
+        for &(sl, pt) in parts {
+            self.st.pos[sl] += pt.len();
+        }
         d.chunk_tick.store(true, std::sync::atomic::Ordering::Release);
         d.tokens_done.fetch_add(rows as u64, std::sync::atomic::Ordering::Release);
         self.adapt().expect("tier promotions");
         self.t_phase = [0.0, t_moe, 0.0, 0.0, 0.0];
         self.t_forward = tf.elapsed().as_secs_f64();
         if std::env::var("QX_DS_VERBOSE").is_ok() {
-            eprintln!("chunk of {rows} rows at {pos0}{}: {:.0} ms ({:.2} ms per row; host: slab enqueue {:.0} ms, sync on the slab passes {:.0}, expert enqueue {:.0}, post enqueue {:.0}; {} distinct experts per layer, engram {:.0} ms)", if kv_only { " KV-only".to_string() } else if keep_from > 0 { format!(" (full stack from row {keep_from})") } else { String::new() }, self.t_forward * 1e3, self.t_forward * 1e3 / rows as f64, t_enq * 1e3, t_sync * 1e3, t_moe * 1e3, t_post * 1e3, n_distinct / n_layers_run.max(1), self.t_engram * 1e3);
+            eprintln!("chunk of {rows} rows at {pos0}{}{}: {:.0} ms ({:.2} ms per row; host: slab enqueue {:.0} ms, sync on the slab passes {:.0}, expert enqueue {:.0}, post enqueue {:.0}; {} distinct experts per layer, engram {:.0} ms)", if kv_only { " KV-only".to_string() } else if keep_from > 0 { format!(" (full stack from row {keep_from})") } else { String::new() }, if parts.len() > 1 { format!(" ({} slots: {})", parts.len(), parts.iter().map(|p| format!("{} rows of slot {}", p.1.len(), p.0)).collect::<Vec<_>>().join(", ")) } else { String::new() }, self.t_forward * 1e3, self.t_forward * 1e3 / rows as f64, t_enq * 1e3, t_sync * 1e3, t_moe * 1e3, t_post * 1e3, n_distinct / n_layers_run.max(1), self.t_engram * 1e3);
             let lane: Vec<u64> = d.chunk_lane.iter().zip(&lane0).map(|(a, b)| a.load(std::sync::atomic::Ordering::Relaxed) - b).collect();
             eprintln!("  chunk lane: driver busy {:.0} ms of the chunk (waiting for a ring slot {:.0} ms, for NVMe reads {:.0} ms and {:.0} ms in their submits, for landing places {:.0} ms, copy calls {:.0} ms); staged {} from RAM, {} from NVMe, {} picks skipped, {} settles before a RAM place changed hands; NVMe reads submitted before the routing {} ({} of them used), {:.0} ms held for it", lane[0] as f64 / 1e6, lane[1] as f64 / 1e6, lane[2] as f64 / 1e6, lane[7] as f64 / 1e6, lane[6] as f64 / 1e6, lane[5] as f64 / 1e6, lane[3], lane[4], lane[8], lane[9], lane[10], lane[11], lane[12] as f64 / 1e6);
         }
