@@ -4258,3 +4258,124 @@ Question: backlog item 7 (one start in ~35 on 2026-11-13 panicked in the warm-up
 Next: carry the diagnostic line unconditionally in the next build that is validated anyway (it prints only on such
 a miss), so the next occurrence names the words. Raw: `perf/results/2026-11-14/x-startup-panic/`.
 
+## 2026-11-14: A deep rewind replays through one trimmed chunk, and a prefix it cannot pay for is not reused — LANDED, default on (2,047 tokens with 1,252 shared: 28.5 -> 4.5 s at the client; 12.5k with 11.7k shared: 7.5 s against 10.9 afresh; exact mode 97.6 -> 14.2 s)
+
+Status: landed, default on; not a promotion (the baseline stays 19.166).
+
+Question: the user asked for automatic prefix caching like vLLM's (backlog item 2 of the morning queue). Measuring
+today's reuse first found it broken for a prefix that ends more than 128 tokens (`ring_w - n_swa`) before the slot's
+end: `rewind` then rebuilds the rings by replaying up to `replay_span` = 5,208 tokens in uncaptured windows, about
+20 ms per token, and the server's prompt timer started after the rewind, so no log showed it.
+
+Before (three-slot 256k server, client-side seconds, 16-token replies):
+- chunk128 (X19 / X20): 2,047 tokens, 1,252 shared with the slot's 1,638-token prompt: 28.5 s (the server logged
+  2.37 s); afresh 5.16 s.
+- The windows' replay on chunk132 (`QX_DS_REPLAY_CHUNK=0`, X22 w), exact mode: 12,528 tokens, 11,734 shared, 97.6 s
+  (the 12,785-token prompt before it took 22.8 s afresh; the 12,528-token one was not run afresh in exact mode).
+- A prefix ending within the last 128 tokens (the same prompt again, a continuation) is free: 0.72 s (X26 def / X28
+  def, chunk133 / chunk134).
+
+Change (`rewind2.diff`, sha256 fec60138f36f, on 9bb819c; binaries `~/qx-bins/chunk134`: qx-ds-check 0aa49a4ee1c5,
+quixiinfer 188c1688b3cf, qx-ds-multi 58868a9c9863, qx-ds-replay e71d350ed6b7; chunk133 = the same engine tools,
+its server without the last two points; chunk132 = the same engine tools, its server with a threshold of 10,000,
+as chunk131's: no test tells 8,192 from 10,000, every default-arm prefix being 1,252, 10,728 or free):
+1. `replay_to` runs the replay through the chunk path (`forward_chunk_inner` with `replaying` set; the guard on the
+   store and index-key writes is in `layer_attn`, which both paths share) when the engine has chunk buffers and the
+   replay is 64+ tokens. `QX_DS_REPLAY_CHUNK=0`: windows.
+2. In a replay chunk layer l runs its last `n_swa + (n_layer - l) * (n_swa - 1)` rows only, from a slab boundary
+   (the layers below a ring window need 127 more rows each; one layer's worth of margin, as `replay_span` has).
+   `QX_DS_REPLAY_TRIM=0`: every row through every layer.
+3. `rewind_fast`; the scheduler reuses a prefix of 256+ tokens only when the rewind is free or the prefix has
+   `QX_DS_REWIND_DEEP_MIN` tokens (default 8,192); else the prompt runs afresh.
+4. Among free slots sharing equally, the one holding the fewest tokens (ties went to the last in the list: a
+   145-token prompt reset the slot holding a 12.8k prompt while two were empty: X26 d).
+5. The request's clock starts before the rewind.
+
+Exactness of the replay (exact kernels, `QX_DS_PREFILL_EXACT=1`):
+
+| test | result |
+|---|---|
+| X25 c2: `qx-ds-check`, 560 single steps, rewind to 400 by a 400-row replay chunk, positions 400.. again | 160 / 160 rows bit-identical |
+| X25 c1: 1,280 steps, rewind to 1,024 (replay from 0, top layers trimmed) | 256 / 256 |
+| X25 b: 5,632 steps, rewind to 5,376 (the full 5,208-row trimmed replay, at 168) | 256 / 256 (restore 9.05 s) |
+| X22: server, 12,528 tokens with 11,734 shared, trimmed chunk / untrimmed chunk / windows | reply (48 tokens), the 794-row stretch chunk's last-row hash and 63 single-row steps (a warm-up row, 15 decode rows of the first reply, 47 after the deep reuse) equal in the three arms; 14.2 / 21.6 / 97.6 s |
+| X26 a: server, 10,739 tokens with 10,728 shared (the suffix in windows after the replay) against the same prompt afresh (`QX_DS_PREFIX=0`) | reply the same; the last prompt row's hash (`92a95224d6b47a33`) and all 47 decode rows equal |
+| X28 d (chunk134): the same deep reuse while another slot decodes a 93-token reply | the reuse reply equals the fresh arm's (`x26-a-fresh.txt`, chunk133); the decoder's reply equals `x12-t3-off.X.txt` (the same prompt on chunk128 at 07:34, two other requests on that server). The 11-token suffix ran in a 12-wide window with the decoder's row. The decoder's 93 tokens took 14.46 s, 8.25 s of it the replay chunk: a deep rewind runs at admission and stalls the other slots for the whole replay (it is not a chunk step; beside the same prompt afresh, X26 d, the decoder took 25.22 s) |
+
+Before this change `replay_to` had no standing check (ds-checks line 5 rewinds 64 of 128: the free path; the gate's
+states unpark with their rings). X25 is the first; it is not yet in ds-checks.
+
+Default mode, a numerics change: a deep rewind's replay was exact (windows) and is f16 now for 256+ rows, like any
+prompt chunk. Reference comparison (X32 kl, `qx-ds-check` of chunk136 = the worktree build: this engine, the cross-slot copy
+function this path does not call, and a KL print in the check; 1,280 single steps, rewind to 1,024 through an f16
+replay chunk, the 256 rows after it against the straight exact pass): KL mean 0.0063, max 0.129, top-1 249 / 256
+(97.3%); 0 of 256 bit-identical. One shape: a 1,024-row replay at 1k context; the 5,208-row replay has no KL figure. Replies after a deep reuse
+against the same prompt afresh: 16 tokens, four prefixes (X23, texts compared afterwards with `cmp`: 88, 88, 86, 95
+bytes) and one more (X27): the same in all five; 48 tokens after the 10,728-token reuse (X32, chunk134, defaults):
+the texts part at byte 81 of 223 (the reuse arm's suffix runs in exact windows after an f16 replay, the afresh arm
+is two f16 chunks, 7,943 rows KV-only and 2,796; both replies read as the same summary). Both differ from the
+exact-mode reply to that prompt (`x26-a-fresh.txt`, 227 bytes): the reuse arm from byte 81, the afresh arm from byte
+137. Server-side times of the pair: prompt 5.03 s + reply 2.75 s against 9.24 + 2.98 (at the client 7.83 against
+12.27 s, not like for like: the afresh arm is a new server's first request).
+
+Where deep reuse pays (default mode, `QX_DS_REWIND_DEEP_MIN=256` against never; client seconds; chunk132, X23, one
+run per point; the two 7,052 rows chunk133, X27 and X26 thr; the slot's tiers as the previous prompt left them):
+
+| prefix shared | prompt | reuse | afresh |
+|--:|--:|--:|--:|
+| 1,252 | 2,047 | 6.13 | 4.56 |
+| 2,684 | 3,478 | 6.43 | 4.99 |
+| 2,684 | 6,442 | 8.97 | 6.94 |
+| 5,678 | 6,471 | 7.44 | 6.84 |
+| 7,052 | 8,957 | 8.75 / 8.49 | 8.95 / 8.81 |
+| 7,052 | 12,785 | 11.31 | 11.11 |
+| 11,734 | 12,528 | 7.52 | 10.92 |
+
+The replay chunk is ~4.4 s whatever the prefix (5,208 rows) and the stretch after it a chunk of its own; afresh
+grows ~0.67 ms per token. The threshold is bracketed, not measured: 5,678 shared loses 0.6 s, 7,052 is a tie
+inside the repeats' spread (and loses 0.2 s with a long suffix), 11,734 wins 3.4 s, nothing between 7,052 and
+10,728. 8,192 sits on the safe side of the tie.
+
+With the defaults (chunk134, X28 def): 12,785 tokens 11.93 s; the same again 0.72 s; 10,739 tokens with 10,728
+shared 6.14 s (the server now logs 5.01 s for the prompt: the replay is inside); a 1,638-token prompt goes to an
+empty slot; 2,047 tokens with 1,252 shared with that one 4.46 s afresh (28.5 s before).
+
+Single-part chunks and the gate: tail dumps at 2,048 and 16,384 tokens byte-identical to chunk128's (chunk133);
+ds-checks parts a and b the same text as v11's, tokenizer line included (chunk133's tools = chunk134's);
+set D `setd-promo31-174203` (chunk134) 19.177 against 19.166 (decode256k 38.9 / 39.1, prefill256k 2.0, serve256k1
+39.79, serve256k3 90.42, decode 30.9, prefill128 10.5; identity serve256k-1 identical); a second serve256k session
+on chunk134 `x32-serve256k-2-180036`: 38.51 / 90.66, identical; `setd-promo30-170740` (chunk133) 19.212. Preflight
+17:42:03: VM shut off, 3,385 MiB used, swap 1,016 used / 7,175 free, pressure avg10 0.00, no build tools, diff
+fec60138f36f; X19-X23 wrote none (the journal: VM off since 01:03:34, no build overlapping a timing run). No scored
+case rewinds deep. A `json_object` request on chunk134 and on chunk128 (X33): the same response, valid JSON
+(`{"name": "Apollo 11", "year": 1969}`), in `reasoning_content` with an empty `content` on both (not from this
+change; backlog item 3 of the evening queue). Three concurrent requests: the gate's serve256k3.
+
+Breaker (fresh context): no defect found by reading (trim arithmetic, persistent writes in a replay chunk, the flex
+tail, `rewind_fast` against `rewind`); its tests are the X25 rows, X26 a, X28 d and def, and the 7k point of the
+table. Its notes kept open: the threshold tests the prefix, while the crossing also depends on the whole prompt
+(a prompt over 8,192 rows runs in two chunks afresh); a replay chunk prefetches by the chunk's rows, gathers Engram
+rows for all rows and dry-runs up to 40 cuBLAS row counts, so 4.4 s is not the floor; one chunk tick replaces 41
+window ticks in the tier accounting; `qx-ds-replay` cannot verify a trace of a windows replay (the windows are
+traced and run again); a sub-threshold deep prefix now scores as no prefix when slots are chosen. A one-heavy-job
+violation, mine: chains X26 d and X26 thr started in the same second (17:32:16: the wait for d's marker matched
+`X26-FIN-def`), two servers loaded together and thr's died of CUDA out of memory; X26 d ran beside it (an
+exactness test, redone as X28 d) and X27 is the table's 7,052 row. Waits match whole lines since.
+
+Not done: one chunk for the replay and the stretch (the experts staged once: ~2 s); prefix reuse across slots (the
+snapshot / unpark pair exists; a copy needs this replay, so it would pay from the same ~7k tokens).
+
+Raw: `perf/results/2026-11-14/x-deep-rewind/`, `setd-promo31-174203`, `setd-promo30-170740`,
+`x32-serve256k-2-180036`.
+
+### Adjudication (fresh context, 2026-11-14): HOLD, then LANDED, default on, not a promotion
+The hold: one identity session on chunk134's server, no `json_object` request, no reference comparison for the
+default-mode numerics change. Lifted by `x32-serve256k-2-180036` (identical), X33 (the same response on chunk134 and
+chunk128) and X32 kl (KL 0.0063, top-1 97.3%, inside 0.03 / 95%). The reply that parts from the afresh one in
+default mode is inside the contract, which bounds the distribution, not the text: both default arms differ from the
+exact reply, reuse differed from afresh on chunk128 too (X19), and under `QX_DS_PREFILL_EXACT=1` reuse and afresh
+are equal down to the row hashes. Gate 19.166 -> 19.177 (+0.1%), decode256k at the level of every run since
+2026-11-13; no scored case rewinds deep; the win is on the secondary metric (28.5 -> 4.46 s; 97.6 -> 14.2 s, single
+runs). Flags: the next experiment must attack a presupposition (none of the last five did); serve3 not run on
+chunk134; no test tells a threshold of 8,192 from 10,000. Nineteen text corrections over the two passes, applied.
+

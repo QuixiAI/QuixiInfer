@@ -2,6 +2,19 @@
 
 
 
+## Resume 2026-11-14, evening: deep rewinds replay through one trimmed chunk LANDED (prefix reuse no longer costs up to 100 s); prefix copy across slots measured, not yet landed
+- **Landed** `perf/results/2026-11-14/setd-promo31-174203` + `x-deep-rewind` (binaries `~/qx-bins/chunk134`, in
+  `target/release`): set D 19.177 against 19.166 (no scored case rewinds deep: not promoted). The user asked for
+  vLLM-style prefix caching; today's reuse turned out to cost ~20 ms per replayed token whenever the shared prefix
+  ended more than 128 tokens before the slot's end (2,047 tokens with 1,252 shared: 28.5 s at the client, 4.5 s
+  now; exact mode 12.5k with 11.7k shared 97.6 -> 14.2 s), hidden by a prompt timer that started after the rewind.
+  Knobs: `QX_DS_REPLAY_CHUNK`, `QX_DS_REPLAY_TRIM`, `QX_DS_REWIND_DEEP_MIN` (8,192).
+- **In the worktree, not landed** (`~/qx-wt/exp`, binaries chunk135 / chunk136): `copy_prefix` (a slot's stores,
+  rings and tokens copied device to device into a free slot) and the scheduler's use of it; the `P` tag in
+  `qx-ds-replay`; a KL print in `qx-ds-check`'s rewind check. Measured and exact in three tests (backlog item 1 of
+  the evening queue). Next: `chain-x34.sh replay`, the breaker, the gate, the adjudicator.
+- The adjudicator's flag: the next experiment after that must attack a presupposition.
+
 ## Resume 2026-11-14, morning: several short prompt stretches in one chunk LANDED (three clients: wall -5%, per-request decode +4 to +9%); baseline unchanged (19.166)
 - **Landed** `perf/results/2026-11-14/setd-promo29-072001` + `x-multi-chunk` (binaries `~/qx-bins/chunk128`, in
   `target/release`): set D 19.187 against 19.166 (no scored case merges: not promoted). The scheduler merges the

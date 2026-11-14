@@ -9,6 +9,25 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-14, evening (deep rewinds through a trimmed chunk landed; prefix copy across slots under test)
+0. **The adjudicator's cadence flag: the next experiment must attack a row of `perf/presuppositions.md`** (none of
+   the last five did; the cross-slot copy does not count).
+1. **Prefix reuse across slots** (`copy_prefix`, worktree build chunk135 / chunk136; `QX_DS_PREFIX_COPY=0` off):
+   measured, not yet through the breaker and adjudicator. A 12.8k prompt decoding in slot 0: the same prompt
+   arriving 0.08 s of prompt time against 15.66 (wall 10.97 against 25.35 s), a prompt sharing 11.7k tokens 6.92
+   against 16.59 s, and the first client's 100 tokens in 24.9 against 38.9 s. Exact mode: the copied prefix's reply
+   equals the same-slot rewind's and the afresh one's (X31), and the copied deep reuse equals the same-slot deep
+   reuse (X34).
+2. **One chunk for a replay and the stretch after it** (the experts staged once: ~2 s of the ~6.9 s a deep reuse
+   costs), and a replay chunk's waste (prefetch by the chunk's rows, Engram rows for all rows, up to 40 cuBLAS dry
+   shapes): the deep threshold would come down with them. A deep rewind runs at admission and stalls the other
+   slots (a decoder's 93 tokens 14.5 s beside one).
+3. **`json_object` replies land in `reasoning_content` with an empty `content`** (X33, the same on chunk128 and
+   chunk134: valid JSON, wrong field).
+4. `replay_to` has no standing check: add the X25 shapes (rewind to 400 of 560, 1,024 of 1,280) to ds-checks with
+   `QX_DS_CHUNK` set and the exact knob; fold the KL print of the rewind check (worktree) into `qx-ds-check`.
+5. The morning queue below, its items 1 and 3-6.
+
 ### Queue as of 2026-11-14, morning (several stretches in one chunk landed; the user's focus list worked through)
 1. **A start-up capture panic** (once in ~35 starts on 2026-11-13; the server exits with 101): 0 in 44 start-only
    launches and ~35 other starts on 2026-11-14. It needs an info-cache miss inside a capture (a normal start has
