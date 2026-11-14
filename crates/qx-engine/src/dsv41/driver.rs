@@ -68,7 +68,7 @@ pub struct Shared {
     /// Chunk jobs, for the chunk's verbose line (ns and counts): [time inside serve_chunk, of it waiting for a ring
     /// slot, of it waiting for NVMe reads, records staged from RAM, records staged from NVMe, time in the copy
     /// calls, waiting for landing places, in the read submits, picks skipped].
-    pub chunk_lane: [AtomicU64; 10],
+    pub chunk_lane: [AtomicU64; 13],
     /// The routing of the chunk layer whose prefetch job has generation `chunk_used_gen`: which experts have rows
     /// (the engine publishes it as soon as it has the lists; the prefetch job then skips the picks without rows).
     pub chunk_used: std::sync::Mutex<(u64, Vec<bool>)>,
@@ -110,6 +110,12 @@ pub struct ChunkJob {
     /// marking) the ones the routing did not select.
     pub experts: Vec<u32>,
     pub prefetch: usize,
+    /// With `prefetch` > 0: the engine's predicted rows per expert of the layer (empty: none; the pick is then
+    /// ordered by the scores). The NVMe picks are read in this order, the ones predicted without rows last.
+    pub pred: Vec<f32>,
+    /// The predicted rows from which a pick is staged before the routing is known (the picks under it wait for the
+    /// routing).
+    pub pred_t: f32,
     /// Per expert of `experts`: its selection count, for the scores (empty: no scoring).
     pub counts: Vec<u32>,
     /// Further (expert, count) pairs to score without copying (the prefetched experts the routing used).
@@ -414,28 +420,43 @@ impl Loop {
             self.ring_user = vec![0; n_slots];
             self.ring_next = 0;
         }
+        // (a prefetch job with a prediction: the picks from this index on wait for the routing; the generation of
+        // the last routing published when the job starts)
+        let mut gate_from = usize::MAX;
+        let gen_start = sh.chunk_used_gen.load(Ordering::Acquire);
         if job.experts.is_empty() && job.prefetch > 0 {
             // the layer's non-resident experts, NVMe ones first (the slow reads must start while the slab passes
             // run; the RAM copies stream after the routing at the link's speed), hottest first within a tier,
             // up to the ring's size
             let mut cand: Vec<usize> = (0..ne).filter(|&e| self.host.table[l * ne + e] == 0).collect();
             let tier = |h: &Host, g: usize| if h.store.in_ram(g) { 1 } else { 0 };
-            cand.sort_by(|&a, &b| tier(&self.host, l * ne + a).cmp(&tier(&self.host, l * ne + b)).then(self.host.score[l * ne + b].partial_cmp(&self.host.score[l * ne + a]).unwrap_or(std::cmp::Ordering::Equal)).then(a.cmp(&b)));
+            let pr = |e: usize| job.pred.get(e).copied().unwrap_or(0.0);
+            cand.sort_by(|&a, &b| tier(&self.host, l * ne + a).cmp(&tier(&self.host, l * ne + b)).then(pr(b).partial_cmp(&pr(a)).unwrap_or(std::cmp::Ordering::Equal)).then(self.host.score[l * ne + b].partial_cmp(&self.host.score[l * ne + a]).unwrap_or(std::cmp::Ordering::Equal)).then(a.cmp(&b)));
             cand.truncate(job.prefetch.min(n_slots));
-            if chunk_overlap() && !cand.is_empty() {
-                // the NVMe reads and the RAM copies run side by side: a share of the RAM records ahead of each
-                // NVMe batch (their copies fill the batch's read time), in the order the GPU will meet them
-                let half = (self.host.store.stage_places(l * ne) / 2).clamp(1, chunk_batch());
-                let (nv, ram): (Vec<usize>, Vec<usize>) = cand.iter().partition(|&&e| tier(&self.host, l * ne + e) == 0);
-                let nb = nv.len().div_ceil(half);
-                let share = if nb > 0 { ram.len().div_ceil(nb) } else { ram.len() };
-                let mut order = Vec::with_capacity(cand.len());
-                for b in 0..nb {
-                    order.extend_from_slice(&ram[(b * share).min(ram.len())..((b + 1) * share).min(ram.len())]);
-                    order.extend_from_slice(&nv[b * half..((b + 1) * half).min(nv.len())]);
+            // With a prediction: the experts predicted with rows (a score of `pred_t` or more) first, the
+            // others behind them. The staging loop holds the others back until the routing is known: a record
+            // staged blind sits in the link's queue ahead of the used ones.
+            let (hi, lo): (Vec<usize>, Vec<usize>) = if job.pred.is_empty() { (cand, Vec::new()) } else { cand.into_iter().partition(|&e| pr(e) >= job.pred_t) };
+            let mut cand = Vec::with_capacity(hi.len() + lo.len());
+            if !job.pred.is_empty() {
+                gate_from = hi.len();
+            }
+            for part in [hi, lo] {
+                if chunk_overlap() && !part.is_empty() {
+                    // the NVMe reads and the RAM copies run side by side: a share of the RAM records ahead of each
+                    // NVMe batch (their copies fill the batch's read time), in the order the GPU will meet them
+                    let half = (self.host.store.stage_places(l * ne) / 2).clamp(1, chunk_batch());
+                    let (nv, ram): (Vec<usize>, Vec<usize>) = part.iter().partition(|&&e| tier(&self.host, l * ne + e) == 0);
+                    let nb = nv.len().div_ceil(half);
+                    let share = if nb > 0 { ram.len().div_ceil(nb) } else { ram.len() };
+                    for b in 0..nb {
+                        cand.extend_from_slice(&ram[(b * share).min(ram.len())..((b + 1) * share).min(ram.len())]);
+                        cand.extend_from_slice(&nv[b * half..((b + 1) * half).min(nv.len())]);
+                    }
+                    cand.extend_from_slice(&ram[(nb * share).min(ram.len())..]);
+                } else {
+                    cand.extend_from_slice(&part);
                 }
-                order.extend_from_slice(&ram[(nb * share).min(ram.len())..]);
-                cand = order;
             }
             job.experts = cand.iter().map(|&e| e as u32).collect();
             *sh.chunk_pick.lock().unwrap() = Some(job.experts.clone());
@@ -494,13 +515,13 @@ impl Loop {
             let nsets = (places / half).clamp(2, chunk_sets());
             // the next batch of NVMe records at or after `from` (their job indices and record ids): up to the
             // first record after them that is staged from RAM, skipped picks passed over
-            let next_run = |lp: &Loop, from: usize, skip: &Vec<bool>| -> Option<(Vec<usize>, Vec<usize>)> {
+            let next_run = |lp: &Loop, from: usize, skip: &Vec<bool>, n: usize| -> Option<(Vec<usize>, Vec<usize>)> {
                 let skipped = |j: usize| !skip.is_empty() && skip[j];
                 let mut j = from;
                 while j < n && (skipped(j) || !is_nvme(lp, j)) {
                     j += 1;
                 }
-                if j == n {
+                if j >= n {
                     return None;
                 }
                 let (mut idxs, mut batch): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
@@ -515,17 +536,42 @@ impl Loop {
             };
             let mut nv_from = 0usize;
             let mut i = 0usize;
+            let mut pre_idx: Vec<usize> = Vec::new();
             while i < n {
                 if can_skip && skip.is_empty() && sh.chunk_used_gen.load(Ordering::Acquire) == job.generation {
                     // (under the lock: the engine may have gone on to the next layer's routing since the load)
                     let used = sh.chunk_used.lock().unwrap();
                     if used.0 == job.generation {
                         skip = job.experts.iter().map(|&e| !used.1[e as usize]).collect();
+                        // (the log's count: NVMe reads submitted before the routing, and the used ones among them)
+                        sh.chunk_lane[10].fetch_add(pre_idx.len() as u64, Ordering::Relaxed);
+                        sh.chunk_lane[11].fetch_add(pre_idx.iter().filter(|&&ix| !skip[ix]).count() as u64, Ordering::Relaxed);
+                        pre_idx.clear();
                     }
                 }
+                // (the picks held back for the routing: no read of theirs goes out before it, and the loop waits
+                // for it when it comes to the first of them; never forever: the engine publishes the routing of
+                // every layer it posted a prefetch job for. A generation that is neither the one at the job's
+                // start nor this job's is a later layer's: the engine went past this layer's routing while the
+                // loop was in a read, and the rest is staged blind, as before the gate)
+                let gated = can_skip && skip.is_empty() && gate_from < n;
+                if gated && i >= gate_from {
+                    let tw = std::time::Instant::now();
+                    let mut cur = sh.chunk_used_gen.load(Ordering::Acquire);
+                    while cur != job.generation && cur == gen_start && tw.elapsed().as_millis() < 5000 {
+                        std::hint::spin_loop();
+                        cur = sh.chunk_used_gen.load(Ordering::Acquire);
+                    }
+                    sh.chunk_lane[12].fetch_add(tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    if cur != job.generation {
+                        gate_from = usize::MAX;
+                    }
+                    continue;
+                }
+                let lim = if gated { gate_from } else { n };
                 if inflight.is_none() && more_nvme {
-                    match next_run(self, i.max(nv_from), &skip) {
-                        None => more_nvme = false,
+                    match next_run(self, i.max(nv_from), &skip, lim) {
+                        None => more_nvme = gated,
                         Some((idxs, batch)) => {
                             // every batch but the last staged one must have left its landing places
                             let tc = std::time::Instant::now();
@@ -535,6 +581,9 @@ impl Loop {
                             let (ptrs, jobs) = self.host.store.fetch_submit(&batch).expect("chunk NVMe fetch");
                             sh.chunk_lane[7].fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             nv_from = idxs[idxs.len() - 1] + 1;
+                            if can_skip && skip.is_empty() {
+                                pre_idx.extend_from_slice(&idxs);
+                            }
                             inflight = Some((idxs, ptrs, jobs));
                         }
                     }

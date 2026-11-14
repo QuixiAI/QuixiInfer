@@ -2441,6 +2441,40 @@ impl<'a> DsEngine<'a> {
                 eprintln!("cuBLAS: prompt chunks in f16 ({} MiB free after the dry pass)", free >> 20);
             }
         }
+        // The next layer's routing, predicted: layer l + 1's router on layer l's FFN input (its top PRED_K per row,
+        // read back with layer l's selections). Layer l + 1's prefetch job stages the picks predicted with rows
+        // first, by predicted rows, and holds the others back until the routing is known (`QX_DS_CHUNK_PRED=0`:
+        // off, the picks by their scores and none held back; `=2`: the predictor's accuracy in the chunk log).
+        // Only where a chunk prefetches (`QX_DS_CHUNK_PREFETCH_MIN` rows): under that a chunk reads by the routing
+        // alone, and a prediction changes nothing there (2026-11-13: 79-232 tokens 1.54-2.55 s with and without).
+        static PRED: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let pred_mode = *PRED.get_or_init(|| std::env::var("QX_DS_CHUNK_PRED").ok().and_then(|v| v.parse().ok()).unwrap_or(1));
+        // Up to `QX_DS_CHUNK_PRED_MAX` rows (default 2,048): the gain shrinks with the chunk (256 / 592 / 1,024 /
+        // 2,040 rows: -19 / -13 / -9.5 / -3.5%) and at 4,096 and 8,192 rows the predictor costs more than the
+        // order gains (+1.5%, +1 to 5%).
+        static PRED_MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let pred_max = *PRED_MAX.get_or_init(|| std::env::var("QX_DS_CHUNK_PRED_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(2048));
+        // (with the exact kernels, `QX_DS_PREFILL_EXACT=1`, up to 768 rows: 298 / 413 / 582 tokens 2.58 / 2.56 /
+        // 2.96 -> 2.18 / 2.27 / 2.81 s, but 960 / 1,638 tokens 3.66 / 5.08 -> 3.79 / 5.56 s)
+        let pred_max = if chunk_ffn_wide { pred_max } else { pred_max.min(768) };
+        let pred_buf = (pred_mode > 0 && prefetch_on && n_ring > 0 && rows <= pred_max).then(|| DeviceBuf::new(rows * crate::mailbox::PRED_K * 4));
+        let mut pred_ids: Vec<i32> = Vec::new();
+        // this layer's predicted rows per expert (empty: no prediction)
+        let mut pred_score: Vec<f32> = Vec::new();
+        // The predicted rows from which a pick is staged before the routing is known (`QX_DS_CHUNK_PRED_T`, default
+        // 3; measured 2026-11-13 on 256 / 592 / 2,040 rows: 1.49 / 2.00 / 3.13 s at 3, 1.59 / 2.03 / 3.10-3.14 at
+        // 1, 1.44 / - / 3.23 at 6; a threshold calibrated on the hit rate per score class was worse). 0: nothing
+        // is held back.
+        static PRED_T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        let pred_t = *PRED_T.get_or_init(|| std::env::var("QX_DS_CHUNK_PRED_T").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0));
+        // (the prediction the current layer's prefetch job goes out with; `=2`: per score class, the experts outside
+        // VRAM and the used ones among them)
+        let mut pred_cur: Vec<f32> = Vec::new();
+        const PRED_B: [f32; 12] = [0.0, 0.25, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0];
+        let mut pred_tab = [[0u64; 2]; 12];
+        let mut pred_kept: Vec<f32> = Vec::new();
+        // per K in (k, 12), per tier class (all, not in VRAM, NVMe): experts used, predicted, both
+        let mut pred_stat = [[[0u64; 3]; 3]; 2];
         for l in 0..n_layers_run {
             if chunk_ffn_wide {
                 // this layer's attention-side dense groups as f16, once for the chunk (cuBLAS GEMMs per slab from them)
@@ -2476,11 +2510,12 @@ impl<'a> DsEngine<'a> {
             // the rows this layer's experts and the layers above run on: all of them up to the last KV source
             let ra = if l >= kv_last { keep_from } else { 0 };
             let n_act = rows - ra;
+            pred_cur = std::mem::take(&mut pred_score);
             let prefetch = if prefetch_on && n_ring > 0 && !(kv_only && l == kv_last) { n_ring } else { 0 };
             if prefetch > 0 {
                 let cb = self.chunk.as_ref().unwrap();
                 *d.chunk_pick.lock().unwrap() = None;
-                d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: Vec::new(), prefetch, counts: Vec::new(), extra_scores: Vec::new(), slots_dev: cb.slots_tbl[l % 2].ptr, generation, ord0: ord0_pre });
+                d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: Vec::new(), prefetch, pred: { if pred_mode >= 2 { pred_kept = pred_cur.clone(); } std::mem::take(&mut pred_cur) }, pred_t, counts: Vec::new(), extra_scores: Vec::new(), slots_dev: cb.slots_tbl[l % 2].ptr, generation, ord0: ord0_pre });
                 self.chunk_ord += prefetch as u64;
             }
             for si in 0..n_slabs {
@@ -2505,9 +2540,11 @@ impl<'a> DsEngine<'a> {
                     self.hc_terms(&w.hc_ffn, &self.s.pre_f, t);
                     self.hc_pre(&self.s.pre_a, t);
                     self.rms(self.s.xpre.ptr, w.ffn_norm.ptr, self.s.x.ptr, E, t);
+                    self.chunk_predict(l, t, r0, pred_buf.as_ref());
                     continue;
                 }
                 self.layer_ffn_pre(l, t, &mut None);
+                self.chunk_predict(l, t, r0, pred_buf.as_ref());
                 if trace && l < 8 {
                     self.gpu.sync();
                     let x: Vec<f32> = self.s.x.download(E);
@@ -2541,6 +2578,53 @@ impl<'a> DsEngine<'a> {
             let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
             for (a, &e) in ids.iter().enumerate() {
                 lists[e as usize].push(a as u32);
+            }
+            if pred_mode >= 2 && pred_kept.len() == ne {
+                for e in 0..ne {
+                    if d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+                        let bi = PRED_B.iter().rposition(|&b| pred_kept[e] >= b).unwrap();
+                        pred_tab[bi][1] += 1;
+                        pred_tab[bi][0] += !lists[e].is_empty() as u64;
+                    }
+                }
+                pred_kept.clear();
+            }
+            if let Some(pb) = pred_buf.as_ref() {
+                let pk = crate::mailbox::PRED_K;
+                if !pred_ids.is_empty() && pred_mode >= 2 {
+                    for (ki, kk) in [k, pk].into_iter().enumerate() {
+                        let mut p = vec![false; ne];
+                        for row in ra..rows {
+                            for &e in &pred_ids[row * pk..row * pk + kk] {
+                                p[e as usize] = true;
+                            }
+                        }
+                        for e in 0..ne {
+                            let tier = d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed);
+                            let u = !lists[e].is_empty();
+                            for (ci, inc) in [true, tier >= 1, tier == 2].into_iter().enumerate() {
+                                if inc {
+                                    pred_stat[ki][ci][0] += u as u64;
+                                    pred_stat[ki][ci][1] += p[e] as u64;
+                                    pred_stat[ki][ci][2] += (u && p[e]) as u64;
+                                }
+                            }
+                        }
+                    }
+                }
+                pred_ids = if l + 1 < n_layers_run { pb.download_at::<i32>(0, rows * pk) } else { Vec::new() };
+                // the next layer's predicted rows per expert: a row's top k count 1 each, the ranks behind them 1/4
+                pred_score.clear();
+                if !pred_ids.is_empty() {
+                    pred_score.resize(ne, 0.0);
+                    let ra1 = if l + 1 >= kv_last { keep_from } else { 0 };
+                    // (the rows under `keep_from` do not run above the last KV source: theirs hold an older layer's guess)
+                    for row in ra1..rows {
+                        for (j, &e) in pred_ids[row * pk..(row + 1) * pk].iter().enumerate() {
+                            pred_score[e as usize] += if j < k { 1.0 } else { 0.25 };
+                        }
+                    }
+                }
             }
             if prefetch > 0 {
                 // the routing, for the prefetch job still staging its pick: it skips the experts without rows
@@ -2587,7 +2671,7 @@ impl<'a> DsEngine<'a> {
             cb.sel.upload(&sel);
             let extra_scores: Vec<(u32, u32)> = picked.iter().filter(|&&e| !lists[e as usize].is_empty()).map(|&e| (e, lists[e as usize].len() as u32)).collect();
             let n_pick_used = extra_scores.len();
-            d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: rest.iter().map(|&e| e as u32).collect(), prefetch: 0, counts: rest.iter().map(|&e| lists[e].len() as u32).collect(), extra_scores, slots_dev: cb.slots_tbl[l % 2].ptr, generation, ord0: ord0_rest });
+            d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: rest.iter().map(|&e| e as u32).collect(), prefetch: 0, pred: Vec::new(), pred_t: 0.0, counts: rest.iter().map(|&e| lists[e].len() as u32).collect(), extra_scores, slots_dev: cb.slots_tbl[l % 2].ptr, generation, ord0: ord0_rest });
             let ex = &self.layers[l].experts;
             let gb = ff * ex.gate_row_bytes;
             // the expert formats differ per layer (the UD quant mixes them): the kernel variants per layer
@@ -2801,7 +2885,14 @@ impl<'a> DsEngine<'a> {
         if std::env::var("QX_DS_VERBOSE").is_ok() {
             eprintln!("chunk of {rows} rows at {pos0}{}: {:.0} ms ({:.2} ms per row; host: slab enqueue {:.0} ms, sync on the slab passes {:.0}, expert enqueue {:.0}, post enqueue {:.0}; {} distinct experts per layer, engram {:.0} ms)", if kv_only { " KV-only".to_string() } else if keep_from > 0 { format!(" (full stack from row {keep_from})") } else { String::new() }, self.t_forward * 1e3, self.t_forward * 1e3 / rows as f64, t_enq * 1e3, t_sync * 1e3, t_moe * 1e3, t_post * 1e3, n_distinct / n_layers_run.max(1), self.t_engram * 1e3);
             let lane: Vec<u64> = d.chunk_lane.iter().zip(&lane0).map(|(a, b)| a.load(std::sync::atomic::Ordering::Relaxed) - b).collect();
-            eprintln!("  chunk lane: driver busy {:.0} ms of the chunk (waiting for a ring slot {:.0} ms, for NVMe reads {:.0} ms and {:.0} ms in their submits, for landing places {:.0} ms, copy calls {:.0} ms); staged {} from RAM, {} from NVMe, {} picks skipped, {} settles before a RAM place changed hands", lane[0] as f64 / 1e6, lane[1] as f64 / 1e6, lane[2] as f64 / 1e6, lane[7] as f64 / 1e6, lane[6] as f64 / 1e6, lane[5] as f64 / 1e6, lane[3], lane[4], lane[8], lane[9]);
+            eprintln!("  chunk lane: driver busy {:.0} ms of the chunk (waiting for a ring slot {:.0} ms, for NVMe reads {:.0} ms and {:.0} ms in their submits, for landing places {:.0} ms, copy calls {:.0} ms); staged {} from RAM, {} from NVMe, {} picks skipped, {} settles before a RAM place changed hands; NVMe reads submitted before the routing {} ({} of them used), {:.0} ms held for it", lane[0] as f64 / 1e6, lane[1] as f64 / 1e6, lane[2] as f64 / 1e6, lane[7] as f64 / 1e6, lane[6] as f64 / 1e6, lane[5] as f64 / 1e6, lane[3], lane[4], lane[8], lane[9], lane[10], lane[11], lane[12] as f64 / 1e6);
+        }
+        if pred_buf.is_some() && pred_mode >= 2 {
+            eprintln!("  chunk pred classes ({rows} rows; score from: used / experts outside VRAM): {}", PRED_B.iter().zip(&pred_tab).map(|(b, t)| format!("{b}: {}/{}", t[0], t[1])).collect::<Vec<_>>().join(", "));
+            for (ki, name) in ["k", "12"].into_iter().enumerate() {
+                let f = |c: [u64; 3]| format!("used {} predicted {} both {} (recall {:.1}%, precision {:.1}%)", c[0], c[1], c[2], 100.0 * c[2] as f64 / c[0].max(1) as f64, 100.0 * c[2] as f64 / c[1].max(1) as f64);
+                eprintln!("  chunk pred top-{name} ({rows} rows): all: {}; not in VRAM: {}; NVMe: {}", f(pred_stat[ki][0]), f(pred_stat[ki][1]), f(pred_stat[ki][2]));
+            }
         }
         logits
     }
@@ -3231,6 +3322,21 @@ impl<'a> DsEngine<'a> {
             eprintln!("chunk scratch: {} MiB outside the flex tail ({} of {} MiB of it handed out)", bytes >> 20, self.chunk_extra_off >> 20, self.chunk.as_ref().map_or(0, |c| c.extra.bytes >> 20));
         }
         DeviceBuf::new(bytes)
+    }
+
+    /// Layer `l + 1`'s router on layer `l`'s FFN input of the bound slab (rows from `r0`): the top PRED_K ids per row
+    /// into `pred` (the chunk path's routing prediction, `QX_DS_CHUNK_PRED`; it decides only the order of the next
+    /// layer's prefetch, never a result).
+    fn chunk_predict(&self, l: usize, t: usize, r0: usize, pred: Option<&DeviceBuf>) {
+        let Some(pb) = pred else { return };
+        if l + 1 >= self.layers.len() {
+            return;
+        }
+        let (c, w1, s) = (&self.cfg, &self.layers[l + 1], &self.s);
+        let pk = crate::mailbox::PRED_K;
+        self.rms(s.xpre.ptr, w1.ffn_norm.ptr, s.xp.ptr, E, t);
+        self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, pk as u64, w1.router_bias.ptr, pb.ptr + (r0 * pk * 4) as u64, s.wts_p.ptr, bits(c.w_scale)]);
     }
 
     fn chunk_ffn_alloc(&mut self, rows_max: usize) {
