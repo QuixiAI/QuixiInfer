@@ -235,6 +235,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         }
         let mut width_hist: std::collections::BTreeMap<usize, usize> = Default::default();
         let prefix_on = !std::env::var("QX_DS_PREFIX").is_ok_and(|v| v == "0");
+        let rewind_deep_min: usize = std::env::var("QX_DS_REWIND_DEEP_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8_192);
         let skip_on = !std::env::var("QX_DS_SKIP").is_ok_and(|v| v == "0");
         let keep = eng.prompt_keep();
         let mut kv_only_windows = 0usize;
@@ -304,18 +305,29 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 let shared = |slot: usize| -> usize {
                     let mut l = eng.tokens(slot).iter().zip(&job.prompt).take_while(|(a, b)| a == b).count().min(job.prompt.len() - 1);
                     l -= l % group;
-                    // a rewind replays about 130 tokens to rebuild the attention window, so a shared prefix pays
-                    // only when it is a good deal longer than that
-                    if l >= 256 { l } else { 0 }
+                    // A shared prefix whose end lies within the slot's last window costs nothing to return to. One that
+                    // ends earlier needs the rings rebuilt by a replay of up to `replay_span` (5,208) tokens through
+                    // the full stack, which costs more than computing a prefix of that order afresh (fresh chunks run
+                    // most rows KV-only): such a prefix is reused only from QX_DS_REWIND_DEEP_MIN tokens (default 8,192: with the replay in one trimmed chunk, ~4.4 s, reuse and afresh cross near 7.4k; was
+                    // no threshold). Until 2026-11-14 every prefix of 256+ tokens was reused and the replay ran in
+                    // windows: 2,047 tokens with 1,252 reused 28.5 s at the client against 5.2 s afresh.
+                    if l >= 256 && (eng.rewind_fast(slot, l) || l >= rewind_deep_min) { l } else { 0 }
                 };
-                let (i, reuse) = if prefix_on { free.iter().enumerate().map(|(i, &sl)| (i, shared(sl))).max_by_key(|&(_, l)| l).unwrap() } else { (free.len() - 1, 0) };
+                // (among slots sharing equally, the one holding the fewest tokens: a prompt that reuses nothing takes an
+                // empty slot before it resets a cached conversation, and the shortest one before a longer. Until
+                // 2026-11-14 ties went to the last free slot in the list: a 145-token prompt reset the slot holding a
+                // 12.8k-token prompt while two slots were empty)
+                let (i, reuse) = if prefix_on { free.iter().enumerate().map(|(i, &sl)| (i, shared(sl))).max_by_key(|&(i, l)| (l, std::cmp::Reverse(eng.tokens(free[i]).len()))).unwrap() } else { (free.len() - 1, 0) };
                 let slot = free.remove(i);
+                // (the request's clock starts before the rewind: a deep one replays up to 5,208 tokens, and until
+                // 2026-11-14 the prompt time left that out)
+                let t_admit = std::time::Instant::now();
                 if reuse > 0 {
                     eng.rewind(slot, reuse);
                 } else {
                     eng.reset(slot);
                 }
-                running.push(Req { job, slot, detok: Detok { tok, ids: Vec::new(), sent: 0 }, text: String::new(), n: 0, t0: std::time::Instant::now(), t_prompt: None, finish: None, matcher, read: reuse, reused: reuse, next: None, logits: None });
+                running.push(Req { job, slot, detok: Detok { tok, ids: Vec::new(), sent: 0 }, text: String::new(), n: 0, t0: t_admit, t_prompt: None, finish: None, matcher, read: reuse, reused: reuse, next: None, logits: None });
             }
             if running.is_empty() {
                 continue;

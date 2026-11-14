@@ -1785,6 +1785,11 @@ impl<'a> DsEngine<'a> {
     /// within the last DS_TMAX positions), nothing is copied; otherwise the rings are rebuilt by replaying the
     /// slot's own tokens (`replay_to`). This replaced a per-position host copy of every latent, 21.5 GB per slot
     /// at 256k (2026-11-06).
+    /// Whether `rewind(slot, p)` copies nothing: the ring still holds the window below `p`.
+    pub fn rewind_fast(&self, slot: usize, p: usize) -> bool {
+        p <= self.st.pos[slot] && self.st.pos[slot] - p <= self.ring_w - self.cfg.n_swa
+    }
+
     pub fn rewind(&mut self, slot: usize, p: usize) {
         sched_trace(&format!("W {slot} {p}"));
         assert!(p <= self.st.pos[slot], "rewind past the end");
@@ -1824,7 +1829,20 @@ impl<'a> DsEngine<'a> {
         self.st.pos[slot] = a;
         self.gpu.sync();
         self.replaying = true;
+        // Through the chunk path when the engine has one (QX_DS_REPLAY_CHUNK=0: windows, as before 2026-11-14): the
+        // replay's windows run uncaptured, ~20 ms per token (1,252 tokens: 25 s, more than the prompt computed
+        // afresh), a chunk runs the same layer parts slab by slab with the experts streamed once per layer. The
+        // `replaying` guard is in `layer_attn`, which both paths share: rings only, no store or index-key writes.
+        static REPLAY_CHUNK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let by_chunk = *REPLAY_CHUNK.get_or_init(|| !std::env::var("QX_DS_REPLAY_CHUNK").is_ok_and(|v| v == "0")) && self.chunk.is_some() && self.driver.is_some() && self.abufs.is_some() && replay.len() >= 64;
         let mut off = 0;
+        if by_chunk {
+            let rows_max = self.chunk.as_ref().unwrap().rows;
+            for part in replay.chunks(rows_max) {
+                let _ = self.forward_chunk_inner(&[(slot, part)], 0);
+            }
+            off = replay.len();
+        }
         while off < replay.len() {
             // widths whose kernels every server warms (the scheduler's set): never 5 or 7, whose kernels may not be
             // loaded and whose multi-GEMV is not bit-identical at width 5
@@ -2358,6 +2376,22 @@ impl<'a> DsEngine<'a> {
         let trace = std::env::var("QX_DS_CHUNK_TRACE").is_ok();
         let kv_last = self.kv_last();
         let n_layers_run = if kv_only { kv_last + 1 } else { n_layer };
+        // A replay (`replay_to`) rebuilds the rings only, and layer l's ring window at the chunk's end needs the
+        // layers below on n_swa - 1 more rows each: layer l runs its last n_swa + (n_layer - l) * (n_swa - 1) rows
+        // (layer 0 the whole replay span, the top layer 255), from a slab boundary. About half the row-layers
+        // (QX_DS_REPLAY_TRIM=0: every row through every layer, as the windows' replay does).
+        let n_swa = self.cfg.n_swa;
+        let trim = self.replaying && parts.len() == 1 && keep_from == 0 && !std::env::var("QX_DS_REPLAY_TRIM").is_ok_and(|v| v == "0");
+        let ra_of = move |l: usize| -> usize {
+            if trim {
+                let need = n_swa + (n_layer - l.min(n_layer)) * (n_swa - 1);
+                if rows > need { (rows - need) / DS_TMAX * DS_TMAX } else { 0 }
+            } else if l >= kv_last {
+                keep_from
+            } else {
+                0
+            }
+        };
         // QX_DS_CHUNK_PREFETCH=0 disables the prefetch job (the experts stream only after the routing is known).
         // A chunk of fewer than QX_DS_CHUNK_PREFETCH_MIN rows (default 256) posts none: its rows route to a
         // minority of a layer's experts (137 of them for 79 rows), so most of a blind pick is read for nothing and
@@ -2449,7 +2483,10 @@ impl<'a> DsEngine<'a> {
                 }
                 for g in [&w.g_ffn, &w.g_shd] {
                     for sg in g.segs.iter().filter(|sg| sg.qx != 0) {
-                        for rows in [rows, rows - keep_from] {
+                        let mut act_rows: Vec<usize> = if trim { (0..n_layer).map(|l| rows - ra_of(l)).collect() } else { vec![rows, rows - keep_from] };
+                        act_rows.sort_unstable();
+                        act_rows.dedup();
+                        for rows in act_rows {
                             if rows > 0 && seen.insert((sg.rows, sg.cols, rows)) {
                                 // (the output lands in the gate scratch or, for the down product, would not fit it: E > ff)
                                 let y = if sg.rows <= self.cfg.ff_exp { gate_scratch } else { self.chunk.as_ref().unwrap().shy.ptr };
@@ -2540,7 +2577,7 @@ impl<'a> DsEngine<'a> {
             self.chunk_gen = generation;
             let ord0_pre = self.chunk_ord;
             // the rows this layer's experts and the layers above run on: all of them up to the last KV source
-            let ra = if l >= kv_last { keep_from } else { 0 };
+            let ra = ra_of(l);
             let n_act = rows - ra;
             pred_cur = std::mem::take(&mut pred_score);
             let prefetch = if prefetch_on && n_ring > 0 && !(kv_only && l == kv_last) { n_ring } else { 0 };
@@ -2552,7 +2589,7 @@ impl<'a> DsEngine<'a> {
             }
             for si in 0..n_slabs {
                 let (r0, t) = slab(si);
-                if l > kv_last && r0 < keep_from {
+                if (l > kv_last && r0 < keep_from) || (trim && r0 < ra) {
                     continue;
                 }
                 self.chunk_views(r0, t);
@@ -2649,7 +2686,7 @@ impl<'a> DsEngine<'a> {
                 pred_score.clear();
                 if !pred_ids.is_empty() {
                     pred_score.resize(ne, 0.0);
-                    let ra1 = if l + 1 >= kv_last { keep_from } else { 0 };
+                    let ra1 = ra_of(l + 1);
                     // (the rows under `keep_from` do not run above the last KV source: theirs hold an older layer's guess)
                     for row in ra1..rows {
                         for (j, &e) in pred_ids[row * pk..(row + 1) * pk].iter().enumerate() {
