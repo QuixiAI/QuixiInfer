@@ -4237,3 +4237,24 @@ driver with the steps they were meant to help.
 
 Verdict: REJECTED. Raw: `perf/results/2026-11-14/x-post-prompt/`.
 
+## 2026-11-14: The start-up capture panic — not reproduced in 44 start-only launches; narrowed to an info-cache miss inside a capture
+
+Status: deferred (no code landed; a diagnostic is saved).
+
+Question: backlog item 7 (one start in ~35 on 2026-11-13 panicked in the warm-up's graph captures: no room for a
+56-byte buffer while a capture records).
+
+- 44 start-only launches of the three-slot 256k server on chunk128 with `RUST_BACKTRACE=1` (`chain-x16.sh`, four
+  batches of 11): 0 panics. (Batch a's logged panic count is a script bug, a shell variable reused by the kill
+  helper; no panic log was kept in any batch.) About 35 more starts in today's experiments: none.
+- Mechanism, from `third_party/cubecl-cuda/src/compute/server.rs` (`info_buffer`): a launch's info words are staged
+  in a device buffer cached by their contents; a launch whose words are not in the cache allocates one, and an
+  allocation that needs a new pool page is refused while a capture records. 56 bytes is a seven-word info set.
+- Diagnostic (`QX_INFO_MISS_LOG=1`, chunk130d: a line per info set first staged while a capture records): one
+  start, 0 misses. A normal start allocates nothing inside its captures, so the panic needs a launch whose info
+  words differ between a width's dry pass and its capture, or an entry evicted between the two. Which launch: not
+  found (the window path's launches with host-dependent arguments were not all read).
+
+Next: carry the diagnostic line unconditionally in the next build that is validated anyway (it prints only on such
+a miss), so the next occurrence names the words. Raw: `perf/results/2026-11-14/x-startup-panic/`.
+

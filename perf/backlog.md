@@ -10,9 +10,10 @@ invented one. The aggregate score lives in `scoreboard.md`.
 ## Beam
 
 ### Queue as of 2026-11-14, morning (several stretches in one chunk landed; the user's focus list worked through)
-1. **A start-up capture panic** (once in ~35 starts; the server exits with 101): the hunt (`chain-x16.sh`:
-   start-only launches with `RUST_BACKTRACE=1`, a panicking start keeps its log as `~/qx-chains/x16-PANIC-*`).
-   Suspect, unproven: a launch-info buffer (56 bytes = 7 words) missing CubeCL's info cache during a capture.
+1. **A start-up capture panic** (once in ~35 starts on 2026-11-13; the server exits with 101): 0 in 44 start-only
+   launches and ~35 other starts on 2026-11-14. It needs an info-cache miss inside a capture (a normal start has
+   none: `QX_INFO_MISS_LOG`). Fold `perf/results/2026-11-14/x-startup-panic/info-miss-diagnostic.diff` into the
+   next validated build with the print unconditional, so the next occurrence names the launch.
 2. **Prefix reuse across slots** (the user asked: "automatic prefix caching like vLLM"). Today a request takes the
    free slot sharing the longest prefix (>= 256 tokens) and rewinds it; nothing is shared with a running slot, and a
    slot's cache is gone once another prompt takes it. Try: copy a prefix's KV, stores and ring state from another

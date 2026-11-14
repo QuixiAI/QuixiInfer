@@ -12,7 +12,8 @@
   start-up panic): the first is at its exact floor (the bytes of the experts used; leaving out one-row experts
   REJECTED as a default: top-1 at the 95% floor), the second landed here, the third is measured and already ahead
   of Strata's figure (22 against 14.4 tok/s over the first eight tokens after a 12.8k prompt; a promotion burst
-  REJECTED), the fourth is being hunted (`chain-x16.sh`; no panic in the starts so far: see the log).
+  REJECTED), the fourth was not reproduced (0 in 44 start-only launches; narrowed to an info-cache miss inside a
+  capture; a diagnostic is saved for the next build: backlog item 1).
 - The user asked about automatic prefix caching: backlog item 2 of the new queue.
 
 ## Resume 2026-11-14: a prompt chunk's prefetch follows the predicted routing (prompts of 256-2,048 tokens 1-16% faster, replies identical); baseline unchanged (19.166)
