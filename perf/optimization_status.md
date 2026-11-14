@@ -4102,3 +4102,138 @@ approximation only VRAM residency removes them, and the three-slot 256k server h
 Raw: `perf/results/2026-11-14/x-drop-onerow/` (experiment.diff, chain scripts, log.txt, rows-per-expert.txt);
 binaries `~/qx-bins/chunk123d`-`chunk127d` (diagnostic, not installed).
 
+## 2026-11-14: Several short prompt stretches in one chunk — LANDED, default on (three-turn loadgen at three clients: wall 56.0 -> 53.0 s, per-request decode 8.38-8.58 -> 8.92-9.16 tok/s, TTFT median 1.45 -> 1.62-1.72 s; replies identical; not a promotion)
+
+Status: landed, default on (`QX_DS_CHUNK_MULTI=0`: off). Not a promotion: the baseline stays 19.166.
+
+Question: backlog item 4 of the queue of 2026-11-14 (the per-request decode rate at three clients fell 9.31 -> 8.43
+tok/s when stretches of 64+ tokens moved to chunks: a decoder waits one chunk per arriving short prompt).
+
+Change (`multi.diff`, sha256 0b8666968b61, on bb84b96; binaries `~/qx-bins/chunk128`: qx-ds-check 366da46edbe1,
+quixiinfer 5a99af74a4a3, qx-ds-multi 4fe642a4d8b2, qx-ds-replay 0c187bc0cf8b):
+- `forward_chunk_inner` takes parts (a slot and its next tokens, each slot once) instead of one slot: positions and
+  slots per row (the kernels already read them per row), the slabs within a part at the widths the part would use
+  alone, each part's last row through the head, `st.pos` / `st.tokens` per part. One part: the same launches as before.
+  f16 only when every part has `QX_DS_CHUNK_F16_MIN` rows (one part: as before).
+- `forward_chunk_parts` (new) and the scheduler (`worker_ds.rs`): when a chunk is due and the picked request's
+  remaining stretch is whole, full-stack and under the f16 threshold, the other running requests with such a stretch
+  (64-255 tokens) join it while the rows fit. All parts exact, so a reply does not depend on its company.
+  `QX_DS_CHUNK_MULTI=0`: one request per chunk. Traced as one `C` / `H` pair per part.
+
+Exactness (fresh three-slot 256k server per arm, merged against `QX_DS_CHUNK_MULTI=0`, temperature 0; the hash is the
+sched trace's `H` of each chunk's last row, matched by the chunk's tokens):
+
+| test | merged chunks seen | replies | last-row hashes |
+|---|---|---|---|
+| X9: three prompts at once, three rounds (75-157 tokens) | 207, 239, 199 rows of 2 slots | 9/9 same | 9/9 |
+| X12 T1: three prompts at once behind a decoder, gap 100000 | 428 rows of 3 slots (prefetch and predictor on: 1,501 NVMe reads submitted before the routing, 1,243 of them used, 174 ms held) | 4/4 same | 4/4 |
+| X13 T2: slots primed with 445-549 tokens, then each text longer, at once | 237 rows of 2 slots at positions 538 / 444 (after rewinds) | 3/3 same | 6/6 |
+| X12 T3: two prompts beside a 93-token reply (`--max-tokens 200`), default gap | 289 rows of 2 slots | 3/3 same (the decoder's too) | 3/3 |
+| X14: loadgen `--dump`, both arms | 2 | 24/24 records equal as a multiset of (concurrency, prompt, text, reasoning, token counts); 8 distinct prompt strings (`tools/compare_dumps.py` reports 12 differences: it pairs by occurrence and the follow-up prompts repeat across conversations) | - |
+
+(The first X12 T2 primed one slot three times and merged nothing; one reply differed there because the arrival order
+gave one arm a rewind and the other an f16 chunk of the whole prompt: existing behaviour, not this change.)
+
+Every traced logits row is equal between the arms as a multiset (the adjudicator's recount from the traces: X9
+878/878, X12 T1 638/638, X12 T3 636/636, X13 638/638), and the 79- and 128-row chunk hashes equal those of older
+binaries' traces (`t24`-`t67`). Not covered: more than three slots, more than 768 merged rows.
+
+Single-part chunks: tail dumps at 2,048 and 16,384 tokens byte-identical to chunk122's; ds-checks part a the same
+text as v11's and part b the same less its tokenizer line (the chain did not export `QX_LLAMA_TOKENIZE`: 8 of 9
+lines; `qx-tok` unchanged since 2026-11-04; `run.json` records correctness skipped) (exact 6/6, production 57/59, windows 128/128); set D `setd-promo29-072001` 19.187 against 19.166
+(decode256k 39.1 / 38.6, prefill256k 2.0, serve256k1 39.11, serve256k3 90.91, decode 30.9, prefill128 10.5; identity
+serve256k-1 identical; a second serve256k session `x17-serve256k-2-080157`: 37.13 / 91.41, identical; no chunk runs
+in either). Preflight of the gate, 07:20:01: VM shut off, 3,426 MiB used, swap 1,003 used, pressure 0.00, no build
+tools; X9-X14 wrote none (the journal: VM off since 01:03:34, cargo only at 06:47:33-36, no OOM lines). The set D
+cases run no merged chunk (their prompts are under 64 tokens).
+
+Times of merged chunks against the same parts alone (exact kernels):
+
+| parts | merged | alone |
+|---|--:|--:|
+| 128 + 79 | 2,425 ms | 1,830 + 1,541 |
+| 148 + 91 | 2,547 | 1,999 + 1,491 |
+| 124 + 75 | 2,379 | 1,904 + 1,407 |
+| 147 + 142 + 139 | 2,519 | 1,957 + 2,063 + 1,995 |
+| 147 + 142 (beside a decoder) | 2,151 | 1,948 + 2,078 |
+| 134 + 103 (at 538 / 444) | 2,655 | 1,708 + 1,636 |
+| loadgen, 185-188 rows of two slots | 2,060-2,190 | 1,300-1,420 each |
+| loadgen, 331-334 rows of two slots | 1,680-2,000 | 1,740-1,880 each |
+
+Three prompts at once on an idle server (X9): the first arrival still runs alone (an idle loop admits it at once);
+round wall 11.15 / 9.99 / 9.09 -> 10.17 / 8.91 / 8.01 s; the last prompt ready after 4.66 / 4.58 / 4.11 -> 2.92 /
+2.74 / 2.56 s.
+
+Three-turn loadgen (`--levels 1,3 --rounds 2 --turns 3 --max-tokens 64 --temperature 0`), three clients:
+
+| run | wall s | aggregate tok/s | per-request tok/s | TTFT median | p90 | merged chunks |
+|---|--:|--:|--:|--:|--:|--:|
+| off, `--warmup 6` (two runs) | 55.9 / 56.0 | 20.60 / 20.57 | 8.58 / 8.55 | 1.45 / 1.45 | 2.94 / 2.98 | 0 |
+| on, `--warmup 6` (two runs, alternating order) | 53.0 / 53.3 | 21.75 / 21.61 | 9.04 / 8.92 | 1.62 / 1.66 | 3.06 / 2.10 | 6 of 22 (four in the warm-up; two, of 185 and 331 rows, in round 1 of the three-client level) |
+| off, sequential warm-up (the breaker's control) | 56.0 | 20.56 | 8.38 | 1.45 | 2.03 | 0 |
+| on, sequential warm-up | 53.0 | 21.73 | 9.16 | 1.72 | 2.99 | 2 (none in the warm-up) |
+
+One client, same runs: 22.7 / 22.7 against 22.0 / 21.6 s with `--warmup 6` (its six requests at once merge in one arm
+only and leave another tier state: the breaker's 2a), 23.4 against 23.3 s with the sequential warm-up. The three-client
+gain stands with equal warm-ups: wall -5.4%, aggregate +5.7%, per-request +9.3% (over the three pairs: wall -4.8 to
+-5.4%, per-request +4.3 to +9.3%). From the X14 dumps at three clients, off -> on: decode seconds summed 139.3 ->
+127.7 (-8.3%), TTFT mean 1.56 -> 1.71 s, TTFT max 4.57 -> 3.69 s, TTFT + decode per request 9.30 -> 8.80 s (-5.3%);
+turn 2 of round 1, TTFTs 1.43 / 1.56 / 4.57 -> 2.10 / 2.10 / 3.69 s.
+
+Cost: the median TTFT is 0.17-0.27 s higher (the picked request's chunk carries its mates' rows: +0.65-0.8 s at
+90-96-row parts in the loadgen, none at 163-169; 2.4-2.7 s against 1.5-2.0 s alone in X9 / X13), and the p90 moved
+between 2.0 and 3.1 s in both arms.
+
+Breaker (fresh context): no exactness defect found by reading; asked for the three-slot merge of 256+ rows, a merge at
+positions > 0, a merge beside a decoder and the equal-warm-up control: all run above. Not done: an `M` trace line
+naming a merge (a merge-only defect is detectable by replaying the `C` lines, not reproducible as a merge); the dry
+pass over two slots is unreachable in the server (it warms every width).
+
+Raw: `perf/results/2026-11-14/x-multi-chunk/` (multi.diff, chain scripts, log.txt, loadgen outputs and dumps,
+server-log extracts), `perf/results/2026-11-14/setd-promo29-072001`.
+
+### Adjudication (fresh context, 2026-11-14): LANDED, default on, not a promotion
+Gate `perf_diff.py`: 19.166 -> 19.187 (+0.1%), every case inside its spread; the one-part path unchanged in time
+against chunk122 (2,048 tokens 3,174 / 3,165 ms; 16,384: 4,779 + 6,924 / 4,785 + 6,928). Like for like verified from
+the journal (chunk128 in every start, only the knob differing; diff sha 0b8666968b61 in the tree, the saved diff and
+the gate run). The 3% bar (no new thread, protocol, buffer class or kernel family) is cleared on all three loadgen
+pairs: the lowest on-arm per-request rate (8.92) is above the highest off-arm (8.58); every one of the 12 merges seen
+ran shorter than its parts alone in sum. Its negatives: ds-checks part b ran without the tokenizer line; one
+identity session at the time (the second added above); the loadgen benefit rests on two merges per measured level,
+both in round 1; the 8% bar is reached on per-request decode in one pair of three and never on wall. Twelve text
+corrections, all applied above.
+
+## 2026-11-14: The tokens right after a prompt — measured, already ahead of the figure of 2026-11-11; a promotion burst after the chunk REJECTED
+
+Status: deferred (nothing landed; the experiment's diff is in the run directory).
+
+Question: backlog item 5 (first steps 174, 102, 82, 79 ms after a long prompt on 2026-11-11: 8-11 tok/s over the
+first eight tokens against Strata's 14.4).
+
+Measured on chunk129e with the knob off (= chunk128's behaviour), three-slot 256k server, sequential prompts, the
+server's `post-prompt step` lines (ms per step, twelve steps):
+
+| prompt | steps |
+|---|---|
+| 145 tokens, first request of a fresh server | 205 102 97 84 108 113 78 76 80 69 86 68 |
+| 147 tokens, another text | 119 57 44 40 41 43 47 39 30 37 44 50 |
+| 1,638 tokens | 94 42 36 49 74 66 35 37 46 50 51 61 |
+| 12,785 tokens | 85 40 33 43 45 40 35 38 41 45 49 44 |
+| 413 tokens | 87 45 32 36 38 41 36 32 36 36 31 37 |
+
+After the 12,785-token prompt the first eight steps take 359 ms: 22 tok/s (Strata's 14.4 is its figure of
+2026-11-11 on a 16k prompt, not rerun). Only the first request of a fresh server is slow throughout (20-40 NVMe reads
+per step: the tiers hold another text's ranking). What is left is step 0: 85-120 ms against ~40, once per reply; the
+flex tail's records go back at the release (216 records, ~2 GB, in X15's logs) and the step waits behind them
+(inferred from the sizes, not profiled).
+
+Experiment (`QX_DS_POST_PROMPT=1`): the experts a chunk streams after the routing become promotion candidates (today
+only the used picks are), the chunk tick's candidates stay for 16 ticks, and the free VRAM slots take them beyond the
+per-token budget. Result: slower. Steps after the same five prompts: 185 157 158 139 140 134 153 125 87 88 82 66 /
+128 90 112 103 94 93 55 62 44 55 58 53 / 112 115 152 122 126 118 94 91 63 59 47 38 / 102 46 101 130 142 114 94 75 80
+55 46 48 / 84 47 84 119 136 110 96 87 94 59 40 41; 48 tokens in 3.27 / 2.65 / 2.60 / 2.72 / 2.40 s against 2.93 /
+2.48 / 2.13 / 2.20 / 1.88. The replies are identical (5/5). The burst's copies and NVMe reads share the link and the
+driver with the steps they were meant to help.
+
+Verdict: REJECTED. Raw: `perf/results/2026-11-14/x-post-prompt/`.
+

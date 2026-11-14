@@ -2,6 +2,19 @@
 
 
 
+## Resume 2026-11-14, morning: several short prompt stretches in one chunk LANDED (three clients: wall -5%, per-request decode +4 to +9%); baseline unchanged (19.166)
+- **Landed** `perf/results/2026-11-14/setd-promo29-072001` + `x-multi-chunk` (binaries `~/qx-bins/chunk128`, in
+  `target/release`): set D 19.187 against 19.166 (no scored case merges: not promoted). The scheduler merges the
+  running requests' remaining prompt stretches of 64-255 tokens into one exact chunk (`forward_chunk_parts`;
+  `QX_DS_CHUNK_MULTI=0` off). Replies identical to separate chunks in every test (two and three slots, after
+  rewinds, beside a decoder). Cost: median TTFT +0.17-0.27 s at three clients.
+- The user's focus list of 2026-11-14 (short-prompt cost, decode under several clients, tokens after a prompt, the
+  start-up panic): the first is at its exact floor (the bytes of the experts used; leaving out one-row experts
+  REJECTED as a default: top-1 at the 95% floor), the second landed here, the third is measured and already ahead
+  of Strata's figure (22 against 14.4 tok/s over the first eight tokens after a 12.8k prompt; a promotion burst
+  REJECTED), the fourth is being hunted (`chain-x16.sh`; no panic in the starts so far: see the log).
+- The user asked about automatic prefix caching: backlog item 2 of the new queue.
+
 ## Resume 2026-11-14: a prompt chunk's prefetch follows the predicted routing (prompts of 256-2,048 tokens 1-16% faster, replies identical); baseline unchanged (19.166)
 - **Landed** (verdict in the notebook entry of 2026-11-14) `perf/results/2026-11-14/setd-promo28-013028` (binaries
   `~/qx-bins/chunk122`, in `target/release`): set D 19.167 against 19.166 (no scored case has a chunk of 256-2,048

@@ -9,6 +9,22 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-14, morning (several stretches in one chunk landed; the user's focus list worked through)
+1. **A start-up capture panic** (once in ~35 starts; the server exits with 101): the hunt (`chain-x16.sh`:
+   start-only launches with `RUST_BACKTRACE=1`, a panicking start keeps its log as `~/qx-chains/x16-PANIC-*`).
+   Suspect, unproven: a launch-info buffer (56 bytes = 7 words) missing CubeCL's info cache during a capture.
+2. **Prefix reuse across slots** (the user asked: "automatic prefix caching like vLLM"). Today a request takes the
+   free slot sharing the longest prefix (>= 256 tokens) and rewinds it; nothing is shared with a running slot, and a
+   slot's cache is gone once another prompt takes it. Try: copy a prefix's KV, stores and ring state from another
+   slot; size the copy against a chunk.
+3. **Merged chunks, what is left**: the first arrival on an idle server still runs alone (a few ms of waiting for
+   mates would merge all three: X9); parts of 256+ rows are never merged (f16 results may depend on the batch:
+   unmeasured); an `M` trace line naming a merge; more than three slots / over 768 merged rows untested.
+4. **Step 0 after a prompt** (85-120 ms against ~40: the flex tail's ~2 GB of records going back, inferred).
+5. **One-row experts left out of f16 chunks** (-11 to -18% of a 256-row chunk for the whole top-1 margin): only if
+   the user widens the bound for short prompts.
+6. Carried from the queue below: its items 2, 3, 6, 8-12.
+
 ### Queue as of 2026-11-14 (a chunk's prefetch follows the predicted routing)
 (2026-11-14, later: item 1 measured. A 256-row chunk is its used experts' bytes, ~59 GB at ~40 GB/s; leaving out
 one-row experts gives 11-18% but spends the top-1 margin: notebook "One-row experts left out", REJECTED as a default.
