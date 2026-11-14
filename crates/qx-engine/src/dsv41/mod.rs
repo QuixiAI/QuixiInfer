@@ -2462,7 +2462,7 @@ impl<'a> DsEngine<'a> {
         // this layer's predicted rows per expert (empty: no prediction)
         let mut pred_score: Vec<f32> = Vec::new();
         // The predicted rows from which a pick is staged before the routing is known (`QX_DS_CHUNK_PRED_T`, default
-        // 3; measured 2026-11-13 on 256 / 592 / 2,040 rows: 1.49 / 2.00 / 3.13 s at 3, 1.59 / 2.03 / 3.10-3.14 at
+        // 3; measured 2026-11-13 on 256 / 592 / 2,040 rows: 1.49 / 2.00 / 3.13 s at 3, 1.59 / 2.04 / 3.10-3.14 at
         // 1, 1.44 / - / 3.23 at 6; a threshold calibrated on the hit rate per score class was worse). 0: nothing
         // is held back.
         static PRED_T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
