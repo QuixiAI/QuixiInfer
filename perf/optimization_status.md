@@ -3895,3 +3895,157 @@ short chunks and true on the long ones.
 - f16 for chunks under 256 rows (above): 1.52 / 2.06 / 2.27 / 1.67 / 1.57 s against 1.54 / 2.22 / 2.52 / 1.78 /
   1.64 exact; behind `QX_DS_CHUNK_F16_MIN=0`.
 - V21's KL run (200 tokens with a 512-token tail) made no chunk and compared two identical runs: void.
+
+
+## 2026-11-14: A prompt chunk's prefetch follows the next layer's predicted routing, and the picks predicted without rows wait for the routing — LANDED (three-slot 256k server, fresh prompts: 298 tokens 2.46 -> 2.07 s, 413: 2.31 -> 2.06, 582: 2.61 -> 2.39, 872: 2.71 -> 2.50, 960: 2.94 -> 2.76, 1,638: 3.17 -> 3.14; replies byte-identical; set D 19.167 against 19.166); run `perf/results/2026-11-14/setd-promo28-013028` (adjudication below)
+
+Tree: a3f0f10 plus `driver.rs`, `mod.rs` (`git diff -- crates` sha 92cdd44d6a0c), committed with this entry;
+binaries `~/qx-bins/chunk122` (qx-ds-check d0f057bcff3d, quixiinfer db73acff0661, qx-ds-multi 132279853400,
+qx-ds-replay 5b4a42be0f40), in `target/release`. chunk121 was the build the breaker read; chunk122 adds its
+hardening note and the cap for the exact kernels. Chains: PR1-PR14 (screening, worktree builds), W1-W3
+(chunk121/122, timings and server arms), V27 (the validation recipe), W5 (the gate run).
+
+### What was measured first
+- **The next layer's router on this layer's FFN input names most of the experts the chunk will use.** Layer
+  l + 1's router (norm, router GEMV, top 12) on layer l's `xpre`, for every row, read back with layer l's
+  selections; the union over the rows against the experts layer l + 1 then routes to, NVMe-tier experts only:
+  2,040 rows: top-8 recall 83.9%, precision 79.7%; top-12 96.9% / 70.0%. 256 rows: top-8 63.2% / 51.9%, top-12
+  87.0% / 34.8%. The later guess (the layer's own router on the residual before its attention) is sharper (2,040
+  rows 91.0% / 83.3%, 256 rows 78.0% / 64.8%) but needs a sync per layer and comes after the experts: not built.
+- **The hit rate rises with the predicted row count and hardly depends on the chunk's size.** Score = rows that
+  have the expert in their predicted top 8, plus a quarter per row that has it in ranks 9-12. Used / experts
+  outside VRAM by score class, 256 | 592 | 2,040 rows: score 0: 8% | 11% | 20%; under 1: 24% | 27% | 37%; 1: 48%
+  | 50% | 52%; 2: 66% | 64% | 69%; 3: 72% | 71% | 77%; 4-5: 81% | 79% | 80%; 6-7: 90% | 85% | 89%; 8 and more:
+  91-96% | 91-98% | 91-99%.
+- **A chunk's time follows the records it stages, blind ones included.** Warmed single chunk in `qx-ds-check`,
+  old order: 256 rows 1.84 s with 7,562 records staged for 5,644 used; 2,040 rows 3.24 s with 12,382 for 10,805.
+  Before the routing arrives the old prefetch job had submitted 1,224 NVMe reads at 256 rows (365 of them used)
+  and 2,392 at 2,040 rows (1,777 used).
+- **The ceiling of any predictor** (the same chunk's own routing replayed from a file as the prediction): 256 rows
+  1.43 s, 592 rows 1.86 s, 2,040 rows 2.97 s.
+
+### Change
+- `mod.rs`, `forward_chunk_inner`: in each layer's slab loop `chunk_predict` runs layer l + 1's router on the
+  slab's FFN input into a small device buffer (rows x 12 ids, allocated per chunk outside the flex tail); after
+  the layer's sync the ids come back with the selections and become `pred`: predicted rows per expert. Layer
+  l + 1's prefetch job carries `pred` and `pred_t`. Only where a chunk prefetches (256 rows or more) and up to
+  `QX_DS_CHUNK_PRED_MAX` rows (2,048; 768 with the exact kernels of `QX_DS_PREFILL_EXACT=1`).
+- `driver.rs`, `serve_chunk`: the pick is ordered by tier, then predicted rows, then score, and split at
+  `pred_t` (`QX_DS_CHUNK_PRED_T`, default 3). The picks under it are held back: no read of theirs is submitted
+  and no record staged until the engine has published the layer's routing; then the existing skip drops the
+  unused ones. The loop leaves the hold when the published generation is this job's, or is neither this job's
+  nor the one at the job's start (the engine went past: the rest is staged blind, as before), or after 5 s.
+- The prediction decides the order and timing of staging only. With no prediction (layer 0, chunks under 256 or
+  over 2,048 rows, `QX_DS_CHUNK_PRED=0`) the job is the old one.
+- Chunk log: NVMe reads submitted before the routing, the used ones among them, the time held;
+  `QX_DS_CHUNK_PRED=2` adds the predictor's accuracy and the score classes.
+
+### Results
+Warmed single chunk, `qx-ds-check`, chunk122, `QX_DS_CHUNK_PRED=0` against default (ms; NVMe records from the
+same chunk122 runs):
+
+| rows | off | on | change | NVMe records off -> on |
+|---|--:|--:|--:|--:|
+| 256 | 1,844 | 1,490 | -19.2% | 1,613 -> 921 |
+| 592 | 2,295 | 1,984 | -13.6% | 2,106 -> 1,475 |
+| 1,024 | 2,625-2,646 (three runs) | 2,376-2,378 | -9.4 to -10.2% | |
+| 2,040 | 3,237-3,249 | 3,128-3,169 (nine runs) | -2.1 to -3.7% | 3,046 -> 2,653 |
+| 4,096 | 4,309-4,315 | 4,322 (cap: no predictor) | 0 | |
+| 8,192 + 8,184 (16k prompt) | 4,725-4,783 + 6,915-6,969 | 4,775-4,795 + 6,945-6,963 (cap) | 0 | |
+
+Three-slot 256k server, fresh, six distinct prompts in sequence then two repeated (prompt seconds; W3, chunk122;
+the same to 0.02 s in PS2 and PS3 on earlier builds, off and on alternating twice):
+
+| prompt tokens | off | on | exact knob, off | exact knob, on |
+|---|--:|--:|--:|--:|
+| 298 | 2.46 | 2.07 | 2.59 | 2.18 |
+| 582 | 2.61 | 2.39 | 2.97 | 2.81 |
+| 960 | 2.94 | 2.76 | 3.68 | 3.68 (cap) |
+| 413 | 2.31 | 2.06 | 2.56 | 2.27 |
+| 1,638 | 3.17 | 3.14 | 5.08 | 5.08 (cap) |
+| 872 | 2.71 | 2.50 | 3.44 | 3.45 (cap) |
+| 298 again (tiers warmed) | 2.19 | 1.87 | 2.33 | 2.01 |
+| 582 again | 2.57 | 2.27 | 3.01 | 2.76 |
+
+Reply times are equal between the arms (64 tokens 2.03-3.72 s each way). Prompts under 256 tokens and over 2,048
+are untouched (79 / 186 / 232 / 128 tokens: 1.54 / 2.23 / 2.55 / 1.79 s without a prediction, 1.56 / 2.23 / 2.53
+/ 1.81 with one, PS1 at 23:02-23:04 on a build that still predicted there; a 3,293-token prompt has one chunk of
+3,293 rows: no predictor).
+
+What each half gives (chunk122, ms): 256 rows: off 1,844, order only (`PRED_T=0`) 1,592, everything held
+(`PRED_T=1e9`) 1,681, default 1,490. 1,024 rows: 2,646, 2,419, 3,107, 2,376.
+
+### Validation (chunk122)
+- Tail dumps of 2k and 16k prompts byte-identical to chunk113's. Exact kernels, 592-row chunk, predictor on
+  against off: dumps identical (815 ms held, no cuBLAS). ds-checks parts b and a: same text as v11's.
+- prefill256k configuration: default dump byte-identical to `po3.bin`; exact knob: the 64 tail rows bit-identical
+  to `pe.bin`.
+- Server: replies to the 13,283 / 3,293 / 1,638-token prompts the same bytes as `v12b-old`'s; the six W3 prompts
+  the same bytes on against off, in default and in exact mode, and chunk122's the same as chunk121's.
+- Exact, two long prompts at once: 60/60 and 60/60 row hashes equal to `t0`. A beside B: 98/98 against `t9a`,
+  64/64 against `t9b`. A 79-token chunk beside a decoder: 98/98 and 60/60. Short prompts by chunks against
+  windows: 316/316 decode rows in exact and in default mode, texts the same. Rewind: 190 common rows equal (127
+  from the start, 63 from the end), texts the same.
+- A predicted chunk beside a decoder, then two predicted chunks at once (exact knob, W3b): the four replies the
+  same bytes on against off; the 582-token prompt arriving a second into a reply 3.03 -> 2.89 s, 298 tokens
+  2.60 -> 2.19, the 960-token one 3.71 (cap), 713 tokens beside it 3.48 -> 3.34.
+- 600 tokens (an 88-row chunk and 512 steps), exact knob against default: 600/600 rows identical. Panic hook:
+  the process is gone 7.4 s after the request, one fatal line.
+- serve256k identity sessions: three on chunk122 with the VM off (`v27-serve256k-1-012401`,
+  `v27-serve256k-2-012703`, and the gate run's), all identical; serve256k1 38.46 / 36.94 / 38.48, serve256k3
+  90.58 / 91.41 / 90.74. The 8k serve guard with the VM off (`w6-serve-013951`): serve1 32.34, serve3 78.68
+  (chunk120: 35.06 / 78.49; the scoreboard gives serve1 a range of 32.3-36.5).
+- Gate run `setd-promo28-013028` (preflight: VM shut off, 3.3 GB used, no build tools): decode256k 38.8 / 38.8,
+  prefill256k 2.0, serve256k1 38.48, serve256k3 90.74; score 19.167 against 19.166. Scored cases cannot be
+  touched by the diff with default knobs: decode256k and serve256k3 make no chunk, prefill256k's chunks have
+  8,192 rows (no predictor, the old job).
+- **A void run, kept for the record:** `setd-promo27-004139` read 19.495 (decode256k 39.4 / 41.5, decode 34.5).
+  The user's Windows VM ran from 00:38:01 to 01:03:34 (journal), starting three minutes before that run
+  (preflight: "vm running", qemu at 344% CPU, 19.7 GB used). The V27 steps in that span (the end of ds-checks a,
+  the 8k serve guard at 36.66 / 83.47, the prefill256k dumps, the sequential server session, the two exact
+  sessions against `t0` and `t9a`/`t9b`, the exact short-prompt pair) ran beside it: their identities stand,
+  their times do not count. The journal gives the bench scope a 112G peak and the VM scope a 16G peak with 3.6G
+  of swap; `free` read 117 GB used and 4 GB free at about 00:59 (seen in the session, in no log); no OOM. Every A/B timing above
+  (PR, PS, W1-W3: 22:05-00:27) and the gate run, the two identity sessions and the 8k guard's repeat (01:24 on)
+  ran with the VM off.
+
+### Breaker (chunk121; fresh context)
+Nothing to fix. Checked and fine: the predictor's scratch (sized for the widest slab, read by nobody else), no
+`blas_map` hit, no module or kernel load under a posted job, the small buffer's allocation, gate liveness (every
+layer that posts a prefetch job publishes its routing after a sync that depends only on jobs ahead in the
+driver's queue), the pick's truncation before the split, a 300,000-case model of the staging loop (no empty
+batch, no double submit, every used pick staged once), thread placement (the driver thread already spins). Its
+notes, all answered: the server numbers were from an earlier build (re-run on chunk121 and chunk122: PS3, W3);
+the exact-kernel call site had never run (W2's dump pair, W3's exact arms: identical, and it showed the exact
+path loses above ~800 rows: the 768 cap); no predicted chunk beside a decoder (W3b); a latent 5 s stall if the
+engine publishes the next layer's routing while the driver sits in one read (unreachable with today's tiers:
+the hold now ends on a foreign generation); the off arm's age (re-measured on chunk122).
+
+### Tried and not kept
+- The threshold calibrated on the hit rate per score class (hold a class back unless 70 / 85 / 95% of it was
+  used so far): 256 rows 1.50 / 1.50 / 1.65 s, 592 rows 2.04 / 2.11 / 2.27, 2,040 rows 3.26 / 3.89 / 4.30 against
+  1.49 / 2.00 / 3.13 at a fixed 3. Recall matters more than precision for the long chunks.
+- Fixed thresholds: 0.25: 1.57 s at 256 rows, 3.10 at 2,040; 1: 1.59 / 2.04 / 3.10-3.14; 6: 1.44 / - / 3.23.
+- The predictor on every 16th slab for long chunks (512 rows predicted of 8,192): 4.75 + 7.00-7.05 s against
+  4.73 + 6.92-6.93 without a predictor (+0.4 to +2.0%; all rows predicted: 4.99-5.03 + 7.21-7.25, +3.8 to +5.6%).
+  Capped instead.
+- A prediction for chunks under 256 rows (they post no prefetch job): 79 / 186 / 232 / 128 tokens 1.56 / 2.23 /
+  2.53 / 1.81 s against 1.54 / 2.23 / 2.55 / 1.79.
+- `qx-ds-check` with `QX_DS_WARM=1` and a prompt under 128 tokens faults (a 96-row window, status 700) with or
+  without this diff: the check tool's warm pass, not the server. Open, low.
+
+### Adjudication (fresh context, 2026-11-14): LANDED, not a promotion
+- Gate: `perf_diff.py` score 19.166 -> 19.167 (+0.0%); decode256k 38.55 -> 38.80 (+0.6%), prefill256k 2.00 ->
+  2.00, serve256k3 91.32 -> 90.74; guards decode +0.7%, prefill128 -0.9%. Like for like: same settings, the
+  binaries in `target/release` are chunk122, `working-tree.diff` equals `git diff -- crates` (92cdd44d6a0c).
+- The bar for a change of this complexity (8% on the targeted metric) is cleared at 298-582 tokens (-15.9, -10.8,
+  -8.4%), not at 872-960 (-7.7, -6.1%) and not at 1,638 (-0.9%); the six prompts summed 16.20 -> 14.92 s (-7.9%).
+  Landed on the 256-600-token range, with no regression elsewhere, exact output and `QX_DS_CHUNK_PRED=0`.
+- Its negatives: `correctness: pass` in `run.json` is attached by hand (bench.sh `--promo` runs without
+  `--check`; the ds-checks logs are now in the run's `logs/`); the A/B chains carry no preflight line (the
+  journal shows the VM off, the builds between chains and no OOM for them); the serve256k identity sessions make
+  no chunk, so the changed path's server identity rests on the W3, W3b and V27 comparisons.
+- The void claim for `setd-promo27-004139` is justified (journal, preflight line, the run's two modes), and no
+  headline timing comes from the VM's window.
+- Its text corrections are applied above; the two numbers it found off in `mod.rs` comments (2.03 -> 2.04 at 592
+  rows) go in a comment-only commit after the validated diff.

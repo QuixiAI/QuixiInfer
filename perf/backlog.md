@@ -9,6 +9,33 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-14 (a chunk's prefetch follows the predicted routing)
+1. **What a prompt chunk of 256-2,048 rows still stages** (256 rows: 6,331 records for 5,644 used, 1.49 s; the
+   ceiling with a perfect prediction is 1.43 / 1.86 / 2.97 s at 256 / 592 / 2,040 rows against 1.49 / 1.98 /
+   3.13). The predictor is nearly spent; what is left is the used records themselves (5,644 records, ~53 GB, for
+   a 256-row chunk): VRAM a short prompt does not need lent to the experts it routes to most, and the chunk's GPU
+   floor (item 3).
+2. **The predictor for chunks over 2,048 rows** (capped: its exact router products cost 0.25 s per 8,192-row
+   chunk). Low: at 8,192 rows the order gains nothing even when the predictor is nearly free (on every 16th slab:
+   16k prompt 4.75 + 7.00-7.05 s against 4.73 + 6.92-6.93 without; the NVMe reads of the second chunk fell 3,505
+   -> 2,698 all the same). Untested with a cheap predictor: 2,049-4,095 rows (4,096 rows: +1.5% with the full
+   one). An f16 router product over the chunk would be the cheap form.
+3. **Windows for prompts under 64 tokens / the chunk floor** (~1.2 s at 40-88 rows: sync on the slab passes
+   0.70-0.87 s): a cheaper small-chunk pass would move the threshold down.
+4. **The per-request decode rate under several clients with short prompts** (three-turn loadgen at three clients:
+   9.31 -> 8.43 tok/s per request since stretches of 64+ tokens chunk). Try: two short stretches in one chunk.
+5. **The tokens right after a prompt** (first steps 174, 102, 82, 79 ms after a long prompt).
+6. **serve256k1's spread** (36.9-40.9 by the warm-up's arrival order): adopt `--stagger` in loadgen and bench.sh
+   with a re-measured baseline.
+7. **A start-up capture panic** (once in ~35 starts; the server exits with 101): root cause open.
+8. The longest gap between two stream deltas beside a long prompt is one chunk (9-16 s at 250k).
+9. f16 for chunks under 256 rows needs accuracy evidence on more than one text (`QX_DS_CHUNK_F16_MIN=0`).
+10. `qx-ds-check` with `QX_DS_WARM=1` and a prompt under 128 tokens faults in a 96-row window (status 700; the
+    check tool's warm pass, with or without the predictor; the server is not affected).
+11. Carried: the Engram projection in f16; expert arithmetic in f16; the outlier of a fresh process.
+12. Host: the benchmark needs the Windows VM off (2026-11-14: a run beside it read 19.495 against 19.167 forty
+    minutes later without it; the preflight line shows it). bench.sh could refuse or warn.
+
 ### Queue as of 2026-11-13, morning (short prompts in chunks; the guard for the promotion race; the ring item closed)
 1. **The NVMe reads of a prompt chunk** (2k chunk 3.24 s: 3,048 reads, 2,356 of them used; a 79-row chunk 1.54 s:
    1,053 NVMe records, 137 experts per layer). Not tried: the next layer's routing predicted from this layer's

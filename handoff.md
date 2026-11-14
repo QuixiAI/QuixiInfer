@@ -1,6 +1,23 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-13)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-14)
 
 
+
+## Resume 2026-11-14: a prompt chunk's prefetch follows the predicted routing (prompts of 256-2,048 tokens 1-16% faster, replies identical); baseline unchanged (19.166)
+- **Landed** (verdict in the notebook entry of 2026-11-14) `perf/results/2026-11-14/setd-promo28-013028` (binaries
+  `~/qx-bins/chunk122`, in `target/release`): set D 19.167 against 19.166 (no scored case has a chunk of 256-2,048
+  rows: not promoted). Three-slot 256k server, fresh prompts: 298 tokens 2.46 -> 2.07 s, 413: 2.31 -> 2.06, 582:
+  2.61 -> 2.39, 872: 2.71 -> 2.50, 960: 2.94 -> 2.76, 1,638: 3.17 -> 3.14; repeated prompts 2.19 -> 1.87 and
+  2.57 -> 2.27. Replies and logits byte-identical: the prediction decides the order and timing of staging only.
+- How: in each chunk layer the next layer's router runs on this layer's FFN input (top 12 per row); the summed
+  rows per expert order the next layer's prefetch picks, and picks predicted with fewer than 3 rows wait until
+  the routing is known. Knobs: `QX_DS_CHUNK_PRED` (0 = old order, 2 = accuracy in the chunk log),
+  `QX_DS_CHUNK_PRED_T` (default 3), `QX_DS_CHUNK_PRED_MAX` (default 2,048 rows; 768 with the exact kernels).
+- The predictor is nearly spent for these sizes (perfect prediction: 1.43 / 1.86 / 2.97 s at 256 / 592 / 2,040
+  rows against 1.49 / 1.98 / 3.13). Over 2,048 rows it is capped: its exact router products cost more than the
+  order gains, and at 8,192 rows the order gains nothing even with a nearly free predictor (backlog item 2).
+- **The benchmark needs the Windows VM off.** It ran 00:38-01:03 on 2026-11-14 during validation: the run beside
+  it (`setd-promo27-004139`, 19.495) is void; identities measured beside it stand. Check the preflight line.
+- Next: the backlog's queue of 2026-11-14.
 
 ## Resume 2026-11-13 (morning): prompts of 64+ tokens run in chunks, bit-identical to before (four cold prompts 2.3-3.9x faster, warm repeats 1.1-1.3x); the promotion race guarded; baseline unchanged (19.166)
 - **Landed** (adjudicator: HOLD twice, then LANDED) `perf/results/2026-11-13/setd-promo25-074000` (binaries `~/qx-bins/chunk120`, in
