@@ -4049,3 +4049,56 @@ the hold now ends on a foreign generation); the off arm's age (re-measured on ch
   headline timing comes from the VM's window.
 - Its text corrections are applied above; the two numbers it found off in `mod.rs` comments (2.03 -> 2.04 at 592
   rows) go in a comment-only commit after the validated diff.
+
+## 2026-11-14: One-row experts left out of (or rerouted in) f16 prompt chunks — REJECTED as a default (256-row chunk 1.55 -> 1.28-1.29 s, but top-1 against the exact prefill falls to 94.9-95.3% on two of four texts)
+
+Status: deferred (the trade is the user's; nothing landed, the experiment's diff is in the run directory).
+
+Question: backlog item 1 of the queue of 2026-11-14, what a 256-2,048-row chunk still stages. A warmed 256-row chunk
+(chunk122, 1.49 s) is 711 ms of sync on the slab passes and 676 ms of expert enqueue; the driver is busy 1.24 s of it
+(793 ms waiting for NVMe reads, 135 ms in their submits); 5,402 RAM and 915 NVMe records staged (~59 GB, about 40
+GB/s against the box's 52-59 GB/s DRAM ceiling). The bytes are the cost, so: which experts carry few rows?
+
+Rows per used expert outside VRAM (`QX_DS_CHUNK_HIST`, diagnostic build; k = 6):
+
+| chunk rows | used outside VRAM | with one row | with two | one-row share, RAM / NVMe | pairs they carry |
+|--:|--:|--:|--:|--:|--:|
+| 256 | 5,843 | 1,725 | 916 | 26% / 53% | 2.8% of 61,440 |
+| 592 | 5,787 + 1,199 | 1,678 | 983 | 18% / 43% | 1.2% |
+| 1,024 | 7,555 + 1,624 | 1,499 | 969 | 12% / 34% | 0.6% |
+
+Most one-row experts sit at the row's ranks 4 and 5 (RAM, 256 rows: 797 of 1,328).
+
+Experiment (`QX_DS_CHUNK_DROP=N,R,T,mode`, f16 chunks only): an expert outside VRAM with at most N rows, all at rank
+R or lower, is not staged; its selections get weight 0 (mode 0), or the row's other weights are scaled up (1), or the
+selection moves with its weight to the row's best-scored expert that is in VRAM or has two rows or more (2; the
+host recomputes the router's score sqrt(softplus(logit)) + bias and it agrees with the routed ids on every row).
+
+Accuracy: a 264-row chunk, then 512 exact single steps whose logits are compared with the same steps after an exact
+prefill (`QX_DS_PREFILL_EXACT=1`); four texts (route16k at 0 and 8,000, wiki256k at 50,000 and 150,000); 513 scored
+rows each (the dumps' other 263 rows are identical in every arm and are left out here).
+
+| arm | top-1 per text | pooled top-1 | mean KL per text | pooled KL | chunk ms per text | mean |
+|---|---|--:|---|--:|---|--:|
+| default (f16) | 95.9 / 98.6 / 95.3 / 96.3 | 96.5% | 0.0195 / 0.0065 / 0.0138 / 0.0094 | 0.0123 | 1,491 / 1,596 / 1,616 / 1,506 | 1,552 |
+| one row, rank >= 3, zeroed | 96.1 / 96.5 / 94.7 / 96.7 | 96.0% | 0.0213 / 0.0129 / 0.0169 / 0.0103 | 0.0154 | 1,309 / 1,429 / 1,441 / 1,332 | 1,378 (-11.2%) |
+| one row, any rank, zeroed | 94.9 / 97.5 / 94.9 / 95.7 | 95.8% | 0.0242 / 0.0132 / 0.0210 / 0.0241 | 0.0206 | 1,242 / 1,310 / 1,328 / 1,226 | 1,277 (-17.8%) |
+| one row, any rank, rerouted | 95.1 / 98.1 / 95.3 / 95.7 | 96.1% | 0.0291 / 0.0157 / 0.0233 / 0.0159 | 0.0210 | 1,250 / 1,319 / 1,332 / 1,261 | 1,290 (-16.9%) |
+
+At 512 rows (1,024 tokens of route16k, all 1,024 dump rows, 511 identical): default KL 0.0075, top-1 98.2%, 1,911 ms;
+one row zeroed (RAM + NVMe) 0.0081, 97.8%, 1,755 ms (-8%, with a sync upload per selection in that build); two rows
+0.0137, 98.3%, 1,599 ms; NVMe-tier only 0.0078, 1,918 ms (no gain: the reads predicted with rows are submitted
+before the routing either way). Renormalizing the row's weights: 0.0096 against 0.0081 (no better).
+
+Verdict: REJECTED as a default. Pooled, every arm is inside the contract (KL <= 0.03, top-1 >= 95%), but the default
+itself is at 95.3-95.9% on two of the four texts and each arm puts at least one text at 94.7-95.1%: the gain (11-18%
+of a 256-row chunk, 8% at 512 rows, less above) is bought with the whole remaining top-1 margin. Rerouting is no
+better than zeroing on KL (0.0210 against 0.0206). The exact path cannot use it at all. Not retried unless the user
+widens the bound for short prompts.
+
+What this settles for item 1: the 256-row chunk's remaining time is the bytes of experts it really uses; without
+approximation only VRAM residency removes them, and the three-slot 256k server has ~1.2 GiB free.
+
+Raw: `perf/results/2026-11-14/x-drop-onerow/` (experiment.diff, chain scripts, log.txt, rows-per-expert.txt);
+binaries `~/qx-bins/chunk123d`-`chunk127d` (diagnostic, not installed).
+

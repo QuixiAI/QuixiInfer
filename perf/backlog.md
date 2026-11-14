@@ -10,6 +10,9 @@ invented one. The aggregate score lives in `scoreboard.md`.
 ## Beam
 
 ### Queue as of 2026-11-14 (a chunk's prefetch follows the predicted routing)
+(2026-11-14, later: item 1 measured. A 256-row chunk is its used experts' bytes, ~59 GB at ~40 GB/s; leaving out
+one-row experts gives 11-18% but spends the top-1 margin: notebook "One-row experts left out", REJECTED as a default.
+The user's focus list of 2026-11-14: items 1, 4, 5, 7 below. New item 13.)
 1. **What a prompt chunk of 256-2,048 rows still stages** (256 rows: 6,331 records for 5,644 used, 1.49 s; the
    ceiling with a perfect prediction is 1.43 / 1.86 / 2.97 s at 256 / 592 / 2,040 rows against 1.49 / 1.98 /
    3.13). The predictor is nearly spent; what is left is the used records themselves (5,644 records, ~53 GB, for
@@ -35,6 +38,10 @@ invented one. The aggregate score lives in `scoreboard.md`.
 11. Carried: the Engram projection in f16; expert arithmetic in f16; the outlier of a fresh process.
 12. Host: the benchmark needs the Windows VM off (2026-11-14: a run beside it read 19.495 against 19.167 forty
     minutes later without it; the preflight line shows it). bench.sh could refuse or warn.
+13. **Prefix reuse across slots** (the user asked, 2026-11-14: "automatic prefix caching like vLLM"). Today a
+    request takes the free slot sharing the longest prefix (>= 256 tokens) and rewinds it (`worker_ds.rs`): nothing
+    is shared with a running slot, and a slot's cache is gone once another prompt takes it. Try: copy a prefix's KV
+    and ring state from another slot (running or free) instead of recomputing it; size the copy against a chunk.
 
 ### Queue as of 2026-11-13, morning (short prompts in chunks; the guard for the promotion race; the ring item closed)
 1. **The NVMe reads of a prompt chunk** (2k chunk 3.24 s: 3,048 reads, 2,356 of them used; a 79-row chunk 1.54 s:
