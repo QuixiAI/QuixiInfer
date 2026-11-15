@@ -10,8 +10,10 @@ invented one. The aggregate score lives in `scoreboard.md`.
 ## Beam
 
 ### Queue as of 2026-11-15, later (fallback burst located; the smaller staging area rejected as a default)
-1. **`json_object` replies land in `reasoning_content` with an empty `content`** (X33: valid JSON, wrong field): a
-   functional bug, the oldest open one.
+1. **`json_object` replies in `reasoning_content`: FIXED and landed** (notebook 2026-11-15). Left: "the reply opens
+   in a reasoning block" should be "the prompt's last `<think>` has no `</think>` after it" (`task: action` and a
+   trailing `latest_reminder` are now treated as content from the first token, untested); the template's
+   `response_format` section is not fed; `tools` with a constraint; streaming not exercised with a constraint.
 2. **The staging area's upper part lent to the tier**, taken back before a window wider than a few tokens or a chunk
    (the store tails' mechanism): the only form in which the 2.2 GiB can go to decode without the +30% on prompts
    under 64 tokens. Worth at most -4% at three clients (X69); needs the 8% bar's argument or a simpler form.

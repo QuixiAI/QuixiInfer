@@ -4792,3 +4792,65 @@ baseline's tier: the baseline's 39.00 is its level, promo35's 38.60 was a low dr
 
 Raw: `perf/results/2026-11-15/x-chunk-ring/` (ring1.diff, ring2.diff, chain scripts, log.txt, server-log extracts),
 `x69-cap128-032946`, `x69-cap64-033751`, `x69-ring-035647`, `setd-promo40-042115`, `x-fallback-burst/`.
+
+## 2026-11-15: A structured-output constraint waits for the reasoning to end — LANDED (a functional fix: `json_object` / `json_schema` / `guided_*` replies with thinking on came back in `reasoning_content` with an empty `content`)
+
+Not a performance change; the engine is untouched (qx-ds-check 86b73a06c964 as chunk144's). Server layer only
+(`crates/qx-serve`: worker.rs, main.rs, worker_ds.rs; `x-json-think/json-think.diff`; binaries chunk148,
+quixiinfer 2d64a25e2271).
+
+Cause: the chat template opens a reasoning block; the grammar mask applied from the first generated token, so
+`</think>` could never be sampled and the splitter filed the whole constrained reply as reasoning (X33, the
+backlog's oldest functional bug). Fix: (1) a request whose rendered prompt ends with an open `<think>` starts with
+the constraint held off; no mask and no matcher step until the generated text contains `</think>`, then the
+constraint applies from the next token (what vLLM's reasoning-aware structured output does); (2) "the reply opens
+in a reasoning block" is now read from the rendered prompt, not from the request's flag, for the constraint and for
+the reply's split alike: an assistant prefill (the block closed in the prompt) used to have its whole
+continuation filed as reasoning, constrained or not.
+
+| request (temperature 0; X77) | chunk144 | chunk148 |
+|---|---|---|
+| `guided_regex [A-Z]{3}-[0-9]{4}`, thinking on | content empty, 8 chars in reasoning | content `CAP-0001`, reasoning 451 chars, 103 tokens |
+| `json_schema` with keys the prompt does not name, thinking on | content empty, 35 chars in reasoning, 17 tokens (JSON per X76) | content `{ "stadt": "Paris", "einwohner": 68.4 }`, reasoning 451 chars, 119 tokens |
+| the same, thinking off | valid, 16 tokens | identical |
+| the regex after an assistant prefill (`wo_eos`) | content empty | content `IES-2024` |
+| a prefill, no constraint | content empty, 106 chars in reasoning | the 106 chars in content |
+| no constraint, thinking on | 129 chars content, 451 reasoning | identical |
+| `json_object`, `max_tokens` 50, thinking on | 14 tokens, 60 chars in reasoning (JSON per X76) | finish `length`, content empty, 241 chars of reasoning |
+
+The last row is the behaviour change to know: a constrained request now spends its reasoning first (about 100-150
+tokens here, 140 in X76), so a small `max_tokens` can end inside it. More generally, a constrained reply that ends
+inside the reasoning for any reason (`max_tokens`, EOS, a `stop` string, the context) has an empty `content`: the
+constraint is only guaranteed once `</think>` is generated. `chat_template_kwargs.enable_thinking: false` gives the
+short reply in `content` (16 tokens in X77; 14 for `json_object` in X76 on chunk147). X77 is non-streaming; the
+streaming path shares the splitter's flag (by reading, not exercised). X76 (the first form: flag from the request) gave valid JSON in content for
+`json_object` and `json_schema`, but could not tell the constraint from the model's own answer; X77 can.
+
+Breaker (fresh context, read-only): found the first form's hole (the flag set from `chat && thinking`: with a
+prefill or a lone system message the block is not open, `</think>` never comes and the constraint would never
+apply) and that X76 did not discriminate: both fixed above. Checked clean: the `emit` refactor for
+unconstrained requests; `</think>` is one vocabulary entry and decodes at once; JSON accepts the leading newlines;
+the splitter and the worker flip at the same point; the completions endpoint and the CLI are unchanged; no other
+consumer of the matcher. Left as it was: `tools` together with a constraint (the mask forbids a tool-call block
+after the reasoning; the server parses no tool calls either way); the template's `response_format` section is not
+fed (the model reasons without having seen the schema); the other worker (`worker.rs`, not run here) gets the
+field and keeps its behaviour.
+
+Server identity and timing: chunk147 (the first form, X58 e) "identical", 34.61 / 81.17; chunk148 (X58 f)
+"identical", 33.01 / 81.23.
+
+Left open by the final form (the adjudicator): after `task: action` the template opens `<think>` before the task
+token, and after a trailing `latest_reminder` there is no generation prompt: the prompt does not end with
+`<think>`, so the server now treats such a reply as content from the first token and applies a constraint at once
+(before: split at `</think>`). Untested; the comment in `main.rs` names "a task token" among the closed cases, which
+is right for the other task tokens only. The better test is "the last `<think>` in the prompt has no `</think>`
+after it" (backlog).
+
+### Adjudication (fresh context, 2026-11-15): LANDED
+The diff does what the entry says and touches no engine code (qx-ds-check, qx-ds-multi and qx-ds-replay hash as
+chunk144's; the binary of X58 f is the diff's). Every table cell matches the two outputs and the servers' request
+lines. The unconstrained path is unchanged for an ordinary chat (the prompt ends with an open block, so the new flag
+equals the old; "plain think" is 129 / 451 chars and 131 tokens on both binaries). Two identity sessions, none
+mismatching. Seven text corrections, applied.
+
+Raw: `perf/results/2026-11-15/x-json-think/`.

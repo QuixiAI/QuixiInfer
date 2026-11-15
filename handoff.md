@@ -15,7 +15,9 @@
   64 records with the chunk jobs' ring in the flex tail measured -3.2% at three clients but +30% on prompts under 64
   tokens: REJECTED as a default, nothing landed (`x-chunk-ring`: ring2.diff, binaries `~/qx-bins/chunk146`).
   `target/release` holds chunk144, the tree is at the landed code.
-- Next: the backlog's queue of 2026-11-15, later (`json_object` first).
+- `json_object` / `json_schema` / `guided_*` with thinking on: FIXED and landed (the constraint waits for
+  `</think>`; binaries `~/qx-bins/chunk148`, in `target/release`; the engine binaries are chunk144's).
+- Next: the backlog's queue of 2026-11-15, later (item 2: the staging area lent to the tier; item 3: hygiene).
 
 ## Resume 2026-11-14, night: set D 18.640 PROMOTED (the compressed stores' tails lent to the VRAM tier: serve256k3 91.3 -> 83.9)
 - **Promoted** `perf/results/2026-11-14/setd-promo35-210457` + `x-store-lend` (binaries `~/qx-bins/chunk140`, in
