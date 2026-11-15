@@ -9,6 +9,18 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-15, evening (hygiene landed: nothing open but new ideas)
+0. **Re-run the Strata head-to-head** (decode, prefill, three clients, short prompts) before choosing: not measured
+   since the goal was set.
+1. **Short prompts**: a 64-255-token stretch costs ~1.8 s whatever its length (a chunk touches nearly every expert).
+2. **Three clients**: 80.8 ms per token each against ~33 for one; the staging lane and NVMe reads bound the step.
+3. **Deep prefix reuse** (~4.5 s, ~2 s of it experts staged twice): one chunk for the replay and the stretch; a ring
+   checkpoint at a prompt's end for free copies later.
+4. **Decode at depth**: 39.0 ms at 256k against 31.0 short.
+5. Closed by decision (notebook 2026-11-15): the staging area lent to the tier (under the bar); the warm-up's stale
+   jobs (no request affected). Structured output leftovers: the template's `response_format` section is not fed;
+   `tools` with a constraint.
+
 ### Queue as of 2026-11-15, later (fallback burst located; the smaller staging area rejected as a default)
 1. **`json_object` replies in `reasoning_content`: FIXED and landed** (notebook 2026-11-15). Left: "the reply opens
    in a reasoning block" should be "the prompt's last `<think>` has no `</think>` after it" (`task: action` and a

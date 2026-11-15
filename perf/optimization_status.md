@@ -4854,3 +4854,54 @@ equals the old; "plain think" is 129 / 451 chars and 131 tokens on both binaries
 mismatching. Seven text corrections, applied.
 
 Raw: `perf/results/2026-11-15/x-json-think/`.
+
+## 2026-11-15: Hygiene bundle — LANDED (a standing check for `replay_to`, the RAM queue's length in the tail lines, the capture diagnostic for the start-up panic; no behaviour change)
+
+Three leftovers of the backlog in one change (`x-hygiene/hygiene.diff`; `git diff -- crates` e7ac80c0fb2c, the
+whole tree 7bf0be2e7a68 in `run.json`; binaries chunk150: qx-ds-check d13446038401, quixiinfer 04d0a4772a3d):
+1. **`tools/ds-checks.sh` part c** (`DS_CHECKS_PART=c`, also the end of a full run): a rewind beyond the ring's reach
+   replayed through one exact chunk (`replay_to`, X25's shapes): route16k 560 rewound to 400 and 1,280 rewound to
+   1,024, `QX_DS_CHUNK=8192 QX_DS_PREFILL_EXACT=1`. Expected and measured on chunk150 (X79): 160 / 160 and 256 / 256
+   rows bit-identical; about 4.5 minutes. Parts a and b are unchanged (`a` and `b` still exit where they did). A full
+   run is now about 16 minutes (a 7, b 4, c 4.5): run it as three parts under the 10-minute rule; `bench.sh --check`
+   grows by part c. `perf/harness/check_ds_log.py` judges line 7 when it is there (both lines exact; a log of parts
+   a and b alone stays valid): the X79 text passes, the same with 159 / 160 fails.
+2. **The RAM queue's length** (`wb`, cap 512, no expiry) is printed in the verbose lines of a tail taken by a chunk
+   and of a lent tail taken back ("N queued for RAM").
+3. **The capture diagnostic** of the start-up panic (once in ~35 starts on 2026-11-13, 0 in the ~79 starts counted
+   on 2026-11-14, backlog): an info set
+   first staged while a capture records now prints "info miss in a capture: N words ..." unconditionally
+   (`third_party/cubecl-cuda`, `info_buffer`); a normal start has none (0 lines in X78's "new" server log on chunk149, in promo41's
+   logs and in X58 g's).
+
+Validation on chunk150: ds-checks a and b the same text as chunk144's (X65), part c as above; set D `--promo`
+(`setd-promo41-155232`, the diff in the tree, VM off): decode256k 39.5 / 39.1, prefill256k 2.0, serve256k1 37.66,
+serve256k3 80.26, decode 30.9, prefill128 10.5, identity "identical", score 18.477 against 18.475.
+`run.json` records correctness as skipped (`--promo` runs without `--check`): the check is X79 a / b / c on the
+same qx-ds-check. The gate flags serve256k1 (37.66 against the baseline's 32.98, unscored), the highest reading on
+the current default (33.11, 35.35, 36.15, 34.61, 33.01 before); the change is prints only, and two more sessions on
+the same binary (X58 g) read 34.73 / 80.65 and 35.70 / 80.32, both "identical": three identity sessions, none
+mismatching.
+
+Tried and dropped (X78): reading "the reply opens in a reasoning block" as "the prompt's last `<think>` has no
+`</think>` after it" (the adjudicator's note on `task: action`). With `task: action` the model answers with one
+action token (`<｜search｜>`) and no reasoning: the landed test (the prompt ends with `<think>`) returns it as
+`content`, the other form filed it as reasoning with an empty `content`, and a constraint with it never applied (the landed
+form: `XYZ-1202`, conforming). The landed form stays. The same run
+exercised streaming with a constraint and thinking on: content `CAP-0001` (conforming), 451 chars of reasoning, on
+chunk148 and chunk149 alike; and a user message that contains the literal tag: unaffected.
+
+Not done, by decision: the warm-up's dry and capture passes being served from a stale mailbox (the fallback burst:
+no request affected, an engine change for no gain); the staging area lent to the tier (at most -4% at three
+clients, less with any hysteresis since every prompt of 8+ tokens would take it back; under the 8% a new protocol
+needs).
+
+Raw: `perf/results/2026-11-15/x-hygiene/`, `setd-promo41-155232`.
+
+### Adjudication (fresh context, 2026-11-15): LANDED
+Read adversarially in place of a separate breaker pass: both driver edits are inside existing verbose blocks and
+only read `wb.len()`; the cubecl print sits after the cache-hit return, fires at most once per distinct info set
+while a capture records, and is absent from every log of the run; parts a and b of ds-checks behave as before, the
+trailing `exit 0` is needed, part c alone is within the 10-minute rule. Gate reproduced (18.477 against 18.475).
+Conditions met: three identity sessions on chunk150, the tree committed. Eight text corrections, applied; line 7
+added to `check_ds_log.py` on its remark.

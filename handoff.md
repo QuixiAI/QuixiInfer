@@ -17,7 +17,10 @@
   `target/release` holds chunk144, the tree is at the landed code.
 - `json_object` / `json_schema` / `guided_*` with thinking on: FIXED and landed (the constraint waits for
   `</think>`; binaries `~/qx-bins/chunk148`, in `target/release`; the engine binaries are chunk144's).
-- Next: the backlog's queue of 2026-11-15, later (item 2: the staging area lent to the tier; item 3: hygiene).
+- Hygiene bundle landed (binaries `~/qx-bins/chunk150`, in `target/release`): `tools/ds-checks.sh` part c (a rewind
+  replayed through one exact chunk; run the checks as parts a, b, c), "N queued for RAM" in the tail lines, the
+  capture diagnostic "info miss in a capture" for the start-up panic. Set D 18.477 on it (baseline 18.475).
+- Next: the backlog's queue of 2026-11-15, evening (the Strata head-to-head first).
 
 ## Resume 2026-11-14, night: set D 18.640 PROMOTED (the compressed stores' tails lent to the VRAM tier: serve256k3 91.3 -> 83.9)
 - **Promoted** `perf/results/2026-11-14/setd-promo35-210457` + `x-store-lend` (binaries `~/qx-bins/chunk140`, in
