@@ -1056,15 +1056,15 @@ impl Loop {
                     if ram_dedup() && !self.host.store.in_ram(v) {
                         // Swap: the victim's bytes go from its slot (quarantined two ticks, read here on the copy
                         // stream ahead of any refill) into the RAM place of a duplicate: the hottest VRAM resident
-                        // of the class that still has a RAM copy nobody reads (not being copied, not in the flex
-                        // tail, whose refill reads it). The victim counts as in RAM once the copy landed
+                        // of the class that still has a RAM copy nobody reads (not being copied; with
+                        // QX_DS_FLEX_DEDUP=0 not in the flex tail, whose refill reads it). The victim counts as in RAM once the copy landed
                         // (`finish_copies`). No duplicate (or the GPU reads RAM in place): the NVMe queue.
                         let mut swapped = false;
                         if !self.host.gpu_reads_ram && swap_mode() {
                             let h = &self.host;
                             let (fp, fb) = (h.flex_ptr, h.flex_bytes);
                             let (inflight, pre_inflight, d2h) = (&self.inflight, &self.pre_inflight, &self.d2h);
-                            let dup = h.holder.values().copied().filter(|&x| x != v && h.layer_class[x / ne] == c && h.table[x] != 0 && h.store.in_ram(x) && !(fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp) && !h.lend_ranges.iter().any(|r| h.table[x] >= r.1 && h.table[x] < r.2) && !inflight.contains(&x) && !pre_inflight.contains(&x) && !d2h.iter().any(|d| d.0 == x)).max_by(|&p, &q| h.score[p].partial_cmp(&h.score[q]).unwrap());
+                            let dup = h.holder.values().copied().filter(|&x| x != v && h.layer_class[x / ne] == c && h.table[x] != 0 && h.store.in_ram(x) && !(!flex_dedup() && fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp && h.table[x] < fp + fb as u64) && !(!lend_dedup() && h.lend_ranges.iter().any(|r| h.table[x] >= r.1 && h.table[x] < r.2)) && !inflight.contains(&x) && !pre_inflight.contains(&x) && !d2h.iter().any(|d| d.0 == x)).max_by(|&p, &q| h.score[p].partial_cmp(&h.score[q]).unwrap());
                             if let Some(x) = dup {
                                 self.chunk_guard(sh, x);
                                 if let Some((_, p)) = self.host.store.evict_deferred(x) {
@@ -1236,7 +1236,7 @@ impl Loop {
                 }
             } else {
                 // the evicted records go straight back into their slots (one to two GB, a few tens of ms on the
-                // copy stream, and the decode after a prompt pays nothing: without this, the promotions would
+                // copy stream, where the record still has its RAM copy (few do since 2026-11-14 night: `flex_dedup`): without this, the promotions would
                 // refill the tail over hundreds of tokens); the tail's empty slots return to the free lists
                 self.finish_copies(sh, true);
                 let mut refilled = 0usize;
@@ -1442,11 +1442,11 @@ impl Loop {
             // inclusive only for promoted records: the initial VRAM residents have no RAM copy, and a VRAM victim
             // without one falls to NVMe while its replacement holds a slot and a place). Such a copy is evicted
             // first, the hottest resident's first (the least likely to leave VRAM), without the margin test.
-            // Residents of the flex tail keep theirs: the refill after a chunk reads it.
+            // QX_DS_FLEX_DEDUP=0: residents of the flex tail keep theirs (the refill after a chunk reads it).
             let dup = if ram_dedup() && !h.gpu_reads_ram {
                 let (fp, fb) = (h.flex_ptr, h.flex_bytes);
-                // (nor a record in a lent store tail: its slot goes back to the store without notice)
-                let in_tail = |x: usize| (fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp) || h.lend_ranges.iter().any(|r| h.table[x] >= r.1 && h.table[x] < r.2);
+                // (QX_DS_LEND_DEDUP=0: nor a record in a lent store tail)
+                let in_tail = |x: usize| (!flex_dedup() && fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp && h.table[x] < fp + fb as u64) || (!lend_dedup() && h.lend_ranges.iter().any(|r| h.table[x] >= r.1 && h.table[x] < r.2));
                 (0..h.table.len()).filter(|&x| h.table[x] != 0 && h.layer_class[x / ne] == c && h.store.in_ram(x) && !inflight.contains(&x) && !pre_inflight.contains(&x) && !in_tail(x)).max_by(|&a, &b| h.score[a].partial_cmp(&h.score[b]).unwrap())
             } else {
                 None
@@ -1476,6 +1476,25 @@ impl Loop {
         sh.promo_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         true
     }
+}
+
+/// `QX_DS_FLEX_DEDUP=0`: residents of the flex tail keep their RAM copy (for the refill after a chunk), as before
+/// 2026-11-14 night. By default the copy is given up like any other resident's: a record held in VRAM and in RAM
+/// takes the RAM place of one that then stays on NVMe. Until then the flex test had no upper bound and also covered
+/// the lent store tails above the arena; a three-slot 256k server measured serve256k3 83.8 against 81.4 ms per
+/// token with both tests off, and 80.3 with no tail at all (X58; perf/optimization_status.md). A chunk taking the
+/// tail queues the records without a copy for RAM (`flex_check`), and the refill brings back those that have one.
+pub fn flex_dedup() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QX_DS_FLEX_DEDUP").map_or(true, |v| v != "0"))
+}
+
+/// `QX_DS_LEND_DEDUP=0`: residents of a lent store tail keep their RAM copy, as before 2026-11-14 night. By
+/// default the copy is given up like any other resident's (see `flex_dedup`); a slot taking its tails back queues
+/// the records without a copy for RAM (`lend_check`).
+pub fn lend_dedup() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QX_DS_LEND_DEDUP").map_or(true, |v| v != "0"))
 }
 
 /// Whether the RAM copies of VRAM residents are reclaimed (`QX_DS_RAM_DEDUP`, default 2; 0 = the tiers as before
