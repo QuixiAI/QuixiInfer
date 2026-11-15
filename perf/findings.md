@@ -90,6 +90,12 @@ driver JIT at first use.
 | Evictions at a prompt chunk's tick capped at the per-token budget (`QX_DS_EVICT_CAP`): the chunk's tick evicted hundreds of VRAM residents and promoted none (the flex tail holds the free slots) | three-slot 256k server: the 64 tokens after a 13k prompt 3.76 -> 3.55 s, after a second one 3.33 -> 2.72 s; scored cases unchanged by construction. Cost: TTFT of the short requests after it +0.1 s | 2026-11-11 |
 
 
+## Strata on this box, refreshed 2026-11-15 (X81; the 2026-11-07 section below is history)
+
+Prompt of 128 / 256 / 1,024 / 2,048 / 16,384 tokens: Strata 4.0 / 4.8 / 7.3 / 10.4 / 19.2 s (16k: 854 tok/s); our
+chunks 1.1 / 1.9 / 2.3 / 3.1 / 11.7 s (16k: 1,392 tok/s). The 64 tokens after: Strata 16.5-18.9 tok/s, ours 25.3-27.3.
+Strata has no server to compare three clients with.
+
 ## Strata on this box (2026-11-07, same files and ids; details in the notebook)
 
 Decode even (27.5 against our 29.2 warm / 23.8 cold-ish); DSpark gains nothing here (26.9); prefill 1k 148 against

@@ -10,8 +10,9 @@ invented one. The aggregate score lives in `scoreboard.md`.
 ## Beam
 
 ### Queue as of 2026-11-15, evening (hygiene landed: nothing open but new ideas)
-0. **Re-run the Strata head-to-head** (decode, prefill, three clients, short prompts) before choosing: not measured
-   since the goal was set.
+0. **The Strata head-to-head is done** (notebook 2026-11-15): prefill 1.6-3.4x faster, decode ~1.5x; the goal's two
+   lines are met, the rest is our own ceiling. `qx-ds-check` with `QX_DS_WARM=1` needs a context of 512 at least
+   (a 128-token prompt overruns it: CUDA error 700).
 1. **Short prompts**: a 64-255-token stretch costs ~1.8 s whatever its length (a chunk touches nearly every expert).
 2. **Three clients**: 80.8 ms per token each against ~33 for one; the staging lane and NVMe reads bound the step.
 3. **Deep prefix reuse** (~4.5 s, ~2 s of it experts staged twice): one chunk for the replay and the stretch; a ring

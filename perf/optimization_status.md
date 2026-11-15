@@ -4905,3 +4905,33 @@ while a capture records, and is absent from every log of the run; parts a and b 
 trailing `exit 0` is needed, part c alone is within the 10-minute rule. Gate reproduced (18.477 against 18.475).
 Conditions met: three identity sessions on chunk150, the tree committed. Eight text corrections, applied; line 7
 added to `check_ds_log.py` on its remark.
+
+## 2026-11-15: Strata head-to-head, refreshed (measurement only): ahead on every prompt length and on decode
+
+Question: where do we stand against the goal ("match or exceed Strata's prefill and decode") before choosing the
+next experiment. Same box, same model files, the same ids (route16k prefixes), VM off, one run each (X81, X82).
+Strata: `strata-dsv41 --max-context 32768 --experts 6 --ssd-cache 95 --prefill-chunk 8192 --dspark none --n 64`, a
+fresh process per run. Ours: chunk150 `qx-ds-check`, `QX_DS_CHUNK=8192 QX_DS_WARM=1 QX_DS_TAIL=64`, default (KL-bounded)
+prompt chunks, a fresh process per run (kernels warmed, tiers as loaded); the prompt's last 64 tokens run as single
+steps, so the chunk covers N - 64 rows.
+
+| prompt tokens | Strata, prompt | ours, the chunk(s) of N - 64 rows | Strata, 64 tokens after | ours, 64 single steps after |
+|--:|--:|--:|--:|--:|
+| 128 | 4,019 ms | 1,097 ms (64 rows) | 18.1 tok/s | 26.3 |
+| 256 | 4,806 | 1,911-1,921 (192) | 18.9 | 26.8-27.3 |
+| 1,024 | 7,261 | 2,344 (960) | 16.7 | 25.3 |
+| 2,048 | 10,446 | 3,113 (1,984) | 17.5 | 25.9 |
+| 16,384 | 19,185 (854 tok/s) | 4,791 + 6,934 (16,320 rows: 1,392 tok/s) | 16.5 | 26.9 |
+
+Not like for like in two ways, neither large enough to change the order: Strata's prompt time is for all N tokens
+and ours for N - 64 (at 38 ms a step the 64 would add 2.4 s as single steps, far less inside the chunk); Strata's
+process is cold where ours has compiled its kernels (the 16k comparison of 2026-11-11 on fresh processes read
+841-880 against 1,132-1,158 tok/s). Strata has no server: nothing to compare the three-client case with.
+**The goal's two lines are met**: prefill 1.6x (16k) to 3.4x (2k) faster, decode about 1.5x. What is left is our
+own ceiling (the backlog's queue of 2026-11-15, evening).
+
+Found on the way: `qx-ds-check` with `QX_DS_WARM=1` and a prompt of 128 tokens dies with CUDA error 700 (the tool
+sizes the context to the prompt, 256 here, and the warm-up's windows run to position 446); with `QX_DS_CTX=8192` it
+runs. A tool guard, not a server path (the server's context is 8,192 at least): backlog.
+
+Raw: `perf/results/2026-11-15/x-strata-h2h/`.
