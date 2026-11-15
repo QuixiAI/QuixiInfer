@@ -37,6 +37,11 @@ pub struct Tiers {
     arena: DeviceBuf,
     /// The arena's flex tail (address, bytes) that the chunk path's buffers view during a prompt.
     flex: Option<(u64, usize)>,
+    /// The compressed stores' tails lent to the tier (`QX_DS_STORE_LEND`): per slot and store its address range
+    /// above the kept positions, and the VRAM slots carved there (slot, size class, address).
+    lend_ranges: Vec<(usize, u64, u64)>,
+    lend_slots: Vec<(usize, usize, u64)>,
+    lend_keep: usize,
     /// Per global expert: its VRAM address or 0.
     table: Vec<u64>,
     /// VRAM slots by record size: (bytes, free slot addresses); and which expert holds each slot.
@@ -433,6 +438,11 @@ pub struct DsEngine<'a> {
     /// stores already hold the exact rows; the replay's early positions are not exact and must not overwrite or
     /// be read back from them) and launch eagerly (no graph has that kernel set).
     replaying: bool,
+    /// The stores' tails lent to the tier: the positions a slot keeps (0: nothing is lent) and the slots whose
+    /// tails are lent now (`store_need`, `store_lend`).
+    lend_keep: usize,
+    lent: Vec<bool>,
+    lend_started: bool,
     /// The pool for the experts the host dispatches (None in the asynchronous mode: the driver has its own).
     pool: Option<Pool>,
     /// Rows the compressed stores hold (the context in compressed positions).
@@ -1229,6 +1239,55 @@ impl<'a> DsEngine<'a> {
                         off += b;
                     }
                 }
+                // The compressed stores hold `max_ctx` positions per slot from the start (7.7 of a 32 GB card's GiB in a
+                // three-slot 256k server, which left the tier 12.3 of its 20), and a slot at position p uses p / max_ctx
+                // of them. Their tails above QX_DS_STORE_LEND_KEEP positions (default 32,768; QX_DS_STORE_LEND=0: off)
+                // are lent to the tier as VRAM slots, carved here for the records next in the ranking, up to the
+                // budget asked for. A slot about to pass the kept positions takes its tails back first (`store_need`:
+                // the driver evicts what lives there) and lends them again when it is reset.
+                let (mut lend_ranges, mut lend_slots): (Vec<(usize, u64, u64)>, Vec<(usize, usize, u64)>) = (Vec::new(), Vec::new());
+                let lend_keep: usize = if std::env::var("QX_DS_STORE_LEND").is_ok_and(|v| v == "0") { 0 } else { std::env::var("QX_DS_STORE_LEND_KEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(32_768) };
+                if lend_keep > 0 && lend_keep < max_ctx && want > used {
+                    for (l, st) in stores.iter().enumerate() {
+                        if let Some((store, _, _, _)) = st {
+                            let ratio = (cfg.ratio[l] as usize).max(1);
+                            let rows_l = Self::store_rows(max_ctx, ratio);
+                            let keep_rows = (lend_keep / ratio + 2).min(rows_l);
+                            for sl in 0..slots {
+                                let lo = store.ptr + ((sl * rows_l + keep_rows) * row * 4) as u64;
+                                // (less the slot's last two rows: the spare row that keeps every index in range)
+                                let hi = store.ptr + (((sl + 1) * rows_l - 2) * row * 4) as u64;
+                                if hi > lo {
+                                    lend_ranges.push((sl, lo, hi));
+                                }
+                            }
+                        }
+                    }
+                    let mut cur: Vec<u64> = lend_ranges.iter().map(|r| (r.1 + 255) & !255).collect();
+                    let (mut lent, mut next, cap) = (0usize, 0usize, want - used);
+                    'carve: for &(l, e) in &order {
+                        if in_vram[l * n_expert + e] || lend_ranges.is_empty() {
+                            continue;
+                        }
+                        let b = pack.experts.record[l] as usize;
+                        if lent + b > cap {
+                            break;
+                        }
+                        // the next range with room, round robin (so every slot's tails carry a like share)
+                        for k in 0..lend_ranges.len() {
+                            let i = (next + k) % lend_ranges.len();
+                            if cur[i] + b as u64 <= lend_ranges[i].2 {
+                                lend_slots.push((lend_ranges[i].0, layer_class[l], cur[i]));
+                                cur[i] = (cur[i] + b as u64 + 255) & !255;
+                                lent += b;
+                                next = i + 1;
+                                continue 'carve;
+                            }
+                        }
+                        break;
+                    }
+                    eprintln!("tiers: the stores' tails above {lend_keep} positions can lend {} VRAM slots ({:.1} GiB) to the tier (a slot under {} positions lends its share)", lend_slots.len(), lent as f64 / 1073741824.0, lend_keep / 2);
+                }
                 let mut score = vec![0f64; cfg.n_layer * n_expert];
                 for (i, &(l, e)) in order.iter().enumerate() {
                     score[l * n_expert + e] = 1.0 / (1.0 + i as f64 / 2000.0);
@@ -1249,6 +1308,9 @@ impl<'a> DsEngine<'a> {
                     store,
                     arena,
                     flex,
+                    lend_ranges,
+                    lend_slots,
+                    lend_keep,
                     table,
                     classes,
                     layer_class,
@@ -1277,6 +1339,7 @@ impl<'a> DsEngine<'a> {
                 (Some(tiers), Some((f, pack)))
             }
         };
+        let lend_keep_v = tiers.as_ref().map_or(0, |t| if t.lend_slots.is_empty() { 0 } else { t.lend_keep });
         let chunk = chunk_rows.map(|rows| mk_chunk(rows, tiers.as_ref().and_then(|t| t.flex)));
         let (tiers, driver, abufs) = match tiers {
             Some(t) if !std::env::var("QX_DS_ASYNC").is_ok_and(|v| v == "0") => {
@@ -1309,6 +1372,8 @@ impl<'a> DsEngine<'a> {
                     arena_ptr: t.arena.ptr,
                     flex_ptr: t.flex.map(|f| f.0).unwrap_or(0),
                     flex_bytes: t.flex.map(|f| f.1).unwrap_or(0),
+                    lend_ranges: t.lend_ranges.clone(),
+                    lend_slots: t.lend_slots.clone(),
                     classes: t.classes,
                     layer_class: t.layer_class,
                     holder: t.holder,
@@ -1356,6 +1421,9 @@ impl<'a> DsEngine<'a> {
             chunk_side: Vec::new(),
             chunk_ord: 0,
             replaying: false,
+            lend_keep: lend_keep_v,
+            lent: vec![false; slots],
+            lend_started: false,
             slots,
             pool: if driver.is_some() { None } else { Some(Pool::new(&cpus)) },
             max_rows: max_ctx,
@@ -1770,6 +1838,7 @@ impl<'a> DsEngine<'a> {
         self.st.pos[slot] = 0;
         self.st.exact_from[slot] = 0;
         self.st.tokens[slot].clear();
+        self.store_lend(slot);
     }
 
     /// Rows a compressed store holds per slot for `max_ctx` positions at compression `ratio`.
@@ -1801,6 +1870,7 @@ impl<'a> DsEngine<'a> {
     pub fn copy_prefix(&mut self, src: usize, dst: usize, upto: usize) {
         sched_trace(&format!("P {src} {dst} {upto}"));
         assert!(src != dst && src < self.slots && dst < self.slots && upto <= self.st.pos[src], "copy_prefix: slots or length");
+        self.store_need(dst, upto);
         self.gpu.sync();
         let row = self.cfg.head_dim + self.cfg.idx_dim;
         for l in 0..self.cfg.n_layer {
@@ -1838,9 +1908,11 @@ impl<'a> DsEngine<'a> {
             // slot advances
             self.st.pos[slot] = p;
             self.st.tokens[slot].truncate(p);
+            self.store_lend(slot);
             return;
         }
         self.replay_to(slot, p);
+        self.store_lend(slot);
     }
 
     /// Tokens a replay must cover so that every layer's ring is exact at its end: a layer's keys at a position
@@ -1904,6 +1976,7 @@ impl<'a> DsEngine<'a> {
         let p = self.snapshot(slot);
         self.st.tokens[slot].clear();
         self.st.pos[slot] = 0;
+        self.store_lend(slot);
         p
     }
 
@@ -1934,6 +2007,7 @@ impl<'a> DsEngine<'a> {
     /// group boundary at most its length (the longest prefix a new prompt shares with it). Exact: the restored
     /// slot computes what the slot that was parked would have.
     pub fn unpark(&mut self, slot: usize, p: Parked, upto: usize) {
+        self.store_need(slot, upto);
         self.gpu.sync();
         let pos = p.tokens.len();
         assert!(upto <= pos, "unpark past the parked length");
@@ -2319,6 +2393,10 @@ impl<'a> DsEngine<'a> {
         assert!(!parts.is_empty() && (parts.len() == 1 || keep_from == 0), "a chunk of several slots runs every row through the full stack");
         for (i, a) in parts.iter().enumerate() {
             assert!(a.0 < self.slots && !a.1.is_empty() && parts[..i].iter().all(|b| b.0 != a.0), "chunk parts: a slot twice, an empty part or a slot out of range");
+        }
+        self.lend_start();
+        for &(sl, pt) in parts {
+            self.store_need(sl, self.st.pos[sl] + pt.len());
         }
         let toks_all: Vec<u32> = parts.iter().flat_map(|p| p.1.iter().copied()).collect();
         let toks = &toks_all[..];
@@ -3076,10 +3154,66 @@ impl<'a> DsEngine<'a> {
         out
     }
 
+    /// Slot `slot` is about to hold `upto` positions: if its store rows there are lent to the tier, they are taken
+    /// back first (the driver evicts the records living there and acknowledges once the device table says so).
+    fn store_need(&mut self, slot: usize, upto: usize) {
+        // (the guard: the rows a window's dry pass and the compressor's group may touch beyond `upto`)
+        if self.lend_keep > 0 && self.lent[slot] && upto + 1024 > self.lend_keep {
+            self.lend_set(slot, false);
+        }
+    }
+
+    /// Slot `slot` holds few positions again: its store tails go (back) to the tier.
+    fn store_lend(&mut self, slot: usize) {
+        // (from half the kept positions down: a rewind across the take-back point would lend and take back in turn)
+        if self.lend_keep > 0 && !self.lent[slot] && self.st.pos[slot] + 1024 <= self.lend_keep / 2 {
+            self.lend_set(slot, true);
+        }
+    }
+
+    /// Before the first forward: every slot short enough lends its tails (a new engine's slots are empty).
+    fn lend_start(&mut self) {
+        if self.lend_keep > 0 && !self.lend_started {
+            self.lend_started = true;
+            for sl in 0..self.slots {
+                self.store_lend(sl);
+            }
+        }
+    }
+
+    fn lend_set(&mut self, slot: usize, on: bool) {
+        let Some(d) = self.driver.as_ref() else { return };
+        let sh = &d.shared;
+        self.lent[slot] = on;
+        let mask = self.lent.iter().enumerate().fold(0u64, |m, (i, &b)| m | (b as u64) << i);
+        if !on {
+            // nothing of this engine's may be in flight into rows the driver is about to stop guarding
+            self.gpu.sync();
+        }
+        sh.lend_want.store(mask, std::sync::atomic::Ordering::Release);
+        let req = sh.lend_req.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        if !on {
+            let t0 = std::time::Instant::now();
+            while sh.lend_ack.load(std::sync::atomic::Ordering::Acquire) < req {
+                assert!(t0.elapsed().as_secs() < 120, "the driver did not give slot {slot}'s store tails back");
+                std::thread::yield_now();
+            }
+        }
+    }
+
     fn forward_segments_inner(&mut self, toks: &[(usize, u32)], act: Option<&mut dyn FnMut(&str, Vec<f32>)>, kv_only: bool) -> Vec<f32> {
         let tf = std::time::Instant::now();
         self.t_experts = 0.0;
         let t = toks.len();
+        if self.lend_keep > 0 {
+            self.lend_start();
+            for sl in 0..self.slots {
+                let n = toks.iter().filter(|x| x.0 == sl).count();
+                if n > 0 {
+                    self.store_need(sl, self.st.pos[sl] + n);
+                }
+            }
+        }
         assert!((1..=DS_TMAX).contains(&t), "window of {t} tokens");
         assert!(t == 1 || (self.driver.is_some() && act.is_none()), "windows need the asynchronous driver and no dumps");
         assert!(!kv_only || (self.driver.is_some() && act.is_none()), "KV-only windows need the asynchronous driver and no dumps");

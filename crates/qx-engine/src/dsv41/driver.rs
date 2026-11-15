@@ -21,6 +21,11 @@ pub struct Shared {
     pub flex_want: AtomicBool,
     pub flex_req: AtomicU64,
     pub flex_ack: AtomicU64,
+    /// The stores' tails lent to the tier: the slots whose tails are lent (a bit per slot), the request counter and
+    /// the driver's acknowledgement (`lend_check`).
+    pub lend_want: AtomicU64,
+    pub lend_req: AtomicU64,
+    pub lend_ack: AtomicU64,
     pub vram_hits: AtomicU64,
     pub ram_hits: AtomicU64,
     pub nvme_misses: AtomicU64,
@@ -170,6 +175,10 @@ pub struct Host {
     /// and the records there leave the VRAM table for the prompt's duration (`flex_check`).
     pub flex_ptr: u64,
     pub flex_bytes: usize,
+    /// The stores' tails lent to the tier: (slot, from, to) address ranges and the VRAM slots carved in them
+    /// (slot, size class, address).
+    pub lend_ranges: Vec<(usize, u64, u64)>,
+    pub lend_slots: Vec<(usize, usize, u64)>,
     /// VRAM slots by size class: (bytes, free addresses); the holder of each slot.
     pub classes: Vec<(usize, Vec<u64>)>,
     pub layer_class: Vec<usize>,
@@ -199,6 +208,9 @@ impl Driver {
             flex_bytes: host.flex_bytes,
             flex_req: AtomicU64::new(0),
             flex_ack: AtomicU64::new(0),
+            lend_want: AtomicU64::new(0),
+            lend_req: AtomicU64::new(0),
+            lend_ack: AtomicU64::new(0),
             vram_hits: Default::default(),
             ram_hits: Default::default(),
             nvme_misses: Default::default(),
@@ -303,6 +315,8 @@ struct Loop {
     /// Whether the flex tail is given to the chunk path; while it is, the tail's empty slots (class, address) and
     /// the records evicted from it (class, address, record), copied back at release if still in RAM.
     flex_on: bool,
+    /// The slots whose store tails the tier holds now (a bit per slot).
+    lend_on: u64,
     flex_slots: Vec<(usize, u64)>,
     flex_evicted: Vec<(usize, u64, usize)>,
     /// RAM promotion candidates left from the last boundary, hottest first, done one at a time between jobs.
@@ -1050,7 +1064,7 @@ impl Loop {
                             let h = &self.host;
                             let (fp, fb) = (h.flex_ptr, h.flex_bytes);
                             let (inflight, pre_inflight, d2h) = (&self.inflight, &self.pre_inflight, &self.d2h);
-                            let dup = h.holder.values().copied().filter(|&x| x != v && h.layer_class[x / ne] == c && h.table[x] != 0 && h.store.in_ram(x) && !(fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp) && !inflight.contains(&x) && !pre_inflight.contains(&x) && !d2h.iter().any(|d| d.0 == x)).max_by(|&p, &q| h.score[p].partial_cmp(&h.score[q]).unwrap());
+                            let dup = h.holder.values().copied().filter(|&x| x != v && h.layer_class[x / ne] == c && h.table[x] != 0 && h.store.in_ram(x) && !(fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp) && !h.lend_ranges.iter().any(|r| h.table[x] >= r.1 && h.table[x] < r.2) && !inflight.contains(&x) && !pre_inflight.contains(&x) && !d2h.iter().any(|d| d.0 == x)).max_by(|&p, &q| h.score[p].partial_cmp(&h.score[q]).unwrap());
                             if let Some(x) = dup {
                                 self.chunk_guard(sh, x);
                                 if let Some((_, p)) = self.host.store.evict_deferred(x) {
@@ -1122,6 +1136,59 @@ impl Loop {
     /// in it (table 0 on host and device, slot out of its class's free list) after the in-flight promotion copies
     /// landed; taking it back returns the tail's slots to the free lists, empty, for the next promotions. The
     /// acknowledgement is written after the device table words landed on this stream.
+    /// Applies a pending change of the lent store tails (`Shared::lend_*`). A slot taking its tails back: every
+    /// record there leaves the table (host and device), the free and quarantined slots there leave their lists, and
+    /// the acknowledgement is written after the device table words landed, so the engine may write the store rows.
+    /// A slot lending them again: its carved slots return to the free lists, empty.
+    fn lend_check(&mut self, sh: &Shared) {
+        let req = sh.lend_req.load(Ordering::Acquire);
+        if req == sh.lend_ack.load(Ordering::Acquire) {
+            return;
+        }
+        let want = sh.lend_want.load(Ordering::Acquire);
+        let changed = want ^ self.lend_on;
+        if changed != 0 {
+            let back = changed & self.lend_on;
+            if back != 0 {
+                self.finish_copies(sh, true);
+                let ranges: Vec<(u64, u64)> = self.host.lend_ranges.iter().filter(|r| back >> r.0 & 1 == 1).map(|r| (r.1, r.2)).collect();
+                let inside = |a: u64| ranges.iter().any(|&(lo, hi)| a >= lo && a < hi);
+                let evict: Vec<(u64, usize)> = self.host.holder.iter().filter(|&(&a, _)| inside(a)).map(|(&a, &g)| (a, g)).collect();
+                for &(a, g) in &evict {
+                    self.write_entry(g, 0);
+                    self.host.holder.remove(&a);
+                    if ram_dedup() && !self.host.store.in_ram(g) && self.wb.len() < 512 {
+                        self.wb.push(g);
+                    }
+                }
+                for (_, free) in self.host.classes.iter_mut() {
+                    free.retain(|&a| !inside(a));
+                }
+                self.quarantine.retain(|&(_, _, a)| !inside(a));
+                unsafe { cudarc::driver::result::stream::synchronize(self.stream).expect("lend: table words") };
+                if std::env::var("QX_DS_VERBOSE").is_ok() {
+                    eprintln!("lend: slots {back:#b} take their store tails back ({} records out)", evict.len());
+                }
+            }
+            let out = changed & want;
+            if out != 0 {
+                let mut n = 0usize;
+                for i in 0..self.host.lend_slots.len() {
+                    let (sl, c, a) = self.host.lend_slots[i];
+                    if out >> sl & 1 == 1 {
+                        self.host.classes[c].1.push(a);
+                        n += 1;
+                    }
+                }
+                if std::env::var("QX_DS_VERBOSE").is_ok() {
+                    eprintln!("lend: slots {out:#b} lend their store tails ({n} VRAM slots to the free lists)");
+                }
+            }
+            self.lend_on = want;
+        }
+        sh.lend_ack.store(req, Ordering::Release);
+    }
+
     fn flex_check(&mut self, sh: &Shared) {
         let req = sh.flex_req.load(Ordering::Acquire);
         if req == sh.flex_ack.load(Ordering::Acquire) {
@@ -1132,7 +1199,8 @@ impl Loop {
             let fp = self.host.flex_ptr;
             // a slot is in the tail when any of its bytes are (the tail's start cuts through a slot of whichever class
             // lies there: that record would be overwritten while still in the table if only starts were tested)
-            let in_tail = |a: u64, bytes: usize| a + bytes as u64 > fp;
+            let fe = fp + self.host.flex_bytes as u64;
+            let in_tail = |a: u64, bytes: usize| a + bytes as u64 > fp && a < fe;
             if want {
                 // every promotion copy in flight has landed before the tail is written by the chunk path
                 self.finish_copies(sh, true);
@@ -1143,6 +1211,13 @@ impl Loop {
                     self.write_entry(g, 0);
                     self.host.holder.remove(&a);
                     self.flex_evicted.push((self.host.layer_class[g / ne], a, g));
+                    // (a record with no RAM copy, an initial resident, would be NVMe-only and could not go back into
+                    // the tail: queue it for RAM, as an eviction does. With the stores' tails lent the warm-up's
+                    // promotions take those slots first and the tail keeps its initial residents: 304 of them left
+                    // VRAM for NVMe at the first chunk, against 26 before, 2026-11-14)
+                    if ram_dedup() && !self.host.store.in_ram(g) && self.wb.len() < 512 {
+                        self.wb.push(g);
+                    }
                 }
                 for (c, (bytes, free)) in self.host.classes.iter_mut().enumerate() {
                     let bytes = *bytes;
@@ -1370,7 +1445,8 @@ impl Loop {
             // Residents of the flex tail keep theirs: the refill after a chunk reads it.
             let dup = if ram_dedup() && !h.gpu_reads_ram {
                 let (fp, fb) = (h.flex_ptr, h.flex_bytes);
-                let in_tail = |x: usize| fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp;
+                // (nor a record in a lent store tail: its slot goes back to the store without notice)
+                let in_tail = |x: usize| (fb > 0 && h.table[x] + h.classes[c].0 as u64 > fp) || h.lend_ranges.iter().any(|r| h.table[x] >= r.1 && h.table[x] < r.2);
                 (0..h.table.len()).filter(|&x| h.table[x] != 0 && h.layer_class[x / ne] == c && h.store.in_ram(x) && !inflight.contains(&x) && !pre_inflight.contains(&x) && !in_tail(x)).max_by(|&a, &b| h.score[a].partial_cmp(&h.score[b]).unwrap())
             } else {
                 None
@@ -1475,7 +1551,7 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
     let mk_events = || -> Vec<cudarc::driver::sys::CUevent> { (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect() };
     let chunk_events = std::array::from_fn(|_| mk_events());
-    let mut lp = Loop { host, pool, shared: Some(sh.clone()), chunk_events, chunk_events_pending: [false; 8], chunk_batch_no: 0, chunk_staged: false, chunk_ram: Default::default(), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), wb: Vec::new(), d2h: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
+    let mut lp = Loop { lend_on: 0, host, pool, shared: Some(sh.clone()), chunk_events, chunk_events_pending: [false; 8], chunk_batch_no: 0, chunk_staged: false, chunk_ram: Default::default(), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), wb: Vec::new(), d2h: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
     for par in 0..2 {
         lp.pre_free[par] = (0..lp.host.pre_slots).map(|i| lp.host.pred_stage_base + ((par * lp.host.pre_slots + i) * lp.host.rec_max) as u64).collect();
     }
@@ -1508,6 +1584,7 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
         }
         let mut worked = false;
         lp.flex_check(&sh);
+        lp.lend_check(&sh);
         if lp.prefetch_check(&sh) {
             worked = true;
         }

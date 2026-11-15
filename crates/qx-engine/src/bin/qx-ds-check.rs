@@ -50,7 +50,8 @@ fn main() -> anyhow::Result<()> {
         qx_engine::dsv41::pin_engine_early();
     }
     let pack = std::env::var("QX_DS_PACK").ok().map(|p| Gguf::open(std::path::Path::new(&p))).transpose()?;
-    let max_ctx = (toks.len() + 64).next_multiple_of(256);
+    // (QX_DS_CTX=N: a larger context than the tokens need, as a server's slots have: the stores' tails are lent then)
+    let max_ctx = (toks.len() + 64).next_multiple_of(256).max(std::env::var("QX_DS_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
     let mut eng = match &pack {
         Some(pk) => {
             let gib = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
