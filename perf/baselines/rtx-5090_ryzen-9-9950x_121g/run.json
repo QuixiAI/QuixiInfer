@@ -1,16 +1,14 @@
 {
  "schema": 1,
- "label": "setd-promo35",
- "date": "2026-11-14T21:12:20",
+ "label": "setd-promo39",
+ "date": "2026-11-15T00:36:32",
  "git": {
-  "commit": "3d05ab2",
+  "commit": "e197dcc",
   "dirty": true,
   "modified": [
-   "M crates/qx-engine/src/bin/qx-ds-check.rs",
-   " M crates/qx-engine/src/dsv41/driver.rs",
-   " M crates/qx-engine/src/dsv41/mod.rs"
+   "M crates/qx-engine/src/dsv41/driver.rs"
   ],
-  "diff_sha": "443232e7902c"
+  "diff_sha": "ae76e12e42ee"
  },
  "host": {
   "gpu": "NVIDIA GeForce RTX 5090",
@@ -44,8 +42,8 @@
   "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/route1k.tokens 1024"
  ],
  "attached": {
-  "tree": "run.json records 3d05ab2 + working tree (git diff -- crates sha256 443232e7902c, lend3.diff, in working-tree.diff); binaries ~/qx-bins/chunk140 (qx-ds-check f39f6aa739ac, quixiinfer 04c962eefb8b, qx-ds-multi ba58f191c8c7, qx-ds-replay 77bbb9af93f4)",
-  "correctness": "tools/ds-checks.sh parts a and b run by chain-x51.sh on the same binaries at 20:57 and 21:04 (attached/x51-ds-checks-a.log, -b.log): all nine lines as perf.md has them; attached by hand because --promo runs without --check",
-  "preflight": "21:04:57 VM shut off, 3,270 MiB used, pressure avg10 0.08, no build tools"
+  "tree": "run.json records e197dcc + working tree (git diff -- crates sha256 ae76e12e42ee, tail-dedup.diff, in working-tree.diff); binaries ~/qx-bins/chunk144 (qx-ds-check 86b73a06c964, quixiinfer 8b54b0fbfceb, qx-ds-multi 7b02a750dff3, qx-ds-replay 1099b84d547c)",
+  "correctness": "tools/ds-checks.sh parts b and a run by chain-x65.sh on the same binaries at 00:21 and 00:29 (attached/x65-ds-checks-a.log, -b.log): all nine lines as perf.md has them, the same text as chunk140's; attached by hand because --promo runs without --check",
+  "preflight": "00:29:14 VM shut off, 3,436 MiB used, swap 1,025 MiB used, pressure avg10 0.00, no build tools"
  }
 }
