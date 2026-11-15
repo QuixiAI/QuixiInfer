@@ -19,6 +19,14 @@ def status(text):
         if (len(re.findall(r"^" + label + ":", text, re.M)) != 1
                 or len(re.findall(r"^" + pattern + r"[ \t]*$", text, re.M)) != 1):
             return "fail"
+    # part c (a rewind replayed through one exact chunk): judged when its lines are there (parts a and b alone stay valid)
+    if re.search(r"^7\.", text, re.M):
+        for n, p, rows in ((560, 400, 160), (1280, 1024, 256)):
+            line = rf"^7\. rewind to {p} of {n} by a replay chunk:\s+rewind to {p}: bit-identical rows: {rows} / {rows}[ \t]*$"
+            if len(re.findall(line, text, re.M)) != 1:
+                return "fail"
+        if len(re.findall(r"^7\.", text, re.M)) != 2:
+            return "fail"
     if re.search(r"panic|error", text, re.I):
         return "fail"
     tokenizer = r"^4\. tokenizer vs llama\.cpp:\s+identical: 20 tokens\s+decode round trip: exact[ \t]*$"

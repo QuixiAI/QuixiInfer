@@ -1167,7 +1167,7 @@ impl Loop {
                 self.quarantine.retain(|&(_, _, a)| !inside(a));
                 unsafe { cudarc::driver::result::stream::synchronize(self.stream).expect("lend: table words") };
                 if std::env::var("QX_DS_VERBOSE").is_ok() {
-                    eprintln!("lend: slots {back:#b} take their store tails back ({} records out)", evict.len());
+                    eprintln!("lend: slots {back:#b} take their store tails back ({} records out; {} queued for RAM)", evict.len(), self.wb.len());
                 }
             }
             let out = changed & want;
@@ -1232,7 +1232,7 @@ impl Loop {
                 unsafe { cudarc::driver::result::stream::synchronize(self.stream).expect("flex: table words") };
                 if std::env::var("QX_DS_VERBOSE").is_ok() {
                     let straddle = evict.iter().filter(|&&(a, _)| a < fp).count();
-                    eprintln!("flex: {} records out of the tail ({} slots to the chunk path; {} record(s) straddle its start)", evict.len(), evict.len() + self.flex_slots.len(), straddle);
+                    eprintln!("flex: {} records out of the tail ({} slots to the chunk path; {} record(s) straddle its start; {} queued for RAM)", evict.len(), evict.len() + self.flex_slots.len(), straddle, self.wb.len());
                 }
             } else {
                 // the evicted records go straight back into their slots (one to two GB, a few tens of ms on the

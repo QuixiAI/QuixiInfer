@@ -7,6 +7,8 @@
 #   4. tokenization against llama.cpp's llama-tokenize (when QX_LLAMA_TOKENIZE points at it): expect identical
 #   5. rewind to 64 and park + unpark to 64 of route1k 128 against the straight pass: expect 64 / 64 twice
 #   6. mixed sequences with cold widths 2,3,4: every slot's 3 rows match single steps (pending-pair regression)
+#   7. (DS_CHECKS_PART=c, or a full run) a rewind beyond the ring's reach, replayed through one exact chunk
+#      (`replay_to`): route16k 560 rewound to 400 and 1,280 rewound to 1,024: expect 160 / 160 and 256 / 256
 # Heavy (the pack's RAM tier): run alone, under a memory cap: `tools/capped.sh 112 tools/ds-checks.sh`.
 set -u
 cd "$(dirname "$0")/.."
@@ -21,6 +23,14 @@ BM=$(dirname "$B")/qx-ds-multi
 [ -x "$BM" ] || { echo "missing $BM; build qx-ds-multi beside qx-ds-check" >&2; exit 1; }
 # a process that pinned the RAM tier takes 10-30 s to tear down after it exits and holds its VRAM meanwhile
 gpu_free() { until [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)" -lt 1000 ]; do sleep 2; done; }
+part_c() {
+  for np in "560 400" "1280 1024"; do
+    set -- $np
+    gpu_free
+    echo "7. rewind to $2 of $1 by a replay chunk: $(env QX_DS_VRAM=20 QX_DS_RAM=60 QX_DS_BENCH=0 QX_DS_ADAPT=0 QX_DS_CHUNK=8192 QX_DS_PREFILL_EXACT=1 QX_DS_REWIND=$2 $B "$M" golden/data/route16k.tokens $1 2>/dev/null | grep -E '^rewind' | sed -E 's/ \(restore.*//; s/ then positions.*: bit/: bit/' | tr '\n' ' ')"
+  done
+}
+if [ "${DS_CHECKS_PART:-}" = c ]; then part_c; exit 0; fi
 gpu_free
 echo "1. exact f32 vs reference:      $(env -u QX_DS_PACK QX_MGEMV_INT8=0 QX_EXACT_EXPERTS=1 QX_REF_COMPAT=0 $B "$M" golden/out-dsv41/p0.tokens 6 2>&1 | grep '^positions')"
 gpu_free
@@ -61,3 +71,5 @@ if ! env QX_DS_VRAM=20 QX_DS_RAM=60 QX_DS_MULTI_WIDTHS=2,3,4 QX_DS_MULTI_ROTATE=
   exit 1
 fi
 echo "6. mixed sequences, cold widths: $(grep '^multi-sequence' "$T/multi.log" | tr '\n' ' ')"
+[ -z "${DS_CHECKS_PART:-}" ] && part_c
+exit 0

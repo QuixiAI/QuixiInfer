@@ -65,6 +65,11 @@ fn info_buffer(command: &mut Command<'_>, words: &[u64]) -> Result<Handle, Serve
     if let Some(handle) = command.stream().info_cache.get(words) {
         return Ok(handle);
     }
+    // An info set first staged while a capture records allocates inside the capture: the suspect of the start-up
+    // panic seen once in ~35 starts on 2026-11-13 and not since (a normal start has no such miss). Name it.
+    if command.stream().capturing.is_recording() {
+        eprintln!("info miss in a capture: {} words {:x?}", words.len(), words);
+    }
     let handle = command.create_with_data(bytemuck::cast_slice(words))?;
     command
         .stream()
