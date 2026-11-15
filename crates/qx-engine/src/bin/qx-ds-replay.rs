@@ -34,6 +34,11 @@ fn main() -> Result<()> {
                 eng.rewind(s.parse()?, p.parse()?);
             }
             "L" => eng.chunk_release(),
+            "P" => {
+                let v: Vec<usize> = rest.split_whitespace().map(|x| x.parse()).collect::<Result<_, _>>()?;
+                anyhow::ensure!(v.len() == 3, "P src dst upto");
+                eng.copy_prefix(v[0], v[1], v[2]);
+            }
             "F" => {
                 let (kv, segs) = rest.split_once(' ').unwrap();
                 let kv = kv == "1";

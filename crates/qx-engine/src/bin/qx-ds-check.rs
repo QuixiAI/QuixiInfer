@@ -296,6 +296,7 @@ fn main() -> anyhow::Result<()> {
             let t_restore = t0.elapsed().as_secs_f64();
             let mut same = 0usize;
             let mut first_bad: Option<usize> = None;
+            let (mut kl_sum, mut kl_max, mut top1) = (0f64, 0f64, 0usize);
             for p in pp..toks.len() {
                 let logits = eng.forward(toks[p], None);
                 if logits == kept[p] {
@@ -303,9 +304,21 @@ fn main() -> anyhow::Result<()> {
                 } else if first_bad.is_none() {
                     first_bad = Some(p);
                 }
+                // KL(straight || restored) and top-1 agreement of the row (a restore through f16 kernels is not exact)
+                let lsm = |v: &[f32]| -> Vec<f64> {
+                    let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                    let z = v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln();
+                    v.iter().map(|&x| x as f64 - m - z).collect()
+                };
+                let (a, b) = (lsm(&kept[p]), lsm(&logits));
+                let kl: f64 = a.iter().zip(&b).map(|(x, y)| x.exp() * (x - y)).sum();
+                kl_sum += kl;
+                kl_max = kl_max.max(kl);
+                top1 += (argmax(&kept[p]) == argmax(&logits)) as usize;
             }
-            println!("{what} to {pp} then positions {pp}..{}: bit-identical rows: {same} / {} (restore {:.2}s{})", toks.len(), toks.len() - pp, t_restore,
-                first_bad.map(|b| format!(", first differing row {b}")).unwrap_or_default());
+            let n_rows = toks.len() - pp;
+            println!("{what} to {pp} then positions {pp}..{}: bit-identical rows: {same} / {} (restore {:.2}s{}; KL mean {:.5} max {:.4}, top-1 {top1}/{n_rows})", toks.len(), toks.len() - pp, t_restore,
+                first_bad.map(|b| format!(", first differing row {b}")).unwrap_or_default(), kl_sum / n_rows.max(1) as f64, kl_max);
         }
         let last = &per_tok[per_tok.len().saturating_sub(32)..];
         let last_ms = last.iter().sum::<f64>() * 1e3 / last.len().max(1) as f64;

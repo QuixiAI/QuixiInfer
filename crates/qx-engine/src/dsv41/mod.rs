@@ -226,6 +226,13 @@ struct State {
     /// Per slot: the tokens so far and the position.
     tokens: Vec<Vec<u32>>,
     pos: Vec<usize>,
+    /// Per slot: the position from which a rewind finds every layer's ring window exact. 0 after a reset; a KV-only
+    /// chunk or window ending at q leaves the rings above the last KV source unwritten for its rows, and the full
+    /// stack needs `prompt_keep - n_swa` rows after q before a window of theirs is exact again; a replay to p
+    /// makes it p. A rewind below it replays whatever the distance (a request cancelled inside its prompt, or a
+    /// slot copied while inside its prompt, left such a slot: until 2026-11-14 a rewind within the ring's reach
+    /// took the rings as they were).
+    exact_from: Vec<usize>,
 }
 
 /// A sequence moved out of its slot (`DsEngine::park`): what `unpark` needs to continue it in any slot.
@@ -1336,7 +1343,7 @@ impl<'a> DsEngine<'a> {
             engram_table: g.tensor("per_layer_token_embd.weight").filter(|t| !t.packed()).map(|t| W::new(g, t)),
             layers,
             s,
-            st: State { rings, ring_tables, stores, sels, tokens: vec![Vec::new(); slots], pos: vec![0; slots] },
+            st: State { rings, ring_tables, stores, sels, tokens: vec![Vec::new(); slots], pos: vec![0; slots], exact_from: vec![0; slots] },
             chunk,
             erows_stride: DS_TMAX,
             erows_row0: 0,
@@ -1761,6 +1768,7 @@ impl<'a> DsEngine<'a> {
         sched_trace(&format!("R {slot}"));
         self.gpu.sync();
         self.st.pos[slot] = 0;
+        self.st.exact_from[slot] = 0;
         self.st.tokens[slot].clear();
     }
 
@@ -1785,9 +1793,38 @@ impl<'a> DsEngine<'a> {
     /// within the last DS_TMAX positions), nothing is copied; otherwise the rings are rebuilt by replaying the
     /// slot's own tokens (`replay_to`). This replaced a per-position host copy of every latent, 21.5 GB per slot
     /// at 256k (2026-11-06).
+    /// Copies slot `src`'s sequence into slot `dst` (whatever `dst` held is dropped) and rewinds `dst` to `upto`, a
+    /// group boundary at most `src`'s length: the compressed stores' rows below `upto`, the rings and the tokens,
+    /// device to device. `src` is left as it is (it may be decoding or mid-prompt: the call runs between forwards).
+    /// Exact: `dst` then computes what `src` rewound to `upto` would (`rewind`: free when `upto` lies within the
+    /// rings' window, else a replay).
+    pub fn copy_prefix(&mut self, src: usize, dst: usize, upto: usize) {
+        sched_trace(&format!("P {src} {dst} {upto}"));
+        assert!(src != dst && src < self.slots && dst < self.slots && upto <= self.st.pos[src], "copy_prefix: slots or length");
+        self.gpu.sync();
+        let row = self.cfg.head_dim + self.cfg.idx_dim;
+        for l in 0..self.cfg.n_layer {
+            if let Some((store, _, _, _)) = &self.st.stores[l] {
+                let ratio = self.cfg.ratio[l].max(1) as usize;
+                let per = Self::store_rows(self.max_ctx, ratio) * row;
+                let n = upto / ratio * row;
+                if n > 0 {
+                    self.k("qx_ds_copy_f32", 256, ((n as u32).div_ceil(256), 1, 1), &[store.ptr + (src * per * 4) as u64, store.ptr + (dst * per * 4) as u64, n as u64]);
+                }
+            }
+            let n_ring = self.ring_w * self.cfg.head_dim;
+            self.k("qx_ds_copy_f32", 256, ((n_ring as u32).div_ceil(256), 1, 1), &[self.st.rings[l].ptr + (src * n_ring * 4) as u64, self.st.rings[l].ptr + (dst * n_ring * 4) as u64, n_ring as u64]);
+        }
+        self.gpu.sync();
+        self.st.tokens[dst] = self.st.tokens[src].clone();
+        self.st.pos[dst] = self.st.pos[src];
+        self.st.exact_from[dst] = self.st.exact_from[src];
+        self.rewind(dst, upto);
+    }
+
     /// Whether `rewind(slot, p)` copies nothing: the ring still holds the window below `p`.
     pub fn rewind_fast(&self, slot: usize, p: usize) -> bool {
-        p <= self.st.pos[slot] && self.st.pos[slot] - p <= self.ring_w - self.cfg.n_swa
+        p <= self.st.pos[slot] && self.st.pos[slot] - p <= self.ring_w - self.cfg.n_swa && p >= self.st.exact_from[slot]
     }
 
     pub fn rewind(&mut self, slot: usize, p: usize) {
@@ -1796,8 +1833,9 @@ impl<'a> DsEngine<'a> {
         let max_ratio = self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
         assert!(p % max_ratio == 0, "rewind to a group boundary");
         let pos = self.st.pos[slot];
-        if pos - p <= self.ring_w - self.cfg.n_swa {
-            // the ring holds [p - n_swa, p) still: positions beyond p are overwritten as the slot advances
+        if pos - p <= self.ring_w - self.cfg.n_swa && p >= self.st.exact_from[slot] {
+            // the ring holds [p - n_swa, p) still, exact at every layer: positions beyond p are overwritten as the
+            // slot advances
             self.st.pos[slot] = p;
             self.st.tokens[slot].truncate(p);
             return;
@@ -1853,6 +1891,7 @@ impl<'a> DsEngine<'a> {
             off += w;
         }
         self.replaying = false;
+        self.st.exact_from[slot] = p;
         debug_assert_eq!(self.st.pos[slot], p);
         self.gpu.sync();
     }
@@ -1908,6 +1947,8 @@ impl<'a> DsEngine<'a> {
         }
         self.st.tokens[slot] = p.tokens;
         self.st.pos[slot] = pos;
+        // (a parked state does not say from where its rings are exact: at its own end they are)
+        self.st.exact_from[slot] = pos;
         assert!(upto % self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize == 0, "unpark to a group boundary");
         if p.rings.len() == self.cfg.n_layer {
             // the rings as parked: exact at `pos`, and `rewind` keeps its fast path within the last DS_TMAX
@@ -2957,6 +2998,10 @@ impl<'a> DsEngine<'a> {
         for &(sl, pt) in parts {
             self.st.pos[sl] += pt.len();
         }
+        if keep_from > 0 && !self.replaying {
+            // (rows under `keep_from` stopped at the last KV source: the rings above it lack them)
+            self.st.exact_from[slot] = pos0 + keep_from + self.prompt_keep() - self.cfg.n_swa;
+        }
         d.chunk_tick.store(true, std::sync::atomic::Ordering::Release);
         d.tokens_done.fetch_add(rows as u64, std::sync::atomic::Ordering::Release);
         self.adapt().expect("tier promotions");
@@ -3128,6 +3173,10 @@ impl<'a> DsEngine<'a> {
         for sl in 0..self.slots {
             if counted[sl] > 0 {
                 self.st.pos[sl] += counted[sl];
+                if kv_only && !self.replaying {
+                    // (a KV-only window: the rings above the last KV source lack its rows)
+                    self.st.exact_from[sl] = self.st.pos[sl] + self.prompt_keep() - self.cfg.n_swa;
+                }
             }
         }
         self.t_phase[3] = tp.elapsed().as_secs_f64();
