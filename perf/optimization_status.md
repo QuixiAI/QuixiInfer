@@ -4379,3 +4379,108 @@ are equal down to the row hashes. Gate 19.166 -> 19.177 (+0.1%), decode256k at t
 runs). Flags: the next experiment must attack a presupposition (none of the last five did); serve3 not run on
 chunk134; no test tells a threshold of 8,192 from 10,000. Nineteen text corrections over the two passes, applied.
 
+## 2026-11-14: Prefix reuse across slots — LANDED, default on (a 12.8k prompt arriving beside its first copy: 15.79 -> 0.08 s of prompt time, 4.6 s once the source is 128+ tokens into its reply; a slot's rings are tracked as exact or not)
+
+Status: landed, default on (`QX_DS_PREFIX_COPY=0`: off); not a promotion (the baseline stays 19.166). The breaker
+found a defect in the first form, fixed and retested below.
+
+Question: the user asked for automatic prefix caching like vLLM's. After today's deep-rewind landing a request
+reuses a prefix only from a free slot. Nothing is shared with a running slot: three clients with one long system
+prompt compute it three times.
+
+Change (`copy2.diff`, sha256 20083f547fd1, on 8451d2c; binaries `~/qx-bins/chunk137`: qx-ds-check 2c0210dee288,
+quixiinfer 69758469cd8e, qx-ds-multi 093f5d6512a0, qx-ds-replay bc700bf29352):
+1. `copy_prefix(src, dst, upto)`: the source slot's compressed-store rows below `upto`, its rings and its tokens,
+   device to device (`qx_ds_copy_f32`), then `rewind(dst, upto)`. The source goes on undisturbed.
+2. `exact_from` per slot: the position from which a rewind finds every layer's ring window exact (0 after a reset;
+   a KV-only chunk or window ending at q makes it q + `prompt_keep` - `n_swa`; a replay to p makes it p; a copy
+   carries the source's; an unpark makes it the parked length). `rewind` and `rewind_fast` take the free path only
+   at or above it. In the server no rewind that was free becomes a replay (a finished prompt leaves it at its end
+   less 128 or lower). An `unpark` below the parked length now always replays (only `qx-ds-check` parks; the gate's
+   states unpark at their own length); `park` does not clear it (conservative); a ring restore followed by a free
+   rewind below the parked length has no standing check any more; the comment in `unpark` about the fast path is
+   stale.
+3. The scheduler values a prefix in tokens of prompt work saved: its length when the rewind is free, its length
+   less `QX_DS_REPLAY_COST` (6,500) when it needs a replay and has `QX_DS_REWIND_DEEP_MIN` tokens, nothing
+   otherwise. The best free slot by value (then fewest tokens), and a running slot's prefix copied into it when it
+   is worth 256+ tokens more. `QX_DS_PREFIX_COPY=0`: no copies. The 6,500 is the replay's ~4.4 s over the ~0.67 ms
+   per token of a prompt afresh, not swept. Untested branches: two free slots that both hold a prefix, and a copy
+   into a free slot that holds a shorter prefix. In the gate's serve sessions every slot is worth 0.
+4. `qx-ds-replay` runs the `P src dst upto` trace line; `qx-ds-check`'s rewind check prints KL and top-1 too.
+
+The breaker's finding (fresh context, on the first form, `copy.diff` / chunk136): a source still inside its prompt
+has passed KV-only chunks, whose rows never wrote the rings above the last KV source; the scheduler found
+`rewind_fast` true at the source's read position, and the copy took those rings as they were. X36 (exact mode;
+A = 12,785 tokens, B = the same text cut to 8,741 tokens, sent 2 s later and admitted after A's first chunk:
+`P 0 d 8192`): on chunk136, 0 of B's 47 decode rows equal the copy-off arm's (the 48-token reply happened to be
+the same text); on chunk137, 47 / 47, B's last prompt row's hash (`54244f37bc454cff`) and all 461 of the source's
+traced rows (the adjudicator's recount; my first count, 36 and 20, took the single-row steps only). Times of X36,
+exact mode: B's prompt 22.56 s against 27.78 s without the copy, the source's 29.65 against 29.17 s (the 8.24 s
+replay at admission is inside both). The same hole was reachable before today without
+any copy: a slot left inside its prompt and rewound within the ring's reach (no way to leave one was found in
+the server: a cancellation is seen only at the first emitted token); `exact_from` closes both.
+
+Exactness on chunk137 (`QX_DS_PREFILL_EXACT=1`):
+
+| test | result |
+|---|---|
+| X36: a copy from a source between its chunks (deep: replay) against no copy | B's 47 decode rows, its last prompt row and the source's 461 rows equal; replies equal |
+| X38: a 12.8k prompt decoding 100 tokens; the same prompt arrives (free copy) | its 48-token reply equals the same-slot repeat's and the afresh one's (48 / 48 and 47 / 47 rows); the source's first bytes equal the afresh 48-token reply |
+| X39 deep: a prompt sharing 11,734 tokens arrives beside the decoding source (copy, replay) | its reply equals the same-slot deep reuse's (`x22-t.7.txt`); the source's unchanged |
+| X39 replay: `qx-ds-replay` on both traces | 121 and 122 forwards, 0 mismatching rows (determinism of `P`, not correctness: the cross-arm rows above are the correctness evidence) |
+
+Times, default mode, three-slot 256k server, one run per arm (chunk137; the same on chunk136, X30):
+
+| case (X37, X40) | copy | no copy |
+|---|--:|--:|
+| the same 12,785-token prompt arriving while the first is ~45 tokens into its reply: prompt time | 0.08 s | 15.79 s |
+| ... its wall time (48 tokens) | 10.75 s | 25.47 s |
+| ... the first client's 100 tokens, wall | 24.66 s | 38.91 s |
+| a prompt sharing 11,734 tokens with it (replay): prompt time | 6.87 s | 16.68 s |
+| the same 12,785-token prompt once the source is 128+ tokens into its reply (replay): prompt time / wall | 4.56 / 6.79 s | 10.41 / 12.81 s |
+| the same 6,442-token prompt, source 128+ tokens in (under the deep threshold: not copied) | 6.08 s | 6.08 s |
+
+The free copy holds only while the source is within 128 tokens of the shared point; after that a prefix of 8,192+
+tokens costs the replay and a shorter one is computed afresh.
+
+Default mode, disclosed: the copied request's last prompt token runs in an exact window where the afresh arm's is
+an f16 chunk row, as for a same-slot repeat. So two identical prompts sent together at temperature 0 can now give
+different replies (X37: replies 1 and 2 part at "provided" / "pasted", byte 58; without the copy they agree;
+replies 1 and 3 are byte-equal with and without the copy), where before
+they were computed twice the same way. Within the contract (the distribution is bounded, not the text) and equal
+under `QX_DS_PREFILL_EXACT=1`, but it is a dependence on company of the kind 2026-11-13 removed for arrival beside
+a decoder: for the adjudicator to rule on.
+
+Breaker's other notes: the gate cannot see a copy (its prompts are under 256 tokens); a copy's replay runs at
+admission and stalls the other slots outside the chunk gap; the copy's cost at 250k tokens (~2.5 GiB device to
+device) is unmeasured; the first form chose by length, not cost, and took the emptiest slot even when the chosen
+one held a redundant prefix (both changed in point 3; no test of either yet).
+
+Single-part chunks and the gate (chunk137): tail dumps at 2,048 and 16,384 tokens byte-identical to chunk134's;
+ds-checks parts a and b the same text as v11's (tokenizer line included; line 5's park / unpark to 64 of 128 now
+replays, still 64 / 64); set D `setd-promo33-191126` 19.144 against 19.166 (decode256k 38.8 / 38.8, prefill256k 2.0,
+serve256k1 39.68, serve256k3 90.42, decode 30.7, prefill128 10.5; identity serve256k-1 identical); a second
+serve256k session `x41-serve256k-2-191900`: 39.26 / 90.99, identical. Preflight 19:11:26: VM shut off, 3,377 MiB
+used, swap 1,028 used, pressure avg10 0.00, no build tools, diff 20083f547fd1; X36-X40 wrote none (the journal:
+VM off since 01:03, builds at 18:19:48 and 18:34:44 only, no concurrent servers). No scored case copies (`prefix
+copies 0` in both serve sessions). Also on chunk137: a `json_object` request (X43: the message equal to
+chunk134's); the same-slot shapes of X28 (X42 def: 0.73 s for the repeat, 6.14 s for the 10,728-token deep reuse,
+empty slots taken; X42 d: every traced row equal to X28 d's, 519 and 93); the rewind check of X32 (X43: default
+mode KL 0.0063, top-1 249 / 256; exact mode 256 / 256 bit-identical). Not run: `serve1` / `serve3` (not in
+`--promo`); a copy beyond 12.8k tokens (at 250k it moves ~2.5 GiB device to device).
+
+Raw: `perf/results/2026-11-14/x-prefix-copy/` (copy.diff = the first form, copy2.diff, chain scripts, log.txt,
+server-log extracts, x36-trace-comparisons.txt); traces in `~/qx-chains` (x36-*, x38-*, x39-*).
+
+### Adjudication (fresh context, 2026-11-14): LANDED, default on, not a promotion
+Gate 19.166 -> 19.144 (-0.1%), nothing scored copies. Row-level exactness on the final binary recomputed from the
+traces (X36 47 / 47 and 461 / 461, 0 / 47 on the first form; X38 48 / 48 and 47 / 47; X39 47 / 47; X42 d equal to
+X28 d row for row, so the deep-rewind evidence of the entry above carries to chunk137). `exact_from` turns no free
+rewind of the server into a replay. The ruling on identical prompts sent together getting different temperature-0
+replies in default mode: acceptable. The contract bounds the distribution against exact, not the text; a same-slot
+repeat already ends its prompt in an exact window, so sequential identical prompts differed before; the copied
+request's last prompt token is the exact one; `QX_DS_PREFILL_EXACT=1` or `QX_DS_PREFIX_COPY=0` restores equality.
+Kept as a disclosure here and in findings. Its negatives: two branches of the value rule untested and the 6,500
+not swept (time only, not exactness); the copy untested beyond 12.8k; `serve1` / `serve3` not run; and, overdue,
+the next experiment must attack a row of `perf/presuppositions.md`. Ten text corrections, applied.
+

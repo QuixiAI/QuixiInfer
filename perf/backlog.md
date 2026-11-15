@@ -12,12 +12,11 @@ invented one. The aggregate score lives in `scoreboard.md`.
 ### Queue as of 2026-11-14, evening (deep rewinds through a trimmed chunk landed; prefix copy across slots under test)
 0. **The adjudicator's cadence flag: the next experiment must attack a row of `perf/presuppositions.md`** (none of
    the last five did; the cross-slot copy does not count).
-1. **Prefix reuse across slots** (`copy_prefix`, worktree build chunk135 / chunk136; `QX_DS_PREFIX_COPY=0` off):
-   measured, not yet through the breaker and adjudicator. A 12.8k prompt decoding in slot 0: the same prompt
-   arriving 0.08 s of prompt time against 15.66 (wall 10.97 against 25.35 s), a prompt sharing 11.7k tokens 6.92
-   against 16.59 s, and the first client's 100 tokens in 24.9 against 38.9 s. Exact mode: the copied prefix's reply
-   equals the same-slot rewind's and the afresh one's (X31), and the copied deep reuse equals the same-slot deep
-   reuse (X34).
+1. **Prefix reuse across slots: LANDED** (notebook 2026-11-14). Left: the free copy holds only while the source is
+   within 128 tokens of the shared point (a ring checkpoint kept at a prompt's end, or at group boundaries, would
+   make later copies free too); under 8,192 shared tokens nothing is copied once the source has moved on; two
+   branches of the scheduler's value rule untested and `QX_DS_REPLAY_COST` not swept; a copy beyond 12.8k tokens
+   unmeasured; a ring restore plus free rewind below the parked length has no standing check.
 2. **One chunk for a replay and the stretch after it** (the experts staged once: ~2 s of the ~6.9 s a deep reuse
    costs), and a replay chunk's waste (prefetch by the chunk's rows, Engram rows for all rows, up to 40 cuBLAS dry
    shapes): the deep threshold would come down with them. A deep rewind runs at admission and stalls the other
