@@ -9,6 +9,16 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-15, later (fallback burst located; the smaller staging area rejected as a default)
+1. **`json_object` replies land in `reasoning_content` with an empty `content`** (X33: valid JSON, wrong field): a
+   functional bug, the oldest open one.
+2. **The staging area's upper part lent to the tier**, taken back before a window wider than a few tokens or a chunk
+   (the store tails' mechanism): the only form in which the 2.2 GiB can go to decode without the +30% on prompts
+   under 64 tokens. Worth at most -4% at three clients (X69); needs the 8% bar's argument or a simpler form.
+3. Hygiene: the warm-up's dry and capture passes are served as jobs from a stale mailbox (the fallback burst);
+   `wb` has no length counter; `replay_to` has no standing check; the start-up panic diagnostic to fold in.
+4. Items 2-4 of the queue below are closed (notebook 2026-11-15); its item 5 stands.
+
 ### Queue as of 2026-11-15 (set D 18.475 promoted: tail residents give up their RAM copies)
 1. **The start-up burst of ~105 stage fallbacks** (follows `QX_DS_LEND_DEDUP`; exact by X62's rows): find the cause
    (a layer trace of the first request: which job and width, are the records residents of the freshly lent

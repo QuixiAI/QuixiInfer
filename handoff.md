@@ -11,7 +11,11 @@
   stores have nothing more to lend. VRAM inventory in the notebook entry (`QX_DS_MEMLOG` diff kept, not landed).
 - Open: a start-up burst of ~105 stage fallbacks with the lend half on (exact by row comparison; cause not found);
   decode256k's baseline is now 39.00 (the level of every run since promo35's 38.60).
-- Next: the backlog's queue of 2026-11-15.
+- Later the same day: the fallback burst is located in the warm-up (no request affected, closed); a staging area of
+  64 records with the chunk jobs' ring in the flex tail measured -3.2% at three clients but +30% on prompts under 64
+  tokens: REJECTED as a default, nothing landed (`x-chunk-ring`: ring2.diff, binaries `~/qx-bins/chunk146`).
+  `target/release` holds chunk144, the tree is at the landed code.
+- Next: the backlog's queue of 2026-11-15, later (`json_object` first).
 
 ## Resume 2026-11-14, night: set D 18.640 PROMOTED (the compressed stores' tails lent to the VRAM tier: serve256k3 91.3 -> 83.9)
 - **Promoted** `perf/results/2026-11-14/setd-promo35-210457` + `x-store-lend` (binaries `~/qx-bins/chunk140`, in

@@ -4703,3 +4703,92 @@ supported by the counters (both off against both on: NVMe reads 27.6-28.8k -> 21
 10.1-10.3k, fetch 12.4-13.8 -> 9.0-9.7 s, pool 80-83 -> 74-78 s, VRAM hits equal). The fallback burst is adequately
 covered for a landing by X62; its cause stays open. Fifteen text corrections, applied. Open items carried: the
 burst's cause, the decode256k baseline drift (38.60 -> 39.00, not this change).
+
+## 2026-11-15: The start-up burst of stage fallbacks — LOCATED (the server's warm-up, before any request; no change)
+
+Question (backlog item 1 of 2026-11-15, the adjudicator's open item): where do the ~105 fallbacks of a session with
+`QX_DS_LEND_DEDUP` on come from. Diagnostic (`QX_DS_FALLBACK_LOG`, not landed:
+`perf/results/2026-11-15/x-fallback-burst/fallback-log-diagnostic.diff`) printing every fallback with the host and
+device table words, one short three-client session each (X67: 104, X68: 101):
+- every one is at driver tick 1, layer 39, experts 27 and 14, in jobs of 2 tokens with 4 staged selections;
+- the record is in VRAM in a lent slot and not in RAM, on the host and on the device (table word non-zero, RAM
+  table word zero), not in flight, not queued anywhere;
+- all of them precede the line "window graph (1 tokens) captured": they are in the warm-up, and no request's step
+  has one.
+About 34 identical jobs for one layer in one tick, listing a record the device table already holds, are consistent
+with the warm-up's dry and capture passes being served from a mailbox that still carries the previous real job's
+staged list (inferred: not confirmed by a trace of the mailbox sequence). The first tick's promotions fill the
+freshly lent slots and dedup frees their RAM copies, so the stale list names records the pool must now compute;
+before the dedup change the copies stayed and the same stale jobs were staged for nothing. No cost to a request and
+none to exactness (X62's rows cover the warm-up). Closed as an open item; what is left is hygiene: a dry pass
+should not be served as a job at all.
+
+## 2026-11-15: A smaller staging area, the chunk jobs' ring in the flex tail — REJECTED as a default (decode -3 to -4% at three clients; prompts of under 64 tokens +30%, decode after a long prompt slower)
+
+Question (backlog item 2): the staging area (256 records, 2.88 GiB with the prefetch slots) is the largest idle VRAM
+left; a decode step stages a handful. Hypothesis: a quarter of it serves decode, and prompt chunks can borrow their
+ring with the flex tail.
+
+**Knob only** (`QX_DS_STAGE_CAP`, chunk144, set D `--promo`, one run each; baseline 18.475):
+
+| records | tier (3-slot 256k) | decode256k | prefill256k | serve256k1 | serve256k3 | decode | prefill128 | score |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 256 (baseline) | 12.3 GiB | 39.00 | 2.00 | 32.98 | 80.84 | 31.0 | 10.5 | 18.475 |
+| 128 | 13.7 | 38.40 | 2.0 | 34.40 | 79.30 | 30.2 | 13.2 | 18.262 |
+| 64 | 14.4 | 38.40 | 2.0 | 32.88 | 77.58 | 29.8 | 16.6 | 18.129 |
+
+prefill128 (windows of 128, no chunks) loses 26% and 58%. Long prompts in the server (X63's scenario, three ~13k
+prompts at once): the three full-stack chunks 5,892 / 5,583 / 5,389 ms at 256, 6,181 / 6,149 / 5,894 at 64 (+8%),
+9,455 / 9,512 / 9,159 at 32; KV-only chunks unchanged at 64, +43% at 32.
+
+**The chunk ring in the flex tail** (`ring1.diff`, `ring2.diff` with the breaker's fixes; binaries chunk145,
+chunk146; not landed): chunk jobs stage through a ring of `QX_DS_CHUNK_RING` records (256) at the end of the flex
+tail, held with the chunk buffers; the staging area defaults to 64 when that ring exists. The release waits for
+the chunk jobs and synchronizes the stage streams (under the capture lock) before the slots carry records again.
+
+| | serve256k3 | serve256k1 | decode256k | prefill128 | score |
+|---|--:|--:|--:|--:|--:|
+| chunk145, `x69-ring` | 78.25 | 33.12 | 38.80 | 10.5 | 18.244 |
+| chunk145, `setd-promo40` (diff in the tree; a 7 s cargo build may have overlapped its end: my slip) | 78.31 | 33.03 | 38.95 | 10.6 | 18.272 |
+
+Exact: 7 / 7 replies of X59's scenario equal to chunk143's (X71); X62's take-back scenarios' rows 540 / 540, 261 /
+261, 546 / 546, 96 / 96 equal to chunk144's (X72); two rounds of three merged short prompts against
+`QX_DS_CHUNK_RING=0 QX_DS_STAGE_CAP=256` on chunk146: 6 / 6 replies equal and the 1,590 traced rows equal as a
+multiset (the requests landed on different slots, so not per slot; X75 rows); the breaker's capture-race case
+(`qx-ds-check`, no warm-up, `QX_DS_CHUNK_SKIP=0`) ran clean (X75 a1). ds-checks do not exercise the ring (no
+`QX_DS_CHUNK`): same text as before.
+
+**What it costs** (the breaker's B2 and C1, measured):
+
+| X63's scenario (chunk146 unless said) | full-stack chunks, ms | 52 post-prompt steps, ms | NVMe reads |
+|---|--:|--:|--:|
+| staging 256, no ring (chunk144, `x63-ref2`) | 5,892 / 5,583 / 5,389 | 5,010 | 28.3k |
+| staging 64, no ring (chunk144, `x63-cap64`) | 6,181 / 6,149 / 5,894 | 4,920 | 24.5k |
+| staging 64, ring 256 in the tail | 5,873 / 5,616 / 5,393 | 5,385 | 29.5k |
+| staging 64, ring 128 in the tail | 6,075 / 5,924 / 5,702 | 5,183 | 28.2k |
+
+The ring restores the chunk times and makes the tail 622 slots instead of 318 (40% of the tier out at every
+prompt, none with a RAM copy since the dedup change): the steps after a prompt lose 0.4 s over three prompts.
+
+| three clients, prompts of 49-60 tokens, 16 tokens each, five rounds (X75 short2) | prompt seconds, summed | generation seconds, summed | staged / pool selections |
+|---|--:|--:|--:|
+| staging 64, ring in the tail (the candidate default) | 47.5 | 23.9 | 43k / 45k |
+| staging 256, ring in the tail | 36.2 | 25.6 | 84k / 15k |
+| staging 256, no ring (the landed behaviour) | 37.3 | 25.2 | 85k / 11k |
+
+Three such prompts run as windows of 48 and 96, which overflow a 64-record area into the pool: +30% of prompt time
+for the commonest chat turn (a short message on a reused prefix), against -5 to -7% of generation time.
+
+**Verdict: REJECTED as a default.** The gain (serve256k3 -3.2%, about -4% with the knob alone) is under the 8% a new
+buffer class needs and the knob alone regresses a standard case (prefill128) and short prompts. Not a promotion,
+nothing landed. For a decode-only deployment `QX_DS_STAGE_CAP=64` is available today (three clients -4%; prompts
+under 64 tokens +30%, long prompts' full-stack chunks +8%). What would make it landable: the staging area's upper
+part lent to the tier and taken back before a window wider than a few tokens (the store tails' mechanism), so that
+every prompt path keeps 256 records; expected at most the -4% above.
+
+Also settled here: the reserve (2.56 GiB, 1.21 free after the warm-up) could give about 0.5 GiB, under 1% by the
+4.1 GiB = 7.5% scale: not pursued. decode256k read 38.3-38.5 with the larger tier and 38.7-39.1 in every run at the
+baseline's tier: the baseline's 39.00 is its level, promo35's 38.60 was a low draw.
+
+Raw: `perf/results/2026-11-15/x-chunk-ring/` (ring1.diff, ring2.diff, chain scripts, log.txt, server-log extracts),
+`x69-cap128-032946`, `x69-cap64-033751`, `x69-ring-035647`, `setd-promo40-042115`, `x-fallback-burst/`.
