@@ -1,6 +1,17 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-14)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-15)
 
 
+
+## Resume 2026-11-15: set D 18.475 PROMOTED (tail residents give up their RAM copies: serve256k3 83.9 -> 80.1-81.6)
+- **Promoted** `perf/results/2026-11-15/setd-promo39-002914` + `x-tail-dedup` (code ff2326d, binaries
+  `~/qx-bins/chunk144`, in `target/release`): the driver frees the RAM copy of a VRAM resident also when it lives in
+  the flex tail or a lent store tail (`QX_DS_FLEX_DEDUP=0` / `QX_DS_LEND_DEDUP=0` restore the old behaviour). About
+  -3.6% at three clients; NVMe reads per session 28k -> 22-23k. Exact in every test; no cost after long prompts.
+- The backlog's "more idle VRAM" premise was false: the 8k server's tier is 16.9 GiB (the 256k one's 16.4), the
+  stores have nothing more to lend. VRAM inventory in the notebook entry (`QX_DS_MEMLOG` diff kept, not landed).
+- Open: a start-up burst of ~105 stage fallbacks with the lend half on (exact by row comparison; cause not found);
+  decode256k's baseline is now 39.00 (the level of every run since promo35's 38.60).
+- Next: the backlog's queue of 2026-11-15.
 
 ## Resume 2026-11-14, night: set D 18.640 PROMOTED (the compressed stores' tails lent to the VRAM tier: serve256k3 91.3 -> 83.9)
 - **Promoted** `perf/results/2026-11-14/setd-promo35-210457` + `x-store-lend` (binaries `~/qx-bins/chunk140`, in

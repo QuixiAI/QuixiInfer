@@ -9,6 +9,18 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-15 (set D 18.475 promoted: tail residents give up their RAM copies)
+1. **The start-up burst of ~105 stage fallbacks** (follows `QX_DS_LEND_DEDUP`; exact by X62's rows): find the cause
+   (a layer trace of the first request: which job and width, are the records residents of the freshly lent
+   slots?) and run `qx-ds-replay` of a burst session against frozen tiers.
+2. **The last idle VRAM**: the staging and prefetch areas (2.88 GiB; a decode step stages a handful, long prompts
+   were unchanged at twice the ring) and the reserve (2.56 GiB, 1.21 free after the warm-up). The stores have
+   nothing more to lend. The 256k server is 1.1-2.9% behind the 8k one, so the gain is bounded by what 2-3 GiB of
+   tier is worth (4.1 GiB was worth ~7.5% at three clients).
+3. **decode256k's baseline drift**: 38.5 / 38.7 in promo35, 38.9-39.1 in the eight repeats since on both binaries.
+4. `wb` has no length counter and no expiry (cap 512); a session with more than three tail cycles is untested.
+5. The night queue below, its items 2 and 3 (item 1's premise was false: presupposition 58).
+
 ### Queue as of 2026-11-14, night (set D 18.640 promoted: the stores' tails lent to the VRAM tier)
 1. **More idle VRAM in a short-context server**: the staging area (256 records, 2.4 GiB: a decode step stages a
    handful) and the reserve (2.5 GiB; 1.21 GiB free after the warm-up) are next. The 8k-context server's 32.3 /

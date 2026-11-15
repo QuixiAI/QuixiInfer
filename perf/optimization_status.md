@@ -4606,11 +4606,12 @@ reserve; the 8k server's 32.3 / 78.7 is what a full 20 GiB tier gives"). Its pre
    432 slots to 434: the 12 ranges hold 4.10 GiB and 0.04 GiB of it is not carved. X54 / X55 (`QX_DS_MEMLOG`
    checkpoints through the load, diff kept in `x-vram-inventory/`, not landed): of 31.41 GiB the three-slot 256k
    server has 30.83 free at the start; scratch 0.56; layers, rings and stores 12.13 (stores 4.69: three 2:1 layers
-   at 0.94 and one 1:1 layer at 1.88; dense weights 7.25); output 0.51; staging and prefetch areas 2.88; arena 12.39;
+   at 0.94 and one 1:1 layer at 1.88; dense weights and rings 7.25, derived: no line prints it); output 0.51; staging and prefetch areas 2.88; arena 12.39;
    2.15 free after load, 1.21 after the warm-up.
 2. *The 8k server never had a 20 GiB tier*: its log says 16.9 GiB (1,770 records). With the tails lent the 256k
-   server has 16.4. X56 (same session, chunk140): 8k 34.0, 35.0 / 79.24, 79.24; 256k 36.55 / 84.67. The gap at
-   near-equal tiers was NVMe reads: 28.2-28.7k per session against 21.0k, VRAM hits equal within 1%.
+   server has 16.4. X56 (same session, chunk140): 8k 34.0, 35.0 / 79.24, 79.24; 256k 36.55 / 84.67. (X56's 256k
+   server log was overwritten by a second, cut-off session.) The gap at near-equal tiers was NVMe reads: 28.2-28.7k
+   per session (X57's two sessions) against 21.0k, VRAM hits equal within 1%.
 
 **Cause.** `QX_DS_CHUNK=0` on the 256k server (no flex tail: X58 a-1) gives 32.89 / 80.26 and 20,974 NVMe reads, the
 8k server's figures. The driver frees the RAM copy of a record that is resident in VRAM ("dedup": the place goes
@@ -4627,11 +4628,11 @@ already queue an evicted record without a RAM copy for RAM, and the refill alrea
 
 | arm | serve256k1 | serve256k3 | NVMe reads | dedups |
 |---|--:|--:|--:|--:|
-| both off (chunk143 b-2, c-1; = chunk140) | 35.80, 38.61 | 83.82, 83.75 | 27.7k, 28.2k | 5.7k |
-| both on (chunk143 b-1, c-2) | 33.11, 35.35 | 81.57, 81.23 | 22.8k, 23.2k | 10.2k |
+| both off (chunk143 b-2, c-1; chunk140's behaviour, by the code, not by binary) | 35.80, 38.61 | 83.82, 83.75 | 27.7k, 28.2k | 5.7k |
+| both on (chunk143 b-1, c-2) | 33.11, 35.35 | 81.57, 81.23 | 22.8k, 23.2k | 10.2k, 10.3k |
 | flex on, lend off (chunk144 d-1) | 35.31 | 82.44 | 25.5k | 7.6k |
 | flex off, lend on (chunk144 d-2) | 35.96 | 82.24 | 24.1k | 8.2k |
-| no flex tail (`QX_DS_CHUNK=0`, a-1) | 32.89 | 80.26 | 21.0k | 9.9k |
+| no flex tail (`QX_DS_CHUNK=0`, a-1, on chunk142) | 32.89 | 80.26 | 21.0k | 9.9k |
 
 X57 (chunk142: the lend exclusion alone removed, the unbounded flex test still covering the lent slots) was null,
 83.96 / 83.96: that is what exposed the missing bound (the breaker's B1). serve256k1 is bimodal (the store-lend
@@ -4645,28 +4646,38 @@ entry) and unscored: only serve256k3 carries the claim. Set D `--promo`:
 | promo38 | chunk144 | 39.00 | 2.00 | 34.61 | 80.45 | 18.445 |
 | promo39 | chunk144, diff in the tree (ae76e12e42ee) | 39.00 | 2.00 | 32.98 | 80.84 | 18.475 |
 
-Gate (promo38): serve256k3 -4.1%, "win (low-risk bar only: 3-8%)"; decode256k +1.0% and serve256k1 +1.4%, below the
-3% bar (decode256k read 38.9-39.1 on chunk140 too: promo36); the rest within noise. Identity "identical" in every
+Gate: serve256k3 -4.5 / -4.1 / -3.6%, "win (low-risk bar only: 3-8%)"; decode256k +1.0%, below the 3% bar: the
+baseline's 38.5 / 38.7 (promo35) has not been reproduced in eight repeats since on either binary (38.9-39.1,
+counters identical with and without the change), so the new baseline carries 39.00; decode +0.3%, below the bar;
+prefill256k and prefill128 unchanged. promo37's gate exits 1 on the unscored serve256k1 (36.15 against 34.14: its
+modes). Preflight of promo39 (X66): 00:29:14, VM shut off, 3,436 MiB used, swap 1,025 MiB used, pressure avg10
+0.00, no build tools, tree e197dcc + diff ae76e12e42ee, binaries 86b73a06c964 / 8b54b0fbfceb; promo37 and promo38
+ran with a clean tree and the binary installed (`--no-build`), which is why promo39 is the promoted run. ds-checks
+attached by hand from X65 (`run.json` said skipped). The five default sessions (two screens, three gates) read
+80.13-81.57, the nine with the old behaviour 83.54-84.67. Identity "identical" in every
 session. chunk144 differs from chunk143 by the bound and comments (the default path does not evaluate either test).
 
 **Exactness and cost of the tail paths** (the breaker's tests; exact-mode servers unless said):
 
 | test | result |
 |---|---|
-| ds-checks a and b on chunk144 (X65) | same text as chunk140's (X51), tokenizer line included |
+| ds-checks a and b on chunk144 (X65) | same text as chunk140's (X51), tokenizer line included (X60 on chunk143 lacked that line: `QX_LLAMA_TOKENIZE` not exported) |
 | X59: three short prompts, a 12.8k prompt, a decoder beside a 13.3k prompt, a short prompt; on against flex off (chunk143) | 7 / 7 replies equal; prompt times 21.46 / 22.49 s against 21.45 / 22.34; 64 tokens after them 2.62 / 3.68 s against 2.68 / 3.65; the refill brings back 69 of 99, 316 of 317, 29 of 316, 293 of 311, 19 of 310 records against 224 of 224, 314 of 315, 310 of 315, 274 of 312, 315 of 316 |
 | X62 t3 (= X50 t3, keep 8,192, a take-back of 159 records inside decode windows), default against both knobs off (chunk144) | replies equal; per-slot ordered rows 540 / 540 and 261 / 261 |
-| X62 t4 (= X50 t4: `copy_prefix` into a lent slot, take-backs of 81 and 158 records, a deep reuse) | 3 / 3 replies equal; rows 546 / 546 and 96 / 96 |
-| X63, default mode: three ~13k prompts at once with 148-192 tokens each, then three short prompts | tokens after the prompts 21.72 / 11.08 / 17.71 s against 22.00 / 11.27 / 17.91; the short round 9.38 / 8.53 s against 9.50 / 8.79; NVMe reads 28.3k against 31.3k; refills 55, 180, 1, 30 records against 224, 197, 312, 304 |
+| X62 t4 (= X50 t4: `copy_prefix` into a lent slot, take-backs of 81 and 158 records, 81 and 157 in the off arm, a deep reuse) | 3 / 3 replies equal; rows 546 / 546 and 96 / 96 |
+| X63, default mode: three ~13k prompts at once with 148-192 tokens each, then three short prompts | prompt times 21.28 / 27.96 / 22.15 s against 16.37 / 28.18 / 27.34 (arrival order; sums 71.4 against 71.9); tokens after the prompts 21.72 / 11.08 / 17.71 s against 22.00 / 11.27 / 17.91; the short round 9.38 / 8.53 s against 9.50 / 8.79; NVMe reads 28.3k against 31.3k; refills 55, 180, 1, 30 records against 224, 197, 312, 304; no replies compared (default mode) |
 
 Breaker (fresh context, read-only): no corruption found by reading (the swap copy against a tail take: both checks
 finish the copies first; a record in `flex_evicted` that lost its RAM copy: its slot goes to the free list; no
 other reader of a tail resident's RAM copy). Its findings and what was done:
 - *Stage fallbacks 1-3 -> 101-107 per session with the change on*, one burst before the first request line (the
   GPU staged a record the host had just taken out of RAM; the pool computes it instead). Also 105 with
-  `QX_DS_CHUNK=0`, and 30 in the 8k server. Not explained to the root. Evidence it is exact: identity "identical"
-  in the six sessions that had the burst; X62's rows equal against arms with 0-1 fallbacks. Not done: its replay of
-  such a session against frozen tiers.
+  `QX_DS_CHUNK=0`, and 30 in the 8k server on chunk140 (before this change). It follows the lend half: d-1 (flex
+  on, lend off) has 1, d-2 has 104-105. Not explained to the root (the adjudicator's inference: promotions filling
+  the freshly lent slots are deduplicated while a posted job still lists them as RAM residents). Evidence it is
+  exact: X62's traces include the warm-up rows (slot 0's 540 = 446 + 94), compared bit for bit against arms with
+  0-1 fallbacks; the bench identity ("identical" in seven burst sessions) covers the measured requests only, after
+  the burst. Not done: `qx-ds-replay` of a burst session against frozen tiers (the next test).
 - *Attribution* (the unbounded flex test): the bound, and rows d-1 / d-2 above.
 - *The take-back while deduplicated had no run*: X62.
 - *A cost after long prompts* (the tail returns mostly empty; `wb` has no expiry and caps at 512): X63, none seen.
@@ -4675,8 +4686,20 @@ other reader of a tail resident's RAM copy). Its findings and what was done:
 
 Not covered: a session with more than three tail cycles; `qx-ds-replay` of a burst session; serve / serve3 (8k:
 no tails, the change is inert there). The inventory's other finding stands for the backlog: the staging area and
-reserve are the only idle VRAM left (2.9 + ~1 GiB), and the 256k server is now within 2% of the 8k one.
+reserve are the only idle VRAM left (2.9 + ~1 GiB), and the 256k server is now 1.1-2.9% behind the 8k one (79.24
+against 80.13-81.57).
 
 Raw: `perf/results/2026-11-15/x-tail-dedup/` (tail-dedup.diff, chain scripts X53-X66, log.txt, gate tables,
 server-log extracts, ds-checks logs), `perf/results/2026-11-14/x-vram-inventory/`, `x56-ctx-225006`, `x57-a-*`,
 `x58-[a-d]-*`, `setd-promo37-234439`, `perf/results/2026-11-15/setd-promo38-001006`, `setd-promo39-002914`.
+
+### Adjudication (fresh context, 2026-11-15): PROMOTE `setd-promo39-002914`, default on
+Gate and scores reproduced (18.420, 18.445, 18.475 against 18.640). The 3% bar applies (two predicates dropped from
+an existing filter behind two knobs, plus one bound) and is cleared narrowly: about -3.6% over five sessions,
+disjoint from the nine old-behaviour sessions by 1.97 ms. promo39 rather than promo38 for provenance (its
+`run.json` carries the diff). Like for like verified (commands, settings, host, binaries against every preflight
+line, no compile during a run, VM off). X62's row equality and X59's replies recomputed. The causal story is
+supported by the counters (both off against both on: NVMe reads 27.6-28.8k -> 21.7-23.2k, dedups 5.3-5.7k ->
+10.1-10.3k, fetch 12.4-13.8 -> 9.0-9.7 s, pool 80-83 -> 74-78 s, VRAM hits equal). The fallback burst is adequately
+covered for a landing by X62; its cause stays open. Fifteen text corrections, applied. Open items carried: the
+burst's cause, the decode256k baseline drift (38.60 -> 39.00, not this change).
