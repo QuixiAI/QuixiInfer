@@ -2,6 +2,16 @@
 
 
 
+## Resume 2026-11-14, night: set D 18.640 PROMOTED (the compressed stores' tails lent to the VRAM tier: serve256k3 91.3 -> 83.9)
+- **Promoted** `perf/results/2026-11-14/setd-promo35-210457` + `x-store-lend` (binaries `~/qx-bins/chunk140`, in
+  `target/release`): a slot's stores above 32,768 positions carry expert records (432 slots, 4.1 GiB in the
+  three-slot 256k server) until the slot grows to within 1,024 positions of them; the driver evicts them on the
+  engine's request (`store_need` / `lend_check`). `QX_DS_STORE_LEND=0` off, `QX_DS_STORE_LEND_KEEP`. Exact against
+  no lending in every test. serve256k3's effect is about -7.5% (the gate run's -8.1% cleared the bar by 0.14
+  points); serve256k1's reference with lending is ~36.5 (34.14 in the promoted run is a fast-mode session).
+- Presuppositions 54-57 added (all overturned today); the adjudicator's cadence flag is cleared.
+- Next: backlog queue of the night (more idle VRAM: the staging area and the reserve).
+
 ## Resume 2026-11-14, evening: deep rewinds replay through one trimmed chunk LANDED (prefix reuse no longer costs up to 100 s); prefix copy across slots measured, not yet landed
 - **Landed** `perf/results/2026-11-14/setd-promo31-174203` + `x-deep-rewind` (binaries `~/qx-bins/chunk134`, in
   `target/release`): set D 19.177 against 19.166 (no scored case rewinds deep: not promoted). The user asked for

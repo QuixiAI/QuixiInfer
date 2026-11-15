@@ -71,3 +71,8 @@ regime only). Payoff: what changes if it is false.
 - When an experiment's result contradicts a row, the row changes first, then the notebook and findings.
 - Add a row whenever a design decision is justified by "everyone knows" or "the docs say"; those are the rows most
   likely to be wrong.
+| 54 | Returning to a shared prefix is cheap ("a rewind replays about 130 tokens"). | Client-side seconds of a request whose prefix ends more than 128 tokens before the slot's end. | 2026-11-14 (2,047 tokens with 1,252 shared: 28.5 s against 5.2 afresh; the replay is 5,208 tokens at ~20 ms, and the prompt timer started after it) | **overturned** | Landed: the replay in one trimmed chunk, a deep prefix reused only from 8,192 tokens. |
+| 55 | A prefix can be reused only from a free slot. | `copy_prefix` from a running slot. | 2026-11-14 (a 12.8k prompt beside its first copy 15.79 -> 0.08 s) | **overturned** | Landed. |
+| 56 | A rewind within the ring's reach finds exact rings. | A copy from a slot between its KV-only chunks, exact mode. | 2026-11-14 (0 of 47 rows right) | **overturned** | `exact_from` per slot. |
+| 57 | A slot's compressed stores must hold VRAM for the whole context from the start; the tier gets what is left. | The stores' tails above 32,768 positions lent to the tier, taken back before a slot grows into them. | 2026-11-14 (432 slots, 4.1 GiB: serve256k3 91.3 -> 83.9; exact against no lending in five tests) | **overturned** | The staging area (2.4 GiB) and the reserve (2.5 GiB) are the next idle VRAM in a short-context server. |
+

@@ -9,6 +9,16 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-14, night (set D 18.640 promoted: the stores' tails lent to the VRAM tier)
+1. **More idle VRAM in a short-context server**: the staging area (256 records, 2.4 GiB: a decode step stages a
+   handful) and the reserve (2.5 GiB; 1.21 GiB free after the warm-up) are next. The 8k-context server's 32.3 /
+   78.7 ms per token is what a full 20 GiB tier gives against 36.5 / 84 now.
+2. **Lending, what is left**: with lending the flex tail comes back empty after the first chunks (initial residents
+   have no RAM copy; no cost seen, exact mode only); a default-mode long prompt with lending, `copy_prefix` into a
+   slot that stays lent and a re-lend after a deep rewind in the server are not covered by a test; the cosmetic
+   "can lend" line in one-slot runs.
+3. The evening queue below (its item 0 is done: presupposition 57).
+
 ### Queue as of 2026-11-14, evening (deep rewinds through a trimmed chunk landed; prefix copy across slots under test)
 0. **The adjudicator's cadence flag: the next experiment must attack a row of `perf/presuppositions.md`** (none of
    the last five did; the cross-slot copy does not count).

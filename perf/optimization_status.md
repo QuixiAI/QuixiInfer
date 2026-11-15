@@ -4484,3 +4484,112 @@ Kept as a disclosure here and in findings. Its negatives: two branches of the va
 not swept (time only, not exactness); the copy untested beyond 12.8k; `serve1` / `serve3` not run; and, overdue,
 the next experiment must attack a row of `perf/presuppositions.md`. Ten text corrections, applied.
 
+## 2026-11-14: The stores' tails lent to the VRAM tier — PROMOTED (set D 19.166 -> 18.640: serve256k3 91.3 -> 83.9, about -7.5% in effect; serve256k1 38.9 -> 34.1-37.0, unscored)
+
+Status: promoted, default on (`QX_DS_STORE_LEND=0` off). A long shot: it attacks presupposition 57
+(below), named by the adjudicator's cadence flag.
+
+Belief attacked: a slot's compressed stores must hold VRAM for the whole context from the start, and the expert
+tier gets what is left (12.3 of the 20 GiB asked for in a three-slot 256k server; the 8k-context server measured
+32.34 / 78.68 ms per token this morning, `w6-serve-013951` on chunk122, against 38.3 / 90.5 at 256k).
+
+Change (`lend3.diff`, sha256 443232e7902c, on 3d05ab2; binaries `~/qx-bins/chunk140`: qx-ds-check f39f6aa739ac,
+quixiinfer 04c962eefb8b, qx-ds-multi ba58f191c8c7, qx-ds-replay 77bbb9af93f4; `QX_DS_STORE_LEND=0` off,
+`QX_DS_STORE_LEND_KEEP` default 32,768 positions):
+- At load, for every compressed store and slot, the address range above the kept positions (less the slot's last
+  two rows) is recorded, and VRAM slots for the next records of the ranking are carved there, round robin, up to
+  the budget asked for: 432 slots, 4.1 GiB, in the three-slot 256k server (476 at a keep of 8,192).
+- The driver (`lend_check`) puts a slot's carved addresses on the tier's free lists when the engine lends them and,
+  when the engine takes them back, finishes the copies in flight, evicts every record there (table 0 on host and
+  device), purges the free and quarantined slots there, synchronizes and acknowledges.
+- The engine lends every slot before its first forward, takes a slot's tails back before any forward, chunk,
+  unpark or prefix copy that brings it within 1,024 positions of the kept ones (`store_need`), and lends again on
+  a reset, a park, or a rewind to under half the kept positions (`store_lend`).
+- `flex_check`'s tail test has an upper bound (the arena's end); records in lent ranges are no RAM-dedup sources;
+  a record the flex tail evicts without a RAM copy is queued for RAM; `qx-ds-check` takes `QX_DS_CTX`.
+
+Gate (chunk140, `setd-promo35-210457`, preflight 21:04:57: VM shut off, 3,270 MiB used, pressure avg10 0.08, no
+build tools, diff 443232e7902c):
+
+| case | baseline | candidate | change |
+|---|--:|--:|--:|
+| decode256k | 38.55 | 38.60 (38.7 / 38.5) | +0.1% |
+| prefill256k | 2.00 | 2.00 | 0 |
+| serve256k1 | 38.94 | 34.14 | -12.3% |
+| serve256k3 | 91.32 | 83.89 | -8.1% |
+| decode | 30.70 | 30.90 | +0.7% |
+| prefill128 | 10.60 | 10.50 | -0.9% |
+
+Score 19.166 -> 18.640 (-2.7%). Identity serve256k-1 identical; a second serve256k session
+`x51-serve256k-2-211223`: 36.62 / 84.46, identical. Tail dumps at 2,048 and 16,384 tokens byte-identical to
+chunk137's; ds-checks parts a and b the same text as v11's. The one-slot cases lend nothing (decode256k and
+prefill256k unpark at their length; the short ones have the whole budget).
+
+serve256k, every run of the day (ms per token; one repeat each):
+
+| | serve256k1 | serve256k3 |
+|---|---|---|
+| no lending (13 runs on chunk122-chunk138) | 36.9-39.8, in three modes by the warm-up's arrival order | 90.42-91.58 |
+| lending, keep 32,768 (chunk138: X44, X45; chunk140: promo35, X51) | 36.86, 36.46, 34.14, 36.62 | 83.96, 84.32, 83.89, 84.46 |
+| lending, keep 8,192 (chunk138) | 36.72 | 83.68 |
+
+serve256k3: -8.1% in the gate run against the committed baseline (the 8% bar cleared by 0.14 points, and by this
+run only: the four keep-32,768 sessions read -8.1, -8.1, -7.7, -7.5% against the baseline, the same-binary pairs on
+chunk138 -7.2 and -7.4%, and against the day's 13 no-lending runs -6.6 to -8.4%); the two sets are disjoint by 6 ms
+(83.68-84.46 against 90.42-91.58). The effect is about 7.5%. A second `--promo` run on chunk140,
+`setd-promo36-212326`: 18.712 (decode256k 39.0 / 38.9, serve256k1 36.97, serve256k3 84.10, -7.9%). serve256k1 is not
+in the score (the standard cases are decode256k, prefill256k and serve256k3) and is mode-dependent (the breaker:
+the two requests of that level trade places by the warm-up's order): lending 34.14-36.97 over five sessions, 34.14
+a single fast-mode one; about 36.5 is the reference for later runs.
+
+Scope of the gain: it holds while a slot is under about 31,700 positions; beyond that the slot takes its share back
+(134-160 records). The scored serve case uses 40-46-token prompts. With every slot long the numbers are the old
+row's. A server at 8,192 positions of context cannot lend at all (it already has the whole budget).
+
+Exactness, lending on against `QX_DS_STORE_LEND=0`:
+
+| test | result |
+|---|---|
+| X48 t1 (chunk140 `qx-ds-check`, `QX_DS_CTX=262144`, keep 3,072, tiers adapting, exact chunks; 2,560 single steps, rewind to 512, park / unpark to 512) | 2,048 / 2,048 rows bit-identical twice; three take-backs of 160 records each (from decode windows), two re-lends |
+| X48 t2 (the same run, the saved state at 2,560 against lending off) | the state files (every store row and ring, 37 MB) identical; 160 records out at the take-back |
+| X46 (chunk138, exact server): a short prompt; a 42,065-token prompt reusing that slot beside a decoder (take-back, 138 records); three short prompts at once (lent again); the long prompt afresh (take-back, 134) | 7 / 7 replies and 238 / 238 traced `H` lines equal, in order. On chunk140 (X49): 7 / 7 replies, the per-slot ordered rows identical (741 rows; the two arms interleaved a decoder's steps and a chunk differently) |
+| X50 t3 (chunk140, exact server, keep 8,192): a 7,267-token prompt with 260 tokens of reply beside a decoder (take-back, 159 records) | both replies equal, the per-slot ordered rows identical (799 rows; 796 in the first pair, which took nothing back) |
+| X50 t4 (chunk140, exact server, keep 8,192): a 12.8k prompt decoding, the same prompt arrives (`copy_prefix` into a lent slot: 157 records out first), then a deep reuse | 3 / 3 replies equal, the per-slot ordered rows identical (640 rows, `P 0 1 12784` among the trace lines) |
+
+Breaker (fresh context): no memory-safety hole found by reading (every store writer indexes by the tokens' own
+positions and every path that raises a position is hooked; the highest row a lent slot writes is under the kept
+rows for any ratio; reads stop at the slot's position; the take-back's order of copies, holders, lists,
+synchronize, acknowledge; the request race). Its findings: the first runs' only exercise of lending was X46 (the
+X48 and X50 rows are its tests); serve256k1's modes (the table above); with lending the warm-up's promotions take
+the lent slots, the arena tail keeps its initial residents (no RAM copy) and the first chunk sent 304 of them to
+NVMe against 26 (now queued for RAM as an eviction does; the first release still returns the tail empty, and it
+stays empty through the second chunk: "0 records out, 0 back" twice in X49 and X50 t3, 255 and 310 back later,
+against 216 at the first release without lending. No cost seen, in exact-mode servers only: NVMe reads 8,658
+against 9,018 in X50 t3 and 21,580 against 22,140 after X49's 42k prompt; 260 tokens after it 12.00 s against
+12.47 s, 32 tokens 2.19 against 2.29 s; prompt times equal within 0.1 s);
+a take-back evicts the newest promotions (no cost seen: 32 tokens after one 2.21 s against 2.30 s); re-lending only
+from half the kept positions (was: just under them) against thrash.
+
+Not covered on chunk140: `copy_prefix` into a lent slot that stays lent (the default keep; X50 t4 forced the
+take-back with a keep of 8,192); a re-lend after a deep rewind in the server (the engine path is X48 t1); a
+default-mode long prompt with lending (X49 and X50 are exact-mode servers). Not done: the 4.1 GiB is all the stores
+can lend; the staging area (256 records, 2.4 GiB) and the reserve (2.5 GiB) are the next idle VRAM. `serve1` /
+`serve3` not run (not in `--promo`). X44 and X45's `run.json` carry no diff hash: they ran chunk138 = `lend.diff`
+(adbf34420d3f) installed with `--no-build` on a clean tree.
+
+Raw: `perf/results/2026-11-14/x-store-lend/` (lend.diff, lend2.diff = the first forms, lend3.diff, chain scripts,
+log.txt, gate.txt, server-log extracts), `setd-promo35-210457` (promoted; ds-checks attached by hand, as for
+promo28), `setd-promo36-212326`, `x51-serve256k-2-211223`, `x44-*`, `x45-*`.
+
+### Adjudication (fresh context, 2026-11-14): PROMOTE, default on
+Gate and score reproduced (19.166 -> 18.640; serve256k1 is not scored, so its modes cannot change the score). The
+8% bar is cleared by the gate run only, by 0.14 points; accepted under the rule as written (the promotion run's
+median against the committed baseline, outside the spread on both sides); the scoreboard row says the effect is
+about 7.5%. Exactness recomputed from the traces: per-slot ordered rows and every chunk hash identical between
+lending on and off in all five pairs, the state files of X48 t2 byte-identical. Memory safety as far as reading
+goes: one size class per record size; a lent slot stays under keep - 1,024 positions, its highest row under
+keep / ratio + 2; the take-back's order; the flex tail's upper bound; inert without the driver (that every store
+writer is hooked and that reads stop at the position are the breaker's claims). The side effect on the flex tail is
+adequately measured for a landing, in exact mode only. Presupposition 57 overturned: the cadence flag is cleared.
+Nine text corrections, applied.
+

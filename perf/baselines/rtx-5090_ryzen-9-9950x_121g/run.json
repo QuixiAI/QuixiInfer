@@ -1,22 +1,16 @@
 {
  "schema": 1,
- "label": "setd-promo13",
- "date": "2026-11-12T16:19:09",
+ "label": "setd-promo35",
+ "date": "2026-11-14T21:12:20",
  "git": {
-  "commit": "967476e",
+  "commit": "3d05ab2",
   "dirty": true,
   "modified": [
-   "M crates/qx-engine/src/dsv41/driver.rs",
-   " M crates/qx-engine/src/dsv41/mod.rs",
-   " M crates/qx-engine/src/ops.rs",
-   " M crates/qx-engine/src/tiers.rs",
-   " M crates/qx-gpu/src/kernel.rs",
-   " M crates/qx-gpu/src/raw.rs",
-   " M third_party/cubecl-cuda/src/compute/context.rs",
-   " M third_party/cubecl-cuda/src/lib.rs",
-   " M tools/longprompt.py"
+   "M crates/qx-engine/src/bin/qx-ds-check.rs",
+   " M crates/qx-engine/src/dsv41/driver.rs",
+   " M crates/qx-engine/src/dsv41/mod.rs"
   ],
-  "diff_sha": "955828554b0f"
+  "diff_sha": "443232e7902c"
  },
  "host": {
   "gpu": "NVIDIA GeForce RTX 5090",
@@ -50,15 +44,8 @@
   "env QX_DS_PACK=/home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp QX_DS_VRAM=20 QX_DS_RAM=100 QX_DS_BENCH=0 QX_DS_PROMOS=32 QX_DS_VERBOSE=1 target/release/qx-ds-check /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf perf/data/route1k.tokens 1024"
  ],
  "attached": {
-  "tree": "run.json records 967476e + working tree (diff_sha 955828554b0f): the tree committed with the notebook entry of 2026-11-12; binaries chunk110 (qx-ds-check a78bd7bb6b73, quixiinfer 8c2ca42d5df6) built from it at 15:55",
-  "correctness": "tools/ds-checks.sh on the same binaries: part a 16:04-16:11 and part b 16:00-16:04 immediately before this run (lines 1-5 of part b on chunk110; line 6 then used chunk109's qx-ds-multi, which target/release still held), part b re-run in full 16:53-16:57 with chunk110's qx-ds-multi (fee1a777cb2d): line 6 reads 3/3 three times; logs/ds-checks-part-a.timestamped.log, logs/ds-checks-part-b.timestamped.log (the re-run); text-identical to the previous validated binary (v11)",
-  "serve1,serve3": "from perf/results/2026-11-12/hold3-serve-165723 (chunk110, 16:57-17:00: 35.06 / 79.18; rows appended to results.jsonl). Earlier builds of the same work: chunk109 34.22 / 79.74, chunk105 32.44 / 78.86",
-  "identity_other_sessions": "serve256k-1 identical in v13-new1-162902, v13-new2-163512, v13-new3-164124 (chunk110: serve256k1 38.43, 38.36, 39.26; serve256k3 90.91, 89.29, 91.24), alternated with chunk104 (v13-old1..3: 39.06, 38.45, 40.77; 91.32, 91.16, 90.99)",
-  "prefill_default_path": "prefill256k configuration, 64 tail rows: the dump is byte-identical to the promoted tree a41128e (po3.bin): the accuracy figures of setd-promo8 stand unchanged",
-  "prefill_exact_knob": "QX_DS_PREFILL_EXACT=1: prefill256k configuration 64/64 tail rows bit-identical to the exact dump of 2026-11-10 (pe.bin) on chunk110; 16,383-token prompt 64/64 against the no-skip exact reference on chunk109 (chain V12)",
-  "server_long_prompt": "three-slot 256k server on chunk110: 13,283 tokens 11.34 s, 3,293 tokens 4.95 s, 1,638 tokens 4.53 s; the 64-token replies equal chunk104 byte for byte; logs/longprompt-3slot.server.log (chain V13). Two prompts at once with the exact knob: 60/60 row hashes equal the reference trace on both slots",
-  "breaker": "two fresh-context reviews (module loading on chunk105; staging overlap on chunk109, with its own runs incl. three-slot server traces byte-identical on vs off); no defect; the fixes and hardening notes they listed are in chunk110",
-  "prefill256k_attribution": "the scored chunk (8,192 rows at 253,952) on chunk110: 16,455 ms default; 16,916 with QX_DS_CHUNK_OVERLAP=0; 17,898 with QX_MODULE_SHARE=0; baseline 18,360 (its measured chunk contains two mgemv.cu compiles). The KV-only chunk before it: 9,514 / 9,512 / 14,173; baseline 14,062 (hold3-p256-*)",
-  "ptx_cache": "every module in this run loaded its PTX from ~/.cache/quixiinfer/ptx (benchmark state from this change on; a first run after a kernel edit pays the compile)"
+  "tree": "run.json records 3d05ab2 + working tree (git diff -- crates sha256 443232e7902c, lend3.diff, in working-tree.diff); binaries ~/qx-bins/chunk140 (qx-ds-check f39f6aa739ac, quixiinfer 04c962eefb8b, qx-ds-multi ba58f191c8c7, qx-ds-replay 77bbb9af93f4)",
+  "correctness": "tools/ds-checks.sh parts a and b run by chain-x51.sh on the same binaries at 20:57 and 21:04 (attached/x51-ds-checks-a.log, -b.log): all nine lines as perf.md has them; attached by hand because --promo runs without --check",
+  "preflight": "21:04:57 VM shut off, 3,270 MiB used, pressure avg10 0.08, no build tools"
  }
 }
