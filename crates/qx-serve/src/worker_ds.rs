@@ -102,6 +102,8 @@ struct Req<'a> {
     t_prompt: Option<f64>,
     finish: Option<&'static str>,
     matcher: Option<llguidance::Matcher>,
+    /// The constraint waits for the reasoning block to close (`Job::grammar_after_think`).
+    in_think: bool,
     /// Prompt tokens fed so far (the reused prefix counts).
     read: usize,
     reused: usize,
@@ -365,7 +367,8 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 } else {
                     eng.reset(slot);
                 }
-                running.push(Req { job, slot, detok: Detok { tok, ids: Vec::new(), sent: 0 }, text: String::new(), n: 0, t0: t_admit, t_prompt: None, finish: None, matcher, read: reuse, reused: reuse, next: None, logits: None });
+                let job_think = job.grammar_after_think;
+                running.push(Req { job, slot, detok: Detok { tok, ids: Vec::new(), sent: 0 }, text: String::new(), n: 0, t0: t_admit, t_prompt: None, finish: None, in_think: job_think && matcher.is_some(), matcher, read: reuse, reused: reuse, next: None, logits: None });
             }
             if running.is_empty() {
                 continue;
@@ -551,7 +554,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             for r in running.iter_mut() {
                 let Some(mut logits) = r.logits.take() else { continue };
                 let pos = eng.pos(r.slot);
-                if let Some(m) = r.matcher.as_mut() {
+                if let Some(m) = r.matcher.as_mut().filter(|_| !r.in_think) {
                     match m.compute_mask() {
                         Ok(mask) => apply_mask(&mut logits, mask.as_slice()),
                         Err(e) => {
@@ -562,7 +565,8 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     }
                 }
                 let id = sample(&logits, &r.job.sampling, pos);
-                if let Some(m) = r.matcher.as_mut() {
+                let was_think = r.in_think;
+                if let Some(m) = r.matcher.as_mut().filter(|_| !was_think) {
                     if !stop_ids.contains(&id) {
                         if let Err(e) = m.consume_token(id) {
                             let _ = r.job.events.send(Event::Error(format!("grammar: {e}")));
@@ -571,7 +575,11 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                         }
                     }
                 }
-                if r.emit(id, &stop_ids, opt.max_ctx, pos) {
+                let live = r.emit(id, &stop_ids, opt.max_ctx, pos);
+                if r.in_think && r.text.contains("</think>") {
+                    r.in_think = false;
+                }
+                if live {
                     if r.matcher.as_ref().is_some_and(|m| m.is_stopped()) {
                         r.finish = Some("stop");
                     } else {

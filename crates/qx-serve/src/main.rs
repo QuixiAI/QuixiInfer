@@ -185,7 +185,7 @@ async fn generate(app: Arc<App>, prompt: Vec<u32>, body: &Value, chat: bool, thi
         Ok(g) => g,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
-    let job = Job { arrived: std::time::Instant::now(), prompt, grammar, max_tokens, sampling: sampling_from(body), stop: stops_from(body), events: tx };
+    let job = Job { arrived: std::time::Instant::now(), prompt, grammar, grammar_after_think: chat && thinking, max_tokens, sampling: sampling_from(body), stop: stops_from(body), events: tx };
     if app.jobs.lock().unwrap().send(job).is_err() {
         return err(StatusCode::SERVICE_UNAVAILABLE, "engine stopped");
     }
@@ -292,7 +292,11 @@ async fn chat_completions(State(app): State<Arc<App>>, h: HeaderMap, Json(body):
     if std::env::var("QX_SCHED_STATS").is_ok() {
         eprintln!("chat: template {:.0} ms, tokenizer {:.0} ms ({} chars, {} tokens)", 1e3 * (t1 - t0).as_secs_f64(), 1e3 * t1.elapsed().as_secs_f64(), text.len(), prompt.len());
     }
-    generate(app.clone(), prompt, &body, true, thinking).await
+    // the reply opens inside a reasoning block only when the rendered prompt ends with one left open (not after an
+    // assistant prefill, a task token or a lone system message): the split of the reply and a structured-output
+    // constraint's start both follow that, not the request's flag
+    let think_open = thinking && text.trim_end().ends_with("<think>");
+    generate(app.clone(), prompt, &body, true, think_open).await
 }
 
 async fn completions(State(app): State<Arc<App>>, h: HeaderMap, Json(body): Json<Value>) -> Response {
@@ -353,7 +357,7 @@ fn main() -> Result<()> {
             let prompt = tok.encode(&text)?;
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let sampling = Sampling { temperature, top_p: 0.95, min_p: 0.0, top_k: if temperature > 0.0 { 20 } else { 1 }, seed: 1234 };
-            jobs.send(Job { arrived: std::time::Instant::now(), prompt, grammar: None, max_tokens, sampling, stop: Vec::new(), events: tx })?;
+            jobs.send(Job { arrived: std::time::Instant::now(), prompt, grammar: None, grammar_after_think: false, max_tokens, sampling, stop: Vec::new(), events: tx })?;
             use std::io::Write;
             while let Some(ev) = rx.blocking_recv() {
                 match ev {

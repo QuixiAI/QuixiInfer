@@ -16,6 +16,10 @@ pub struct Job {
     pub prompt: Vec<u32>,
     /// A structured-output constraint.
     pub grammar: Option<crate::grammar::Spec>,
+    /// The reply opens inside a reasoning block (a chat request with thinking on): the constraint applies to the
+    /// answer, from the token after `</think>` (the DeepSeek worker; before 2026-11-15 it applied from the first
+    /// token, the block could never close and the constrained text came back as `reasoning_content`).
+    pub grammar_after_think: bool,
     pub max_tokens: usize,
     pub sampling: Sampling,
     pub stop: Vec<String>,
