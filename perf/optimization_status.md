@@ -5084,3 +5084,99 @@ the step except the waits (host-bound: findings, the DRAM's read bandwidth), `qx
 ~1.6x of the card's nominal memory bandwidth; exact f32 by contract) and `qx_ds_idx_score2` (5.8%).
 
 Raw: `perf/results/2026-11-16/x-nsys-dec256k/`.
+
+## 2026-11-16: A short chunk's experts on the grouped kernels — LANDED, default on, not a promotion (chunks under 256 rows -12 to -15% for a first chunk, to -20% on later 64-row chunks: 192 rows 1,920 -> 1,650 ms; a chat turn's 190-token message 2.12 -> 1.72 s)
+
+Presupposition attacked (62): "a short prompt's time is its experts' bytes: the copy link and the disk" (findings;
+the notebook's entry of 2026-11-15). Measured instead:
+
+1. **The link is not the limit.** `qx-membw`, extended for the run (not landed, its output not retained: the
+   figures are from the session): the copy engine alone moves
+   50.9-51.3 GB/s host to device, the same on 1 to 16 streams and for 9.5 MB or 67 MB copies; beside the pool
+   28.3 (the pool 29.3, together 57.6: the DRAM's read ceiling).
+2. **The pool does not help a window** (X94, prefill128 on chunk153, `QX_DS_STAGE_SHARE` 8 / 7 / 6 / 5): 10.7 /
+   10.7 / 11.4 / 13.0 ms per token. Staging everything stays the default.
+3. **A 192-row chunk is GPU-bound on its expert kernels** (X95, nsys on chunk153; the window from the chunk's
+   first large host-to-device copy to its last, 2,012 ms; the chunk line says 1,984 ms):
+   5,566 copies, 57.1 GB, the copy engine busy 1,209 ms (47.3 GB/s while copying, idle ~21 ms a layer); kernels
+   busy 1,584 ms, 1,225 of it expert kernels (6,009 experts: `qx_moe_gateup_mma_*` 102-148 us each, `down_mma`
+   39-67 us, whatever the rows: 7.7 rows an expert on average, ~204 us an expert in all); the card idle 50-70 ms.
+   6,009 - 5,566 = 443 of the used experts were not copied: the VRAM residents (a derivation, not a counter).
+4. The chunk's expert kernels are the exact int8 tensor-core ones (64 rows a pass); the grouped CUDA-core family
+   (a weight block decoded once per warp for up to 8 rows; `QX_DS_CHUNK_MMA=0`) and the per-selection family
+   (`QX_DS_CHUNK_GROUPED=0`) are the same bits. On short chunks (X96, X97; chunk153):
+
+| rows | tensor-core (default) | grouped | per selection |
+|--:|--:|--:|--:|
+| 192 | 1,926 / 1,918 (exact mode: the same kernels) | 1,646 | 1,719 |
+| 64 | 1,095 / 1,097 | 964 | 984 |
+
+Change (`grp3.diff`, sha256 1680be89c1d7, on 7943d9b; binaries `~/qx-bins/chunk156`: qx-ds-check 772a7b95eae8,
+quixiinfer 059163839b16): in a chunk whose experts run one after another on the main stream (`ns == 1`: under 256
+rows by default) an expert with at most `QX_DS_CHUNK_GRP_MAX` rows (default 64; 0: never) runs the grouped
+kernels, one with more the tensor-core ones. Both families were already warmed at start-up.
+
+Threshold and the forms tried (one run a cell; 192 rows repeated: tensor-core 1,918 / 1,920 / 1,926 / 1,928 over
+three binaries, grouped 1,645 / 1,646 / 1,652 / 1,654 / 1,668; the 136-row row is X100 on chunk156 with the logits
+dump on, its "8" cell is threshold 4; chunk154 = the knob with default 0, chunk155 = also a
+`QX_DS_CHUNK_SIDE_MIN` knob and the grouped choice on the side streams, not landed):
+
+| rows | 0 (as before) | 8 | 24 | 64 | side streams from 1 row, 0 / 24 / 64 | grouped on the side streams, 24 / 64 |
+|--:|--:|--:|--:|--:|--:|--:|
+| 64 | 1,097 | | 963 | | 976 / 971 / - | |
+| 136 | 1,596 | 1,394 (4) | | 1,389 | | |
+| 192 | 1,920 | 1,668 | 1,652 | 1,654 | 1,665 / 1,665 / 1,669 | |
+| 448 (side streams) | 1,790 | | 1,789 | | | 1,808 / 1,816 |
+| 1,024 (side streams) | 2,404 | 2,377 | 2,379 | 2,374 | | 2,427 / 2,551 |
+| 4,096 | 4,337 | | 4,339 | 4,328 | | |
+
+Overlapping the experts on side streams and the grouped kernels are substitutes under 256 rows (both land on
+~1,650 ms at 192 rows: the copies' 1.2 s and the dense layers are what is left); the grouped kernels on the side
+streams cost the larger chunks, so the side branch is untouched. With `QX_DS_CHUNK_STREAMS=1` (not the default)
+the new branch also serves large chunks: 1,024 rows 4,007 -> 3,317 ms (X103; timed, not hashed; the same holds
+whenever `ns` falls to 1: a staging ring under 8 x streams, raw launches off). X103's sixteen 64-row chunks: -13.4
+to -20.0% each against the knob at 0, mean -17.0%.
+
+Exactness (all rows compared by the sha256 of the logits dump; chunk156):
+
+| test | result |
+|---|---|
+| X100: the 64 single steps after a 192-row chunk and after a 136-row chunk: default (64), tensor-core only (0), both families in one chunk (4), no chunk at all (single steps from 0) | the same hash in the four arms, both sizes |
+| X103: 1,088 tokens in sixteen 64-row chunks, every row dumped (each chunk's own last row included: the top layers' experts), 64 / 0 / 4 | the same hash (562,626,560 bytes) |
+| X103: 400 single steps, rewind to 200 through a 200-row replay chunk (exact kernels), 64 and 0 | 200 / 200 rows bit-identical in both |
+| ds-checks parts a, b, c (`ds-checks-chunk156.log`) | pass; the same text as chunk153's (its chunks are 400+ rows: the untouched branch) |
+
+Several slots in one short chunk (X103, the server, two requests of ~100 tokens together, twice): with the knob
+at 0 requests 1 and 2 shared a chunk (201 rows of 2 slots, 2,237 ms, tensor-core); at 64 the four went into
+separate chunks (grouped). The four replies are byte-identical between the arms. Not run: a several-slot chunk on
+the grouped kernels (the kernels index by selection; the breaker expects no difference); formats other than this
+model's; the X103 rewind arms do not show that the replay chunk took the grouped branch (bit-identical either way).
+
+Server (X83 ck156 against ck153, the three-turn chat, one run): turn 2's 190-row chunk 2,117 -> 1,720 ms (prompt
+2.12 -> 1.72 s, -18.8%); the other prompts as before (4.07, 0.41, 3.10, 0.45, 0.37 s); the six reply texts are
+byte-identical to ck153's. Four first prompts of 87-101 tokens (X103): chunks of 1.16-1.38 s (prompt times 1.38 /
+1.91 / 1.25 / 1.60 s: two waited behind the other's chunk).
+
+Gate: set D `setd-promo44-085725` (chunk156, the diff in the tree) 18.508 against 18.475 (+0.2%): decode256k 39.1 /
+39.0, prefill256k 2.0, serve256k1 32.98, serve256k3 81.17, decode 30.9, prefill128 10.5; identity serve256k-1
+identical. Preflight 08:57:25: VM shut off, 3,521 MiB used, pressure avg10 0.00, no build tools. The gate has no
+chunk under 256 rows (its prompts are 42-46 tokens, in windows): no harm shown, the gain is on the secondary
+metric. `run.json` records correctness as skipped; the pass is `check_ds_log.py` on the three part logs of
+772a7b95eae8.
+
+Two more `serve256k` sessions on chunk156 (X58 k): `QX_DS_CHUNK_GRP_MAX=64` 35.5 / 80.52, `=0` 34.76 / 81.3, both
+"identical" (three in all; these sessions contain no chunk: no harm, not evidence for the changed path). X103's
+chain hit its 598 s cap after its last arm's requests: that arm's log line and the chain's end marker are missing
+(the marker written by hand), its files are in the run directory.
+
+Breaker (fresh context): no defect by reading (argument lists against the existing grouped branch and the kernels'
+info words, both families warmed for the model's three gate and five down formats, the scratch written and read
+by list position, m = 1 / 8 / 9 / 64 / 65). Its tests: the every-row dump, the short replay chunk and the
+one-stream timing above; the several-slots chunk is the one not run.
+
+Raw: `perf/results/2026-11-16/x-chunk-grp/`, `setd-promo44-085725`.
+
+### Adjudication (fresh context, 2026-11-16): LANDED, default on, not a promotion
+Gate 18.475 -> 18.508 (+0.2%), no scored case harmed; the 3% bar met on the target (a secondary metric) by a wide
+margin; ten text corrections, applied (the code comment's "~130 us an expert" is ~204 us by the profile: to fix
+with the next change to that block). Follow-up: a several-slot short chunk at the default knob.

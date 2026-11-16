@@ -10,8 +10,10 @@ invented one. The aggregate score lives in `scoreboard.md`.
 ## Beam
 
 ### Queue as of 2026-11-16 (ring checkpoint landed: a chat turn reuses its history after a long reply)
-1. **The short stretch**: what is left of a chat turn is the new message: 190 rows 2.1 s as a chunk, 14 tokens
-   0.4 s in a window (64-255 tokens ~1.8 s whatever the length).
+1. **The short stretch**: grouped kernels LANDED (190 rows 2.12 -> 1.72 s). Next: the predicted prefetch under 256
+   rows now pays in the check tool (X104: 192 / 136 / 64 rows 1,652 / 1,387 / 969 -> 1,554 / 1,299 / 932 ms with
+   `QX_DS_CHUNK_PREFETCH_MIN=64`; it lost on 2026-11-13 when the kernels were the bound): measure in the server
+   (more NVMe reads). A several-slot short chunk on the grouped kernels is unhashed.
 2. **Decode after a reused prompt** is 3-5% slower over 400 tokens than after the same prompt afresh (the chunk
    leaves the conversation's experts in VRAM, a reuse does not): keep or prefetch a slot's experts across turns.
 3. Checkpoint gaps: no row-level check after a chunk / window or of a cross-slot copy with a checkpoint; one
