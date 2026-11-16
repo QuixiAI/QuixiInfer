@@ -29,6 +29,16 @@ part_c() {
     gpu_free
     echo "7. rewind to $2 of $1 by a replay chunk: $(env QX_DS_VRAM=20 QX_DS_RAM=60 QX_DS_BENCH=0 QX_DS_ADAPT=0 QX_DS_CHUNK=8192 QX_DS_PREFILL_EXACT=1 QX_DS_REWIND=$2 $B "$M" golden/data/route16k.tokens $1 2>/dev/null | grep -E '^rewind' | sed -E 's/ \(restore.*//; s/ then positions.*: bit/: bit/' | tr '\n' ' ')"
   done
+  # 8: the rings checkpointed at a prompt's end and put back (the server's free rewind after a long reply);
+  # 9: a rewind after a rewind (the rings hold cells of the first pass: the second must replay)
+  C0="QX_DS_VRAM=20 QX_DS_RAM=60 QX_DS_BENCH=0 QX_DS_ADAPT=0 QX_DS_CHUNK=8192 QX_DS_PREFILL_EXACT=1"
+  F='s/ \(restore.*//; s/ then positions.*: bit/: bit/'
+  gpu_free
+  echo "8. checkpoint at 420 of 560, rewind to 400: $(env $C0 QX_DS_CKPT=420 QX_DS_REWIND=400 $B "$M" golden/data/route16k.tokens 560 2>/dev/null | grep -E '^rewind' | sed -E "$F" | tr '\n' ' ')"
+  gpu_free
+  echo "8. checkpoint at 420 of 600, rewind to 400, 10 tokens, rewind to 300: $(env $C0 QX_DS_CKPT=420 QX_DS_REWIND_VIA=400:10 QX_DS_REWIND=300 $B "$M" golden/data/route16k.tokens 600 2>/dev/null | grep -E '^rewind' | sed -E "$F" | tr '\n' ' ')"
+  gpu_free
+  echo "9. rewind to 400 after a rewind to 500 and 20 tokens, of 600: $(env $C0 QX_DS_REWIND_VIA=500:20 QX_DS_REWIND=400 $B "$M" golden/data/route16k.tokens 600 2>/dev/null | grep -E '^rewind' | sed -E "$F" | tr '\n' ' ')"
 }
 if [ "${DS_CHECKS_PART:-}" = c ]; then part_c; exit 0; fi
 gpu_free

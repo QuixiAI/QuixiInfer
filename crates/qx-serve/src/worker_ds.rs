@@ -554,6 +554,11 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             for r in running.iter_mut() {
                 let Some(mut logits) = r.logits.take() else { continue };
                 let pos = eng.pos(r.slot);
+                if pos == r.job.prompt.len() && pos >= 256 {
+                    // the prompt's end: the rings kept, so the next turn's rewind to here is free however long
+                    // the reply (a client that drops the reasoning from the history shares exactly this prefix)
+                    eng.checkpoint(r.slot);
+                }
                 if let Some(m) = r.matcher.as_mut().filter(|_| !r.in_think) {
                     match m.compute_mask() {
                         Ok(mask) => apply_mask(&mut logits, mask.as_slice()),

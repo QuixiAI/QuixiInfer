@@ -241,10 +241,18 @@ fn main() -> anyhow::Result<()> {
         // to P and re-run positions P..: every row must come back bit for bit (the replay-based rewind, 2026-11-06)
         let rewind_to = std::env::var("QX_DS_REWIND").ok().and_then(|v| v.parse::<usize>().ok());
         let park_to = std::env::var("QX_DS_PARK").ok().and_then(|v| v.parse::<usize>().ok());
+        // QX_DS_CKPT=C: the rings checkpointed at position C of the straight pass (`checkpoint`: what the server does
+        // at a prompt's end). QX_DS_REWIND_VIA=P1:K: before the rewind to P, a rewind to P1 and K tokens from there
+        // (the rings then hold cells of the first pass above P1 + K: a rewind must not trust what lay below them).
+        let ckpt_at = std::env::var("QX_DS_CKPT").ok().and_then(|v| v.parse::<usize>().ok());
+        let via: Option<(usize, usize)> = std::env::var("QX_DS_REWIND_VIA").ok().and_then(|v| { let (a, b) = v.split_once(':')?; Some((a.parse().ok()?, b.parse().ok()?)) });
         let mut kept: Vec<Vec<f32>> = Vec::new();
         anyhow::ensure!(start == 0 || (rewind_to.is_none() && park_to.is_none()), "the rewind and park checks run from position 0");
         for p in start..total {
             save_if_due(&mut eng, p);
+            if ckpt_at == Some(p) {
+                eng.checkpoint(0);
+            }
             // QX_DS_NANCHECK=1: run every forward with activation dumps and name the first NaN activation
             let nancheck = std::env::var("QX_DS_NANCHECK").is_ok_and(|v| v == "1");
             let mut first_nan: Option<String> = None;
@@ -288,7 +296,17 @@ fn main() -> anyhow::Result<()> {
             let Some(pp) = target else { continue };
             assert!(pp < toks.len(), "{what} target inside the prompt");
             let t0 = std::time::Instant::now();
+            let mut how = "";
             if what == "rewind" {
+                if let Some((p1, k)) = via {
+                    eng.rewind(0, p1);
+                    for p in p1..p1 + k {
+                        let _ = eng.forward(toks[p], None);
+                    }
+                }
+                if ckpt_at.is_some() || via.is_some() {
+                    how = if eng.rewind_fast(0, pp) { " (free)" } else { " (replay)" };
+                }
                 eng.rewind(0, pp);
             } else {
                 let parked = eng.park(0);
@@ -318,7 +336,7 @@ fn main() -> anyhow::Result<()> {
                 top1 += (argmax(&kept[p]) == argmax(&logits)) as usize;
             }
             let n_rows = toks.len() - pp;
-            println!("{what} to {pp} then positions {pp}..{}: bit-identical rows: {same} / {} (restore {:.2}s{}; KL mean {:.5} max {:.4}, top-1 {top1}/{n_rows})", toks.len(), toks.len() - pp, t_restore,
+            println!("{what} to {pp}{how} then positions {pp}..{}: bit-identical rows: {same} / {} (restore {:.2}s{}; KL mean {:.5} max {:.4}, top-1 {top1}/{n_rows})", toks.len(), toks.len() - pp, t_restore,
                 first_bad.map(|b| format!(", first differing row {b}")).unwrap_or_default(), kl_sum / n_rows.max(1) as f64, kl_max);
         }
         let last = &per_tok[per_tok.len().saturating_sub(32)..];

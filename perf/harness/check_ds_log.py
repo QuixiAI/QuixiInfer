@@ -27,6 +27,15 @@ def status(text):
                 return "fail"
         if len(re.findall(r"^7\.", text, re.M)) != 2:
             return "fail"
+    # the ring checkpoint and the rewind after a rewind (2026-11-15): judged when there
+    if re.search(r"^[89]\.", text, re.M):
+        for line in (r"8\. checkpoint at 420 of 560, rewind to 400:\s+rewind to 400 \(free\): bit-identical rows: 160 / 160",
+                     r"8\. checkpoint at 420 of 600, rewind to 400, 10 tokens, rewind to 300:\s+rewind to 300 \(free\): bit-identical rows: 300 / 300",
+                     r"9\. rewind to 400 after a rewind to 500 and 20 tokens, of 600:\s+rewind to 400 \(replay\): bit-identical rows: 200 / 200"):
+            if len(re.findall(r"^" + line + r"[ \t]*$", text, re.M)) != 1:
+                return "fail"
+        if len(re.findall(r"^[89]\.", text, re.M)) != 3:
+            return "fail"
     if re.search(r"panic|error", text, re.I):
         return "fail"
     tokenizer = r"^4\. tokenizer vs llama\.cpp:\s+identical: 20 tokens\s+decode round trip: exact[ \t]*$"

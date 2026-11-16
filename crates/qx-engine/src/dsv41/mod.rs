@@ -238,6 +238,28 @@ struct State {
     /// slot copied while inside its prompt, left such a slot: until 2026-11-14 a rewind within the ring's reach
     /// took the rings as they were).
     exact_from: Vec<usize>,
+    /// Per slot: the rings as they stood at the end of its last prompt (`checkpoint`), on the host: (position,
+    /// `exact_from` then, the rings per layer). A reply longer than the rings' reach (DS_TMAX positions) leaves
+    /// the prompt's end outside them, and the next turn of a chat shares exactly that prefix when the client
+    /// drops the reasoning from the history: `rewind` puts these rings back instead of replaying. Dropped as
+    /// soon as the slot's tokens below that position change.
+    ckpt: Vec<Option<RingCkpt>>,
+    /// Per slot: the highest position the rings were written at since they were last whole (a reset or a
+    /// replay). A ring cell holds the last position written with its index, so after a rewind from H the cells
+    /// the slot has not reached again still hold the old sequence's positions up to H, and the positions
+    /// `ring_w` below those are gone: the rings hold [max(pos, ring_hi) - ring_w, pos) only. Until 2026-11-15 a
+    /// rewind tested `pos - p` alone: rewind 600 -> 500, 20 tokens, rewind -> 400 read cells of the old 529..600.
+    ring_hi: Vec<usize>,
+}
+
+/// A slot's rings at the end of a prompt (`DsEngine::checkpoint`).
+#[derive(Clone)]
+struct RingCkpt {
+    pos: usize,
+    exact_from: usize,
+    /// `max(pos, ring_hi)` then: the rings hold [hi - ring_w, pos).
+    hi: usize,
+    rings: Vec<Vec<f32>>,
 }
 
 /// A sequence moved out of its slot (`DsEngine::park`): what `unpark` needs to continue it in any slot.
@@ -1408,7 +1430,7 @@ impl<'a> DsEngine<'a> {
             engram_table: g.tensor("per_layer_token_embd.weight").filter(|t| !t.packed()).map(|t| W::new(g, t)),
             layers,
             s,
-            st: State { rings, ring_tables, stores, sels, tokens: vec![Vec::new(); slots], pos: vec![0; slots], exact_from: vec![0; slots] },
+            st: State { rings, ring_tables, stores, sels, tokens: vec![Vec::new(); slots], pos: vec![0; slots], exact_from: vec![0; slots], ckpt: (0..slots).map(|_| None).collect(), ring_hi: vec![0; slots] },
             chunk,
             erows_stride: DS_TMAX,
             erows_row0: 0,
@@ -1838,6 +1860,8 @@ impl<'a> DsEngine<'a> {
         self.st.pos[slot] = 0;
         self.st.exact_from[slot] = 0;
         self.st.tokens[slot].clear();
+        self.st.ckpt[slot] = None;
+        self.st.ring_hi[slot] = 0;
         self.store_lend(slot);
     }
 
@@ -1889,12 +1913,43 @@ impl<'a> DsEngine<'a> {
         self.st.tokens[dst] = self.st.tokens[src].clone();
         self.st.pos[dst] = self.st.pos[src];
         self.st.exact_from[dst] = self.st.exact_from[src];
+        // (the source's checkpoint is the destination's too: the same tokens, the same rings' history)
+        self.st.ckpt[dst] = self.st.ckpt[src].clone();
+        self.st.ring_hi[dst] = self.st.ring_hi[src];
         self.rewind(dst, upto);
     }
 
     /// Whether `rewind(slot, p)` copies nothing: the ring still holds the window below `p`.
     pub fn rewind_fast(&self, slot: usize, p: usize) -> bool {
-        p <= self.st.pos[slot] && self.st.pos[slot] - p <= self.ring_w - self.cfg.n_swa && p >= self.st.exact_from[slot]
+        p <= self.st.pos[slot] && (self.ring_reaches(slot, p) || self.ckpt_reaches(slot, p))
+    }
+
+    /// Whether slot `slot`'s rings hold the window below `p`, exact at every layer.
+    fn ring_reaches(&self, slot: usize, p: usize) -> bool {
+        // (QX_DS_RING_HI=0: the test as it was until 2026-11-15, to show the defect; never for use)
+        static HI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let hi = if *HI.get_or_init(|| !std::env::var("QX_DS_RING_HI").is_ok_and(|v| v == "0")) { self.st.ring_hi[slot] } else { 0 };
+        self.st.pos[slot].max(hi) - p <= self.ring_w - self.cfg.n_swa && p >= self.st.exact_from[slot]
+    }
+
+    /// Whether slot `slot`'s checkpoint holds the window below `p`, exact at every layer.
+    fn ckpt_reaches(&self, slot: usize, p: usize) -> bool {
+        self.st.ckpt[slot].as_ref().is_some_and(|c| p <= c.pos && c.hi - p <= self.ring_w - self.cfg.n_swa && p >= c.exact_from)
+    }
+
+    /// Keeps slot `slot`'s rings as they stand (the end of a prompt), so that a later `rewind` to within DS_TMAX
+    /// positions below this one is free however far the slot has run since. Host memory, `ring_w * head_dim`
+    /// floats per layer; one checkpoint per slot, the latest. QX_DS_RING_CKPT=0: none.
+    pub fn checkpoint(&mut self, slot: usize) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| !std::env::var("QX_DS_RING_CKPT").is_ok_and(|v| v == "0")) {
+            return;
+        }
+        sched_trace(&format!("S {slot}"));
+        self.gpu.sync();
+        let n_ring = self.ring_w * self.cfg.head_dim;
+        let rings = (0..self.cfg.n_layer).map(|l| self.st.rings[l].download_at::<f32>(slot * n_ring * 4, n_ring)).collect();
+        self.st.ckpt[slot] = Some(RingCkpt { pos: self.st.pos[slot], exact_from: self.st.exact_from[slot], hi: self.st.pos[slot].max(self.st.ring_hi[slot]), rings });
     }
 
     pub fn rewind(&mut self, slot: usize, p: usize) {
@@ -1903,11 +1958,33 @@ impl<'a> DsEngine<'a> {
         let max_ratio = self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
         assert!(p % max_ratio == 0, "rewind to a group boundary");
         let pos = self.st.pos[slot];
-        if pos - p <= self.ring_w - self.cfg.n_swa && p >= self.st.exact_from[slot] {
+        if self.ring_reaches(slot, p) {
             // the ring holds [p - n_swa, p) still, exact at every layer: positions beyond p are overwritten as the
             // slot advances
+            self.st.ring_hi[slot] = pos.max(self.st.ring_hi[slot]);
             self.st.pos[slot] = p;
             self.st.tokens[slot].truncate(p);
+            if self.st.ckpt[slot].as_ref().is_some_and(|c| c.pos > p) {
+                self.st.ckpt[slot] = None;
+            }
+            self.store_lend(slot);
+            return;
+        }
+        if self.ckpt_reaches(slot, p) {
+            // the rings of the last prompt's end, put back: they hold [p - n_swa, p), exact at every layer
+            let c = self.st.ckpt[slot].take().unwrap();
+            self.gpu.sync();
+            let n_ring = self.ring_w * self.cfg.head_dim;
+            for l in 0..self.cfg.n_layer {
+                self.st.rings[l].upload_at(slot * n_ring * 4, &c.rings[l][..n_ring]);
+            }
+            self.st.pos[slot] = p;
+            self.st.tokens[slot].truncate(p);
+            self.st.exact_from[slot] = c.exact_from;
+            self.st.ring_hi[slot] = c.hi;
+            if c.pos == p {
+                self.st.ckpt[slot] = Some(c);
+            }
             self.store_lend(slot);
             return;
         }
@@ -1964,6 +2041,11 @@ impl<'a> DsEngine<'a> {
         }
         self.replaying = false;
         self.st.exact_from[slot] = p;
+        // (every cell the slot can read again was rewritten: a replay shorter than the ring starts at 0)
+        self.st.ring_hi[slot] = 0;
+        if self.st.ckpt[slot].as_ref().is_some_and(|c| c.pos > p) {
+            self.st.ckpt[slot] = None;
+        }
         debug_assert_eq!(self.st.pos[slot], p);
         self.gpu.sync();
     }
@@ -1976,6 +2058,8 @@ impl<'a> DsEngine<'a> {
         let p = self.snapshot(slot);
         self.st.tokens[slot].clear();
         self.st.pos[slot] = 0;
+        self.st.ckpt[slot] = None;
+        self.st.ring_hi[slot] = 0;
         self.store_lend(slot);
         p
     }
@@ -1983,6 +2067,12 @@ impl<'a> DsEngine<'a> {
     /// Slot `slot`'s state as `park` would take it, without emptying the slot: the tokens, the used store rows
     /// and the rings.
     pub fn snapshot(&mut self, slot: usize) -> Parked {
+        if self.st.ring_hi[slot] > self.st.pos[slot] {
+            // rings with cells of a rewound sequence in them: made whole first (a parked state's rings are taken
+            // as holding [pos - ring_w, pos))
+            let pos = self.st.pos[slot];
+            self.replay_to(slot, pos);
+        }
         self.gpu.sync();
         let pos = self.st.pos[slot];
         let row = self.cfg.head_dim + self.cfg.idx_dim;
@@ -2021,6 +2111,8 @@ impl<'a> DsEngine<'a> {
         }
         self.st.tokens[slot] = p.tokens;
         self.st.pos[slot] = pos;
+        self.st.ckpt[slot] = None;
+        self.st.ring_hi[slot] = 0;
         // (a parked state does not say from where its rings are exact: at its own end they are)
         self.st.exact_from[slot] = pos;
         assert!(upto % self.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize == 0, "unpark to a group boundary");
