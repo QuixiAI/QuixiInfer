@@ -2,6 +2,16 @@
 
 
 
+## Resume 2026-11-16, later: short chunks on the grouped kernels LANDED (under 256 rows -12 to -15%); baseline still 18.475
+- **Landed** (2a912f0; binaries `~/qx-bins/chunk156`, in `target/release`): in a chunk under 256 rows an expert with
+  at most 64 rows runs the grouped CUDA-core kernels (`QX_DS_CHUNK_GRP_MAX`, 0 = as before). 192 rows 1,920 ->
+  1,650 ms; a chat turn's 190-token message 2.12 -> 1.72 s. Bit-identical in every test.
+- Measured: the copy engine alone does 51 GB/s (PCIe Gen5 x16 under load); a 1,024-row chunk keeps it 94% busy
+  (100 GB) with 18 GB from NVMe beside it; the pool does not help windows or chunks. The predicted prefetch under
+  256 rows: rejected as a default (-3 to -5% warm, nothing fresh).
+- Closed by decision: decode after a reused prompt (+3-5%), deep prefix reuse in one chunk. Queue: the backlog's
+  "2026-11-16, later" (nothing open above the bar; an oracle bound for the tier policy is the unmeasured idea).
+
 ## Resume 2026-11-16: ring checkpoint LANDED (a chat turn after a reply of 128+ tokens reuses its history); baseline still 18.475
 - **Landed** (binaries `~/qx-bins/chunk153`, in `target/release`): the server keeps a slot's rings at each prompt's
   end (`DsEngine::checkpoint`, host memory, `QX_DS_RING_CKPT=0` off); a rewind to within 128 positions below it is

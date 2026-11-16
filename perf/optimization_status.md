@@ -5201,3 +5201,32 @@ two-slot chunks under 256 rows on the grouped kernels ("2 of several slots"); it
 to the other three servers' single-slot ones and to X103's tensor-core two-slot arm.
 
 Raw: `perf/results/2026-11-16/x-chunk-grp/` (X104-X106).
+
+## 2026-11-16: A 1,024-row chunk is at the copy link and the disk (measurement only); the queue's items 2-4 closed by decision
+
+nsys over a warmed 1,024-row chunk (X107, chunk156; 2,436 ms; the window from its first large host-to-device copy
+to its last, 2,384 ms): 9,811 copies, 100.2 GB, the copy engine busy 2,238 ms (94% of the window, 44.8 GB/s; the
+engine alone does 51); kernels busy 1,528 ms on 9 streams (expert kernels 918 ms in union, 4,200 ms summed: the
+side streams overlap them); the card idle 18 ms. The lane: 7,808 records staged from RAM and 1,935 from NVMe
+(1,582 ms waiting for NVMe reads: 18 GB at the disk's ~12 GB/s), 2,091 of 10,240 prefetch picks skipped; 10,142
+experts used (253 a layer of 344).
+
+So the three regimes are:
+- **under 256 rows**: was the expert kernels (fixed cost an expert), now the copies (grouped kernels, landed today);
+- **256 rows and up**: the copies at 94% duty and the disk beside them: the time is the bytes of the used experts
+  outside VRAM (93 GB of ~96 GB used at 1,024 rows; the VRAM tier holds 13% of the records and a chunk takes its
+  flex tail) over ~45 GB/s. The pool adds nothing (DMA 51 alone, 28 + 29 with the pool: one memory bus);
+- **decode**: the same bus per token (findings).
+
+Closed by decision (the queue of 2026-11-16):
+- **Decode after a reused prompt** (+3 to +5% over 400 tokens against the same prompt afresh; +2,000 RAM
+  evaluations): a fresh chunk resets the scores to the prompt's counts (its tick decays 2,700 tokens' worth at a
+  half-life of 256) and promotes up to 512 at once. Re-applying a prompt's counts on reuse would buy at most ~0.5 s
+  per 400-token reply against the 1.6-3.3 s the reuse saves, and costs copies of the same order. Under the bar.
+- **Deep prefix reuse in one chunk** (the experts staged once, ~2 s): since the ring checkpoint a deep rewind
+  happens only when history is edited 128+ tokens before a prompt's end, and is reused only from 8,192 tokens. A
+  per-row replay flag through the chunk path (store writes, the per-layer trim, KV-only rows) for that path fails
+  the complexity bar.
+- **Three clients, decode at depth**: the profile of 2026-11-16 (X93) and the knob sweeps of 2026-11-15 stand.
+
+Raw: `perf/results/2026-11-16/x-nsys-chunk1024/`.

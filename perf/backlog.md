@@ -9,6 +9,15 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-16, later (grouped kernels landed; every path measured at a hardware limit)
+1. Nothing open above the bar. Prompts are the bytes of the used experts outside VRAM over ~45 GB/s of copies (and
+   the disk's 12 GB/s for the NVMe quarter); decode is the same memory bus per token; notebook 2026-11-16.
+2. What would move them: a higher VRAM hit rate (60.6% of selections with 13% of the records: an oracle bound for
+   the tier policy on a recorded trace is unmeasured), fewer or smaller records (not without the exactness
+   contract), hardware (four DIMMs, more VRAM, a second NVMe).
+3. Small: the code comment "~130 us an expert" at `QX_DS_CHUNK_GRP_MAX` should read ~200; `qx-membw`'s copy-alone
+   loop (session only) is worth landing; `qx-ds-check` warm-up context guard; structured-output leftovers.
+
 ### Queue as of 2026-11-16 (ring checkpoint landed: a chat turn reuses its history after a long reply)
 1. **The short stretch**: grouped kernels LANDED (190 rows 2.12 -> 1.72 s); the predicted prefetch under 256 rows
    REJECTED as a default (X104-X106: -3 to -5% warm, nothing fresh). What is left is the copies (57 GB at 47 GB/s
