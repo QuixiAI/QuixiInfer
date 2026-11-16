@@ -5180,3 +5180,24 @@ Raw: `perf/results/2026-11-16/x-chunk-grp/`, `setd-promo44-085725`.
 Gate 18.475 -> 18.508 (+0.2%), no scored case harmed; the 3% bar met on the target (a secondary metric) by a wide
 margin; ten text corrections, applied (the code comment's "~130 us an expert" is ~204 us by the profile: to fix
 with the next change to that block). Follow-up: a several-slot short chunk at the default knob.
+
+## 2026-11-16: The predicted prefetch under 256 rows, re-measured on the grouped kernels — REJECTED as a default (under the bar: -3 to -5% warm, nothing on a fresh server, +2 to +4% NVMe reads)
+
+`QX_DS_CHUNK_PREFETCH_MIN=64` against the default 256 on chunk156 (it lost on 2026-11-13, when a short chunk was
+bound by its expert kernels; one run a cell unless said):
+
+| case | default | prefetch from 64 rows |
+|---|--:|--:|
+| check tool, warmed (X104): 192 / 136 / 64 rows | 1,652 / 1,387 / 969 ms | 1,554 / 1,299 / 932 (-6 / -6 / -4%); NVMe records 695 -> 831, 568 -> 676, 387 -> 436 |
+| server after a three-turn chat (X105): the 190-row turn; four prompts of 87-101 tokens | 1,717; 1,260 / 1,228 / 1,186 / 1,119 | 1,667 (-2.9%); 1,190 / 1,165 / 1,152 / 1,099 (-1.8 to -5.6%); NVMe 10,208 -> 10,426 |
+| fresh server, its first four prompts of 87-101 tokens (X106, two servers an arm; the first default server put them in two two-slot chunks, no single-slot times) | 1,373 / 1,289 / 1,162 / 1,194 (mean 1,255) | 1,313 / 1,242 / 1,203 / 1,221 and 1,270 / 1,277 / 1,246 / 1,181 (mean 1,244, -0.9%); NVMe 5,293 -> 5,472-5,511 |
+
+Replies byte-identical in every pair (X105: four short replies and the chat's three; X106: the four replies in all
+four servers). Under the 3% bar where it counts (the server), with more disk reads: the default stays 256, the
+knob stays.
+
+Covered on the way (the gap left by the grouped-kernels entry): X106's first default server ran the two pairs as
+two-slot chunks under 256 rows on the grouped kernels ("2 of several slots"); its four replies are byte-identical
+to the other three servers' single-slot ones and to X103's tensor-core two-slot arm.
+
+Raw: `perf/results/2026-11-16/x-chunk-grp/` (X104-X106).
