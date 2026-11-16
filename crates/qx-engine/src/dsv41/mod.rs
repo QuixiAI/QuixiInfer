@@ -3017,6 +3017,15 @@ impl<'a> DsEngine<'a> {
             // (not with a staging ring too small to hold several groups of N, nor for a chunk of a few rows: the
             // driver frees a ring slot on the mark, which now comes once per N experts)
             let ns = if mma && qx_gpu::raw::RAW.load(std::sync::atomic::Ordering::Relaxed) && n_ring >= 8 * chunk_streams() && n_act >= 256 { chunk_streams() } else { 1 };
+            // QX_DS_CHUNK_GRP_MAX=N (default 64; 0: never): in a chunk whose experts run one after another (under 256
+            // rows: no side streams) an expert with at most N rows runs the grouped CUDA-core kernels (a weight block
+            // decoded once per warp for up to 8 rows), one with more the tensor-core ones (64 rows a pass, a fixed
+            // ~130 us an expert whatever its rows). The same bits either way. A short chunk's experts have a handful
+            // of rows each: 192 rows 1,920 -> 1,652 ms, 64 rows 1,097 -> 963 (2026-11-16; any N from 8 to 64 the
+            // same). Not on the side streams: there the grouped kernels cost 1,024 rows +1 to +6%.
+            static GRP_MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let grp_max = *GRP_MAX.get_or_init(|| std::env::var("QX_DS_CHUNK_GRP_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(64));
+            let (kg_grp, kd_grp) = (static_name(format!("qx_moe_gateup_grp_{gsuf}")), static_name(format!("qx_moe_down_grp_{dsuf}")));
             let side: Vec<[u64; 3]> = if ns > 1 { self.chunk_side[..ns].iter().map(|b| [b[0].ptr, b[1].ptr, b[2].ptr]).collect() } else { Vec::new() };
             if ns > 1 {
                 qx_gpu::raw::side_begin(ns);
@@ -3074,7 +3083,12 @@ impl<'a> DsEngine<'a> {
                     let word = cb.slots_tbl[l % 2].ptr + 8 * e as u64;
                     let sl = cb.sel.ptr + (offs[e] * 4) as u64;
                     self.gpu.run(MOE.kernel("qx_moe_wait_word", CubeDim::new_1d(1)), (1, 1, 1), &[word, generation]);
-                    if mma {
+                    if mma && m <= grp_max {
+                        let groups = m.div_ceil(8);
+                        self.gpu.run(MOE.kernel(kg_grp, CubeDim::new_1d(256)), (((2 * ff) as u32).div_ceil(8), groups, 1), &[word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, m as u64, sl]);
+                        self.gpu.run(MOE.kernel("qx_moe_quant_h_sel", CubeDim::new_1d(256)), (m, 1, 1), &[cb.gu.ptr, bits(clamp_exp[l]), cb.hq.ptr, cb.hd.ptr, ff as u64, sl, m as u64]);
+                        self.gpu.run(MOE.kernel(kd_grp, CubeDim::new_1d(256)), ((E as u32).div_ceil(8), groups, 1), &[word, cb.hq.ptr, cb.hd.ptr, 0, cb.out.ptr, ff as u64, E as u64, (2 * gb) as u64, ex.down_row_bytes as u64, sl, m as u64]);
+                    } else if mma {
                         let passes = m.div_ceil(64);
                         self.gpu.run(MOE.kernel(kg, CubeDim::new_1d(128)), (((2 * ff) as u32).div_ceil(64), passes, 1), &[word, cb.xq.ptr, cb.xd.ptr, k as u64, cb.gu.ptr, ff as u64, E as u64, ex.gate_row_bytes as u64, m as u64, sl]);
                         self.gpu.run(MOE.kernel("qx_moe_quant_h_sel", CubeDim::new_1d(256)), (m, 1, 1), &[cb.gu.ptr, bits(clamp_exp[l]), cb.hq.ptr, cb.hd.ptr, ff as u64, sl, m as u64]);
