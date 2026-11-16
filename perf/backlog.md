@@ -17,6 +17,8 @@ invented one. The aggregate score lives in `scoreboard.md`.
 3. Checkpoint gaps: no row-level check after a chunk / window or of a cross-slot copy with a checkpoint; one
    checkpoint per slot (a second, older turn edited is still afresh or a replay); a parked state carries none.
 4. Three clients, deep prefix reuse (one chunk for replay and stretch), decode at depth: as in the queue below.
+5. decode256k per kernel (X93): waits 38%, `qx_mgemv` 20% (527 launches, ~1.1 TB/s of dense f32 weights), `qx_ds_idx_score2`
+   5.8% (283 us x 8), top-k 3%. Candidates, each under ~4%: the scorer's compute, the dense GEMVs' bandwidth use.
 
 ### Queue as of 2026-11-15, evening (hygiene landed: nothing open but new ideas)
 0. **The Strata head-to-head is done** (notebook 2026-11-15): prefill 1.6-3.4x faster, decode ~1.5x; the goal's two

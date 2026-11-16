@@ -5059,3 +5059,28 @@ two more `serve256k` sessions on chunk153 (X58 j: `QX_DS_RING_CKPT=1` 35.51 / 80
 "identical") and the structured-output requests (X78 c153: all eight as on chunk148, 0 panics). The win is on the
 secondary metric (a chat turn's prompt time); set D shows no harm. Also measured (X91): the card's PCIe link is
 Gen5 x16 throughout a 13k-token prompt and reply (it idles at Gen1).
+
+## 2026-11-16: decode256k per kernel (measurement only): 38% waiting for host-served experts, 20% dense GEMVs at ~1.1 TB/s, 14% position cost
+
+`nsys profile -t cuda` of the gate's decode256k command on chunk153 (X93; 39.2 ms per token under the profiler,
+38.9 without). The graph replays hide their kernels: the kernel sums cover the two uncaptured steps (80 launches
+of the per-layer kernels), 68.6 ms in all, so per step:
+
+| kernel | ms per step | launches | note |
+|---|--:|--:|---|
+| `qx_moe_wait_staged` + `qx_moe_wait` | 9.7 + 5.0 | 40 + 40 | the card waiting for experts outside VRAM (2026-11-07: 17.0 + 10.8) |
+| `qx_mgemv` | 6.9 | 527 (13.0 us each) | the dense f32 GEMVs: ~7.25 GiB read per token, ~1.1 TB/s |
+| `qx_ds_idx_score2` | 2.25 | 8 (283 us) | position cost |
+| `qx_ds_attn_part` + `attn_merge` | 1.5 + 0.5 | 40 + 40 | position cost in part |
+| `qx_rms_groups` | 1.25 | 241 | |
+| `qx_ds_topk2` | 1.15 | 9 (127 us) | position cost (2.5 ms before the tiled kernel) |
+| `qx_ds_copy_f32` | 0.7 | 98 | |
+| expert kernels (gate-up, down, post, combine) | ~2.5 | | |
+| the rest | ~3 | | |
+
+The position cost is ~5 ms of the 8 ms between decode256k (38.9) and decode (31.0); the rest is the tier (15.4
+against 17.1 GiB, and 32 tokens of adaptation after the state's load against 1,000). No single kernel holds 3% of
+the step except the waits (host-bound: findings, the DRAM's read bandwidth), `qx_mgemv` (20%, already within
+~1.6x of the card's nominal memory bandwidth; exact f32 by contract) and `qx_ds_idx_score2` (5.8%).
+
+Raw: `perf/results/2026-11-16/x-nsys-dec256k/`.
