@@ -9,6 +9,15 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-16 (ring checkpoint landed: a chat turn reuses its history after a long reply)
+1. **The short stretch**: what is left of a chat turn is the new message: 190 rows 2.1 s as a chunk, 14 tokens
+   0.4 s in a window (64-255 tokens ~1.8 s whatever the length).
+2. **Decode after a reused prompt** is 3-5% slower over 400 tokens than after the same prompt afresh (the chunk
+   leaves the conversation's experts in VRAM, a reuse does not): keep or prefetch a slot's experts across turns.
+3. Checkpoint gaps: no row-level check after a chunk / window or of a cross-slot copy with a checkpoint; one
+   checkpoint per slot (a second, older turn edited is still afresh or a replay); a parked state carries none.
+4. Three clients, deep prefix reuse (one chunk for replay and stretch), decode at depth: as in the queue below.
+
 ### Queue as of 2026-11-15, evening (hygiene landed: nothing open but new ideas)
 0. **The Strata head-to-head is done** (notebook 2026-11-15): prefill 1.6-3.4x faster, decode ~1.5x; the goal's two
    lines are met, the rest is our own ceiling. `qx-ds-check` with `QX_DS_WARM=1` needs a context of 512 at least

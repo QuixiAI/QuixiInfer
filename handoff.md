@@ -1,6 +1,18 @@
-# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-15)
+# Handoff: DeepSeek-V4.1-Flash in QuixiInfer (updated 2026-11-16)
 
 
+
+## Resume 2026-11-16: ring checkpoint LANDED (a chat turn after a reply of 128+ tokens reuses its history); baseline still 18.475
+- **Landed** (binaries `~/qx-bins/chunk153`, in `target/release`): the server keeps a slot's rings at each prompt's
+  end (`DsEngine::checkpoint`, host memory, `QX_DS_RING_CKPT=0` off); a rewind to within 128 positions below it is
+  free however long the reply. A client that drops the reasoning from the history got 0 tokens reused per turn
+  (3.7 s at 2.7k tokens); now 0.4 s plus the new message's stretch. Cross-slot copies carry the checkpoint.
+- **A real exactness bug fixed on the way** (on HEAD since 2026-11-06): a rewind after a rewind trusted ring cells
+  the first pass had overwritten (0 / 200 rows identical in X87). `ring_hi` per slot is in the test now.
+- ds-checks part c has lines 8 and 9 for both; run the checks as parts a, b, c and judge the concatenation with
+  duplicate lines removed. Set D 18.395 on chunk153 (no checkpoint is taken in the gate: prompts of 42-46 tokens).
+- The card's PCIe link is Gen5 x16 under load (Gen1 at idle).
+- Next: the backlog's queue of 2026-11-16.
 
 ## Resume 2026-11-15: set D 18.475 PROMOTED (tail residents give up their RAM copies: serve256k3 83.9 -> 80.1-81.6)
 - **Promoted** `perf/results/2026-11-15/setd-promo39-002914` + `x-tail-dedup` (code ff2326d, binaries

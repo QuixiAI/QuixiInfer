@@ -4959,3 +4959,103 @@ the bytes of the experts outside VRAM, not by a setting. A short chunk shows the
 experts per layer (1,097 ms), 192 rows 150 (1,921 ms): about 1 GB of records per layer whatever the row count.
 
 Raw: `perf/results/2026-11-15/x58-h-*`, `x58-i-*`.
+
+## 2026-11-16: The rings checkpointed at a prompt's end — LANDED, default on, not a promotion (a chat turn after a reply of 128+ tokens reuses its history: 2.7k tokens 3.7 -> 0.4-2.1 s of prompt time; a rewind after a rewind read stale ring cells, fixed)
+
+Presupposition attacked (61): "a chat's next turn reuses its history". It did only when the client sent the reply
+back whole. A client that drops the reasoning from the history (the usual one) shares the previous prompt and
+nothing after it; the slot stands at the reply's end, and once the reply is longer than the rings' reach (DS_TMAX =
+128 positions) the rewind to the prompt's end is a deep one: under 8,192 tokens the scheduler takes the prompt
+afresh (and an empty slot), above it a 4.4 s replay.
+
+Measured on HEAD (chunk150, X83 head; three slots at 256k; a three-turn chat over a 2.5k-token text, 400 tokens
+per reply at most, the history resent without the reasoning; one run):
+
+| turn | thinking on: prompt tokens (reused), prompt s | thinking off |
+|---|---|---|
+| 1 | 2,500 (0), 4.07 | 1,870 (0), 3.08 |
+| 2 | 2,688 (0), 3.68 | 2,022 (2,004), 0.47 |
+| 3 | 2,700 (0), 3.74 | 2,234 (2,220), 0.38 |
+
+Change (`ckpt2.diff`, sha256 79b38d5a8a1c, on 7c70dfb; binaries `~/qx-bins/chunk153`: qx-ds-check 94a7df6a62e1,
+quixiinfer df915b573d5b; chunk152 = the first form, `ckpt1.diff`, before the breaker's two points):
+1. `DsEngine::checkpoint(slot)`: the slot's rings (per layer `ring_w * head_dim` floats) downloaded to the host with
+   the position and `exact_from`; one per slot, the latest. The server calls it when a prompt of 256+ tokens ends
+   (the first sampled token). `QX_DS_RING_CKPT=0`: none. Trace op `S slot` (`qx-ds-replay` replays it).
+2. `rewind(slot, p)`: when the rings no longer reach `p` and the checkpoint does (`p` at most 128 positions below
+   what the checkpointed rings were written up to, and at or above its `exact_from`), the rings are uploaded and
+   the slot is at `p`: no replay. `rewind_fast` says so, which is what the scheduler's value rule asks.
+3. The checkpoint is dropped whenever the slot's tokens below its position change (reset, a rewind below it, a
+   replay below it, park, unpark); `copy_prefix` hands the source's checkpoint to the destination (the same tokens),
+   so a cross-slot copy of a prefix the scheduler valued through the source's checkpoint is free too.
+4. **A defect of the old rewind, fixed** (breaker, by reading; shown by X87): a ring cell holds the last position
+   written with its index, so after a rewind from H the cells the slot has not reached again hold the old
+   sequence's positions up to H and the positions `ring_w` below them are gone. `rewind` tested `pos - p <= 128`
+   alone. `ring_hi` per slot (the highest position written since the rings were last whole) is now in the test
+   (`max(pos, ring_hi) - p <= 128`), in the checkpoint, and `snapshot` replays first when the rings have such
+   cells. `QX_DS_RING_HI=0` is the old test, kept only to show the defect.
+5. `qx-ds-check`: `QX_DS_CKPT=C` (a checkpoint at position C of the straight pass), `QX_DS_REWIND_VIA=P1:K` (a
+   rewind to P1 and K tokens before the rewind under test), "(free)" / "(replay)" in the line when either is set.
+   `tools/ds-checks.sh` part c: lines 8 (two) and 9; `check_ds_log.py` judges them when present.
+
+The defect, shown (X87, chunk153 with `QX_DS_RING_HI=0`, exact kernels): 600 single steps, rewind to 500, 20
+tokens, rewind to 400 (taken as free): **0 / 200 rows bit-identical**, KL mean 0.124, max 2.04, top-1 176 / 200.
+With the fix the same case replays: 200 / 200 (line 9). In the server it needed a prompt that shares up to 128
+positions less than the slot holds, ends below the slot's old end, and a third prompt sharing less again while the
+slot is still below that end (an edited last message, twice): rare, silent, and on HEAD since the ring rewind
+(2026-11-06). The checkpoint's first form would have frozen such rings and served them however long the reply.
+
+Exactness (exact kernels, `QX_DS_PREFILL_EXACT=1`):
+
+| test | result |
+|---|---|
+| ds-checks parts a, b, c on chunk153 (`ds-checks-chunk153.log`) | pass; lines 1-7 the same text as chunk150's (X79) |
+| line 8: checkpoint at 420 of 560, rewind to 400 | free, 160 / 160 rows bit-identical |
+| line 8: checkpoint at 420 of 600, rewind to 400 (the checkpoint), 10 tokens, rewind to 300 (the rings, `ring_hi` 420) | free, 300 / 300 |
+| line 9: rewind to 400 after a rewind to 500 and 20 tokens, of 600 | replay, 200 / 200 |
+| X83 ckx against frx (chunk152; `QX_DS_PREFIX=0` = every prompt afresh): the three-turn chat, thinking on and off | six replies byte-identical (1,746 / 1,690 / 560 and 651 / 692 / 259 bytes); only the thinking-on turns 2 and 3 restore from a checkpoint (2 positions below it, `exact_from` 0), the thinking-off turns are ring rewinds as on HEAD; on chunk152, not the final binary |
+| X88 ck against fr (chunk153): a 5.2k-token turn (a chunk with KV-only rows: `exact_from` > 0), the same text with another question (the restore 60 positions below the checkpoint), two more turns (the third after a prompt that ended in a window), a second client decoding 700 tokens beside (it ended during turn 4's reply, after every restore) | four replies and the side reply byte-identical (976 / 914 / 825 / 927 / 3,589 bytes); prompt seconds 11.44, 0.50, 0.37, 0.92 against 11.4 each |
+| X89 (chunk153): the same 2.5k prompt again 12 s and 18 s after the first (the source ~93 and ~259 tokens into its reply: the first is inside the rings' reach, the second is copied with the source's checkpoint) | 2,498 reused in 0.11 / 0.09 s (7.44 s with `QX_DS_PREFIX_COPY=0`); both replies equal each other and the no-copy arm's (1,746 bytes) |
+
+The server tests compare temperature-0 texts, not rows (200-700 tokens each); the rows are the check tool's lines.
+Not run: a trace replayed with `QX_DS_RING_CKPT=0`; a checkpoint taken after a deep replay (8,192+ shared); a
+row-level check of a checkpoint taken after a chunk or a window, and of `copy_prefix` with a checkpoint (texts
+only); `snapshot`'s replay branch (not reachable from the server); a restore at exactly the checkpoint's position;
+a KL figure for default mode (the claim rests on the exact-mode equivalence).
+
+Timing, default mode (X83, one run each; chunk150 against chunk153; turn 1 is 4.07 s in both):
+
+| turn (thinking on) | chunk150 prompt s | chunk153 prompt s | client s |
+|---|--:|--:|--:|
+| 2: 2,688 tokens, 2,498 reused | 3.68 | 2.12 (a 190-row chunk) | 16.97 -> 15.81 |
+| 3: 2,700 tokens, 2,686 reused | 3.74 | 0.41 (14 tokens in a window) | 10.76 -> 5.81 (the reply is 153 tokens against 208: other numerics, as any reuse in default mode) |
+
+What is left of turn 2 is the short chunk's floor (backlog: 64-255 tokens ~1.8 s). The reply after a reused prompt
+decoded 0.4-0.6 s slower over 400 tokens in three pairs (13.69 and 13.90 against 13.28 s; exact mode 13.66 against
+13.28: 3-5%): a fresh chunk leaves the conversation's experts in VRAM, a reuse does not (turn 2's reply has +2,002
+RAM evaluations and +439 ms of pool time on chunk153 against chunk150, +2,366 and +299 ms in ckx against frx). The
+checkpoint itself (a sync and 40 downloads) has no timing print; the breaker read 3.4-8.4 ms from the gap before
+the first post-prompt step in `x83-ck.server.log` against 0.1 ms on HEAD.
+
+Gate: set D `setd-promo43-000649` (chunk153, the diff in the tree) 18.395 against 18.475 (-0.4%): decode256k 38.9 /
+38.9, prefill256k 2.0, serve256k1 35.68, serve256k3 80.00, decode 31.0, prefill128 10.5; identity serve256k-1
+identical. Preflight 00:06:49: VM shut off, 3,445 MiB used, pressure avg10 0.00, no build tools. `perf_diff.py
+gate` flags serve256k1 (+8.2% against the baseline's 32.98): the case wanders run to run (the eight default-settings sessions
+since the dedup default: 32.98-37.66, the baseline's the lowest). `run.json` records correctness as skipped: the
+pass is `check_ds_log.py` on the three part logs of 94a7df6a62e1. The gate's prompts are 42-46 tokens: it takes no checkpoint and restores none, so it
+shows no harm, not the gain. A first gate on chunk152 was stopped when the breaker's report came.
+
+Breaker (fresh context): the `ring_hi` hole (point 4) and the cross-slot valuation (point 3: a running slot's
+prefix was valued as free through a checkpoint `copy_prefix` could not use, which would have stalled every decoder
+for a replay) found by reading; its tests are lines 8-9, X87, X88 and X89. Checked and found sound: every writer
+that lowers a position drops the checkpoint; the server never parks; `upload_at` is synchronous; lent store tails
+lie above any live checkpoint.
+
+Raw: `perf/results/2026-11-16/x-ring-ckpt/`, `setd-promo43-000649`.
+
+### Adjudication (fresh context, 2026-11-16): HOLD, then LANDED, default on, not a promotion
+The hold: one identity session on chunk153, the tree uncommitted, nine text corrections (applied above). Lifted by
+two more `serve256k` sessions on chunk153 (X58 j: `QX_DS_RING_CKPT=1` 35.51 / 80.91, `=0` 34.75 / 81.04, both
+"identical") and the structured-output requests (X78 c153: all eight as on chunk148, 0 panics). The win is on the
+secondary metric (a chat turn's prompt time); set D shows no harm. Also measured (X91): the card's PCIe link is
+Gen5 x16 throughout a 13k-token prompt and reply (it idles at Gen1).
