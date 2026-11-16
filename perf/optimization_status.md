@@ -4935,3 +4935,27 @@ sizes the context to the prompt, 256 here, and the warm-up's windows run to posi
 runs. A tool guard, not a server path (the server's context is 8,192 at least): backlog.
 
 Raw: `perf/results/2026-11-15/x-strata-h2h/`.
+
+## 2026-11-15: Three-client decode, the two knob levers re-swept (measurement only): both flat, the defaults stand
+
+After the tier grew from 12.3 to 16.4 GiB and the tail residents' duplicates went, the two settings tuned on the
+old tier were swept again on chunk150 (`bench.sh --cases serve256k`, one session each, VM off, identity
+"identical" in all six):
+
+| setting | serve256k1 | serve256k3 | staged / pool selections |
+|---|--:|--:|--:|
+| default (`QX_DS_STAGE_SHARE_NARROW=4`, `QX_DS_PROMOS=32`; X58 e, f, g) | 34.6, 33.0, 34.7, 35.7 | 81.2, 81.2, 80.7, 80.3 | 261k / 184k |
+| narrow share 2 | 34.5 | 86.1 | 184k / 264k |
+| narrow share 3 | 35.5 | 82.3 | 224k / 225k |
+| narrow share 5 | 35.6 | 81.6 | 301k / 146k |
+| promotions 16 per token | 37.0 | 80.1 | 264k / 188k |
+| promotions 64 | 33.0 | 80.3 | 251k / 194k |
+| promotions 96 | 34.6 | 80.6 | 261k / 184k |
+
+VRAM hits are 60.6-60.8% of the selections in every arm (39% miss with 11% of the records resident); the split of
+the misses has its optimum where it was, and the promotion budget does not move the hit rate. With the findings'
+ceilings (the pool at the DRAM's read bandwidth, a short prompt at the disk's) the three-client step is bound by
+the bytes of the experts outside VRAM, not by a setting. A short chunk shows the same: 64 rows touch 99 distinct
+experts per layer (1,097 ms), 192 rows 150 (1,921 ms): about 1 GB of records per layer whatever the row count.
+
+Raw: `perf/results/2026-11-15/x58-h-*`, `x58-i-*`.
