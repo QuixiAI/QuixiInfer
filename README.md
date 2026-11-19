@@ -261,6 +261,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
 | `QX_DS_VRAM`, `QX_DS_RAM` | The tiers in GiB (`--vram-gib` 21, `--ram-gib` 100; the VRAM figure is a cap, the context and slots come first). |
 | `QX_DS_PROMOS` | Expert promotions into VRAM per token (4; the benchmarked configuration uses 32). |
 | `QX_DS_TOPK_KERNEL=1`, `QX_DS_IDX_KERNEL=1`, `QX_MGEMV_ZGROUPS=0` | The previous indexer top-k, scorer and dense-GEMV kernels, for A/B runs. |
+| `QX_CPU_ISA` | Kernel set for the CPU expert pool: `scalar`, `avx2` or `avx512`; a set the CPU does not support falls back to the detected one, for A/B runs and bisecting a wrong answer. |
 
 ## How it works
 

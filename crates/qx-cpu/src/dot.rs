@@ -319,11 +319,39 @@ fn detect() -> Isa {
 }
 
 /// The kernel set this CPU runs: detected on first use and cached, so a call is an atomic load and a branch.
+///
+/// `QX_CPU_ISA` (`scalar`, `avx2` or `avx512`) overrides the detected set for A/B runs and for bisecting a wrong
+/// answer on a user's machine. It is read here, once, so every later call sees the same set. A set the CPU cannot
+/// run is refused, not tried: one line on stderr names the set that runs instead.
 pub fn isa() -> Isa {
     #[cfg(target_arch = "x86_64")]
     {
         static ISA: OnceLock<Isa> = OnceLock::new();
-        *ISA.get_or_init(detect)
+        *ISA.get_or_init(|| {
+            let detected = detect();
+            let want = match std::env::var("QX_CPU_ISA").ok().as_deref() {
+                None => return detected,
+                Some("scalar") => Isa::Scalar,
+                Some("avx2") => Isa::Avx2,
+                Some("avx512") => Isa::Avx512,
+                Some(other) => {
+                    eprintln!("QX_CPU_ISA={other} is not scalar, avx2 or avx512; running {detected:?}");
+                    return detected;
+                }
+            };
+            let supported = match want {
+                Isa::Scalar => true,
+                Isa::Avx2 => detected != Isa::Scalar,
+                Isa::Avx512 => detected == Isa::Avx512,
+            };
+            if supported {
+                eprintln!("QX_CPU_ISA: running {want:?}");
+                want
+            } else {
+                eprintln!("QX_CPU_ISA asks for {want:?}, which this CPU lacks; running {detected:?}");
+                detected
+            }
+        })
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -367,7 +395,7 @@ fn scalar_kernels() -> Kernels {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn kernels_for(isa: Isa) -> Kernels {
+pub(crate) fn kernels_for(isa: Isa) -> Kernels {
     match isa {
         Isa::Avx512 => avx512::kernels(),
         Isa::Avx2 => avx2::kernels(),
@@ -376,7 +404,7 @@ fn kernels_for(isa: Isa) -> Kernels {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn kernels_for(_isa: Isa) -> Kernels {
+pub(crate) fn kernels_for(_isa: Isa) -> Kernels {
     scalar_kernels()
 }
 
@@ -1203,7 +1231,19 @@ mod tests {
         (a - b).abs() <= 1e-5 * a.abs().max(b.abs()).max(1e-3)
     }
 
-    /// Tests that call AVX-512 kernels return early here on a CPU without the features instead of dying of SIGILL.
+    /// Whether the CPU itself has the AVX-512 features the kernels need, regardless of `QX_CPU_ISA`.
+    fn cpu_has_avx512() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx512vbmi")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    /// Whether the selected kernel set is AVX-512.
     fn have_avx512() -> bool {
         isa() == Isa::Avx512
     }
@@ -1220,8 +1260,12 @@ mod tests {
     }
 
     fn skip_avx512(name: &str) -> bool {
-        if !have_avx512() {
+        if !cpu_has_avx512() {
             eprintln!("skipping {name}: no AVX-512 F/BW/VNNI/VL/VBMI");
+            return true;
+        }
+        if !have_avx512() {
+            eprintln!("skipping {name}: QX_CPU_ISA selects {:?}, not Avx512", isa());
             return true;
         }
         false
@@ -1345,6 +1389,64 @@ mod tests {
                 let d = half::f16::from_f32(((rng(seed) % 1000) as f32 + 1.0) * 1e-4);
                 b[o..o + 2].copy_from_slice(&d.to_le_bytes());
             }
+        }
+        v
+    }
+
+    /// An edge row: every byte `fill`; the block's f16 scale `d` (Q2_K's `dmin` at 82 too); every scale field
+    /// overwritten with `scale`. A fill of 0xff puts every grid index, sign bit and qh bit at its maximum. The
+    /// scale fields are those the scalar reader of each format consumes; NVFP4's four UE4M3 bytes are `scale`.
+    fn edge_row(name: &str, bb: usize, fill: u8, scale: u8, d: f32, dmin: f32) -> Vec<u8> {
+        fn set_f16(v: &mut [u8], o: usize, x: f32) {
+            v[o..o + 2].copy_from_slice(&half::f16::from_f32(x).to_le_bytes());
+        }
+        let mut v = vec![fill; bb];
+        match name {
+            "iq2s" => {
+                set_f16(&mut v, 0, d);
+                v[74..82].fill(scale);
+            }
+            "iq3s" => {
+                set_f16(&mut v, 0, d);
+                v[106..110].fill(scale);
+            }
+            "iq2xs" => {
+                set_f16(&mut v, 0, d);
+                v[66..74].fill(scale);
+            }
+            // the 4-bit scale is the top nibble of the second u32 of each 8-element pair
+            "iq2xxs" => {
+                set_f16(&mut v, 0, d);
+                for i in 0..8 {
+                    v[9 + 8 * i] = (scale << 4) | (v[9 + 8 * i] & 0x0f);
+                }
+            }
+            "iq3xxs" => {
+                set_f16(&mut v, 0, d);
+                for i in 0..8 {
+                    v[69 + 4 * i] = (scale << 4) | (v[69 + 4 * i] & 0x0f);
+                }
+            }
+            // three scale bits at 12 of each qh u16; bit 15 is the +-1/8 offset and 0..11 the grid high bits
+            "iq1s" => {
+                set_f16(&mut v, 0, d);
+                for i in 0..8 {
+                    v[35 + 2 * i] = (v[35 + 2 * i] & 0x8f) | ((scale & 7) << 4);
+                }
+            }
+            "q2k" => {
+                v[0..16].fill(scale);
+                set_f16(&mut v, 80, d);
+                set_f16(&mut v, 82, dmin);
+            }
+            // no f16 scale: the four UE4M3 sub-block scale bytes are the scale field
+            "nvfp4" => {
+                for b in v.chunks_exact_mut(36) {
+                    b[0..4].fill(scale);
+                }
+            }
+            "iq4nl" => set_f16(&mut v, 0, d),
+            _ => unreachable!(),
         }
         v
     }
@@ -1508,6 +1610,94 @@ mod tests {
         }
     }
 
+    /// Every pool kernel's AVX2 and AVX-512 versions on the same input are bit-identical: random rows as the
+    /// other tests make them, plus rows with every grid index, sign bit and scale at its maximum, with the scale
+    /// fields zero, and with the block scale zero, against activations at +127 and -127 (the quantizers clamp to
+    /// 127, see `act.rs`, never -128), and against a zero activation scale.
+    #[test]
+    fn avx2_matches_avx512_bits() {
+        if skip_avx512("avx2_matches_avx512_bits") || skip_avx2("avx2_matches_avx512_bits") {
+            return;
+        }
+        type Q = unsafe fn(&[u8], &[Q8K]) -> f32;
+        let qk: [(&str, usize, Q, Q); 8] = [
+            ("iq2s", 82, avx2::iq2s_q8k, avx512::iq2s_q8k_gather),
+            ("iq3s", 110, avx2::iq3s_q8k, avx512::iq3s_q8k),
+            ("nvfp4", 144, avx2::nvfp4_q8k, avx512::nvfp4_q8k),
+            ("iq2xxs", 66, avx2::iq2xxs_q8k, avx512::iq2xxs_q8k),
+            ("iq2xs", 74, avx2::iq2xs_q8k, avx512::iq2xs_q8k),
+            ("iq3xxs", 98, avx2::iq3xxs_q8k, avx512::iq3xxs_q8k),
+            ("iq1s", 50, avx2::iq1s_q8k, avx512::iq1s_q8k),
+            ("q2k", 84, avx2::q2k_q8k, avx512::q2k_q8k),
+        ];
+        let mut s = 0x0bad_f00d_dead_beefu64;
+        let mut n_cmp = 0usize;
+        for (name, bb, a2, a5) in qk {
+            let nb = if matches!(name, "iq2s" | "iq3s" | "nvfp4") { 10 } else { 9 };
+            for _ in 0..200 {
+                let w = match name {
+                    "nvfp4" => nvfp4_blocks(4 * nb, &mut s),
+                    "q2k" => q2k_blocks(nb, &mut s),
+                    _ => blocks(nb, bb, &mut s),
+                };
+                let mut q = Vec::new();
+                quantize_q8_k(&act(256 * nb, &mut s), &mut q);
+                let (x, y) = (unsafe { a2(&w, &q) }, unsafe { a5(&w, &q) });
+                assert!(x.to_bits() == y.to_bits(), "{name}: avx2 {x} vs avx512 {y}");
+                n_cmp += 1;
+            }
+            // for NVFP4 the UE4M3 bytes are the scale, so the zero-block-scale row zeroes them
+            let zero_block = if name == "nvfp4" { 0 } else { 0xff };
+            let edges = [
+                ("max indices and scales", edge_row(name, bb, 0xff, 0xff, 1000.0, 1000.0)),
+                ("zero scales", edge_row(name, bb, 0xff, 0, 1000.0, 1000.0)),
+                ("zero block scale", edge_row(name, bb, 0xff, zero_block, 0.0, 0.0)),
+            ];
+            for (variant, w) in edges {
+                for (sign, ad) in [(127i8, 1.0f32), (-127, 1.0), (127, 0.0)] {
+                    let q = vec![Q8K { qs: [sign; 256], d: ad }];
+                    let (x, y) = (unsafe { a2(&w, &q) }, unsafe { a5(&w, &q) });
+                    assert!(x.to_bits() == y.to_bits(), "{name} {variant} act {sign} d {ad}: avx2 {x} vs avx512 {y}");
+                    n_cmp += 1;
+                }
+            }
+            eprintln!("{name}: random and edge rows bit-identical avx2/avx512");
+        }
+        type O = unsafe fn(&[u8], &[Q80]) -> f32;
+        let q80: [(&str, usize, O, O); 2] = [("nvfp4 q80", 36, avx2::nvfp4_q80, avx512::nvfp4_q80), ("iq4nl", 18, avx2::iq4nl_q80, avx512::iq4nl_q80)];
+        for (name, bb, a2, a5) in q80 {
+            for _ in 0..200 {
+                let w = if bb == 36 { nvfp4_blocks(10, &mut s) } else { blocks(20, bb, &mut s) };
+                let mut q = Vec::new();
+                quantize_q8_0(&act(640, &mut s), &mut q);
+                let (x, y) = (unsafe { a2(&w, &q) }, unsafe { a5(&w, &q) });
+                assert!(x.to_bits() == y.to_bits(), "{name}: avx2 {x} vs avx512 {y}");
+                n_cmp += 1;
+            }
+            let f = if bb == 36 { "nvfp4" } else { "iq4nl" };
+            // IQ4_NL's only scale is the f16 block scale, so its two edge cases are the large one and zero
+            let edges: Vec<(&str, Vec<u8>)> = if bb == 36 {
+                vec![
+                    ("max indices and scales", edge_row(f, bb, 0xff, 0xff, 1000.0, 1000.0)),
+                    ("zero scales", edge_row(f, bb, 0xff, 0, 1000.0, 1000.0)),
+                    ("zero block scale", edge_row(f, bb, 0xff, 0, 0.0, 0.0)),
+                ]
+            } else {
+                vec![("max indices", edge_row(f, bb, 0xff, 0, 1000.0, 1000.0)), ("zero block scale", edge_row(f, bb, 0xff, 0, 0.0, 0.0))]
+            };
+            for (variant, w) in edges {
+                for (sign, ad) in [(127i8, 1.0f32), (-127, 1.0), (127, 0.0)] {
+                    let q = vec![Q80 { qs: [sign; 32], d: ad }; if bb == 36 { 2 } else { 1 }];
+                    let (x, y) = (unsafe { a2(&w, &q) }, unsafe { a5(&w, &q) });
+                    assert!(x.to_bits() == y.to_bits(), "{name} {variant} act {sign} d {ad}: avx2 {x} vs avx512 {y}");
+                    n_cmp += 1;
+                }
+            }
+            eprintln!("{name}: random and edge rows bit-identical avx2/avx512");
+        }
+        eprintln!("{n_cmp} avx2/avx512 comparisons bit-identical");
+    }
+
     /// The detection picks the strongest set the CPU supports, and the cached table is the one that set builds.
     #[test]
     fn dispatch_picks_the_expected_set() {
@@ -1526,7 +1716,6 @@ mod tests {
                 assert_eq!(k.iq4nl_q80 as usize, avx2::iq4nl_q80 as Q80Dot as usize);
             }
             Isa::Scalar => {
-                assert!(!have_avx2());
                 assert_eq!(ptr(k.iq1s_q8k), ptr(iq1s_q8k_scalar as Q8kDot));
             }
         }
