@@ -10,10 +10,10 @@ invented one. The aggregate score lives in `scoreboard.md`.
 ## Beam
 
 ### Queue as of 2026-11-19 (suffix decoding landed, its corpus opt-in; true picks scored under the routing knob)
-1. **The corpus as a default**: two 8.5-minute sessions (three clients fill ~13k tokens, then fresh tasks) with and
-   without it; pass at +3% on the fresh tasks. And the first-time JSON list's +4% from own-history drafts at half
-   acceptance (a stricter rule for repetitive structure).
-2. **The routing knob over a topic change** with true picks (a token file that switches text after the state).
+1. **Drafts on repetitive structure**: a first-time JSON list reads +4% from its own history and +5% more from a
+   corpus of other lists (drafts at half acceptance or less): a stricter rule there (acceptance by source).
+   The corpus is the default since X131 (+2.3% on three fresh tasks with 11.7k tokens in it); beyond ~12k unmeasured.
+2. The routing knob: nothing open on scoring (X130: no difference over a topic change); it stays opt-in.
 3. A per-token serve metric (ms per step misreads speculating sessions).
 
 ### Queue as of 2026-11-18 (decode exactness relaxed by the user; speculation and admission landed)

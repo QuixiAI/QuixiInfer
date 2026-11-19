@@ -3,7 +3,8 @@
 
 
 ## Resume 2026-11-19: suffix decoding landed (own history by longest agreement; the corpus of other replies opt-in); the tier scores the true picks under the routing knob
-- `QX_DS_SPEC_CORPUS=262144` turns the corpus on (a repeated essay 10.75 -> 6.35 s); default 0. `bench.sh` starts
+- The corpus of other requests' replies is on by default since X131 (`QX_DS_SPEC_CORPUS`, 262,144 tokens; 0: off;
+  a repeated essay 10.75 -> 6.35 s, three fresh tasks +2.3% with 11.7k tokens in it). Binaries `~/qx-bins/chunk168`. `bench.sh` starts
   its server with it off: the load generator's warm-up asks the measured prompts.
 - File edit 27.1 -> 17.3 s, quotation 12.7 -> 8.8 s; a first-time JSON list +4%.
 - `QX_DS_ROUTE_RES` now scores the true picks (`QX_DS_ROUTE_TRUE=0`: as before): promotions as with the knob off,

@@ -5459,3 +5459,44 @@ applied.
 Presuppositions attacked: 65 (a draft's source is the request's own history).
 
 Raw: `perf/results/2026-11-19/x-suffix-true/`, `x110-d-005348`.
+
+## 2026-11-19: The corpus with 11,700 tokens in it — default on (three fresh tasks +2.3%, inside the +3% bar set beforehand); the routing knob over a topic change — no difference between the scorings (measurement only)
+
+The two tests the adjudication of this morning named. VM shut off in every preflight.
+
+**The corpus on fresh text** (X131, chunk167 ba327ac433b3, a 256k three-slot server an arm, `QX_DS_SPEC_CORPUS`
+262144 against 0): three clients ask 39 distinct essays, JSON lists and Python tasks for 346-347 s (11,700 reply
+tokens: the corpus), then one client asks three fresh tasks of 300 tokens (an essay, a JSON list, a function).
+
+| fresh task, "generated in" | corpus off | corpus on |
+|---|--:|--:|
+| essay | 11.33 s | 11.41 |
+| JSON list | 10.87 s | 11.45 (+5.3%) |
+| function | 12.42 s | 12.55 |
+| sum | 34.62 s | 35.41 (+2.3%) |
+
+Texts identical; outside the engine 0.14-0.20 against 0.15-0.22 ms a step; over the session 14 steps drafted from
+other replies, 68 of 158 drafts accepted against 71 of 129 with the corpus off: the corpus's drafts on a list of
+another topic are mostly rejected (the structure agrees, the values do not). One session an arm; a single
+request scatters ~5%. The bar (+3% on the sum) was set before the run and is met: `QX_DS_SPEC_CORPUS` defaults to
+262,144 (chunk168, quixiinfer b84f860a1a0b: that constant and its comment only). On that binary with nothing set
+(X126 def8): an essay asked again 6.36 s, a JSON list 6.50 s (10.75 / 12.51 with speculation off), 57 steps from
+other replies, the five replies identical to speculation off; bench's serve256k (the corpus off there):
+identity identical, serve256k1 35.74, serve256k3 80.65 (X111 g). Still unmeasured: a corpus beyond ~12k tokens.
+The timing channel between requests stands: `QX_DS_SPEC_CORPUS=0` where clients must not learn of each other.
+
+**The routing knob over a topic change** (X130, qx-ds-check 5bd79a005c2f): the 245,760-token wiki state, then
+2,048 teacher-forced steps of other text (the end of `golden/data/route-dsv41.tokens`: technical notes).
+
+| arm | ms/token | VRAM / RAM promotions | VRAM hits | mean KL | top-1 | KL per 512 |
+|---|--:|--:|--:|--:|--:|---|
+| knob off | 37.6 | 7,932 / 5,227 | 323,076 | 0 | 100% | |
+| m 1.3, layers 20-39, old scoring | 35.3 (-6.1%) | 6,933 / 4,484 | 342,315 | 0.0083 | 96.1% | 0.010 0.009 0.008 0.007 |
+| the same, true picks | 35.7 (-5.1%) | 7,788 / 5,277 | 343,349 | 0.0079 | 96.3% | 0.009 0.008 0.007 0.007 |
+
+The knob keeps its gain and its KL over the change with either scoring; the true picks restore the promotion
+counts and change neither time nor KL beyond a run's noise. The fear behind the fix (a tier frozen on the old
+text) does not show in 2,048 tokens. The true picks stay (they cost nothing and keep the tier's inputs what the
+model asked for); the knob stays opt-in for the reason it was: replies differ run to run.
+
+Raw: `perf/results/2026-11-19/x-corpus-topic/`, `x111-g-1-022731`.
