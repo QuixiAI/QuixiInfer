@@ -348,6 +348,18 @@ These are not our measurements. They are cautions with a source.
   ported (`QX_DS_ADMIT_WINDOW`). Not ported: suffix decoding's cross-request corpus, draft models (DSpark: a 4-row
   window is 77 ms, so it needs 3+ accepted drafts a round and VRAM from the tier).
 
+## Sharing the box with the VM (2026-11-19; notebook of that day, "The RAM tier's elastic part")
+
+- The service's 104.5 GB cannot be swapped or reclaimed (pinned through the CUDA driver, swap off for the unit), so
+  another 16 GiB tenant is a question of who is killed, not of who slows down: 19.3 GiB are available beside it.
+- Pinned arenas can be freed and pinned again while serving: 12 GiB out in 0.5-1.3 s, in again in 1.6 s (not
+  zero-filled; 2.1 s zero-filled), the host has the memory within a second, twenty rounds leave host and GPU
+  memory where they were.
+- The coldest 12 GiB of the 91 GiB tier are worth 5.4% of the gate score (decode256k +8%, serve256k3 +8%, decode
+  +4%, prefill128 +4%, prefill256k 0): the same order as the 95 -> 100 GiB steps measured before.
+- A VM's pid file under `/run/libvirt/qemu/` is readable by the service's user and exists before the guest touches
+  memory: an earlier signal than any memory counter. A pid file can outlive its process: check `/proc/<pid>`.
+
 ## Open: windows of 5 are not bit-identical to single steps (2026-11-06)
 
 `QX_DS_WINDOW=5` on route1k 128 gave 125 / 128 bit-identical rows against single steps, while widths 6 and 7 gave

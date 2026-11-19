@@ -774,6 +774,16 @@ becomes a family.
   bounded suffix when a decoder's state is rebuilt. Ours rebuilds the ring from the host latent history in
   `rewind`; the equivalent is already in place, but a measurement of `rewind`'s cost at 16k belongs to family 4.
 
+### Queue 2026-11-19, after the elastic RAM tier
+
+- **The first real VM start**: read `journalctl -u quixiinfer | grep "ram tier"` after it; the release must come
+  before the guest's memory does (MemAvailable in the line), the return 20 s after shutdown.
+- The release waits for the scheduler's step (a full prompt chunk: up to 16 s). If the journal ever shows a release
+  with little memory left, let the chunk path poll between its parts.
+- Yield untested with `QX_DS_GPU_SHARE`, `QX_DS_PREFETCH`, `QX_DS_STG_WAIT=words` (all off by default).
+- The refill under load: promotions wait turn about; not measured on a loaded server.
+- Size of the part: 12 GiB leaves ~14 GiB beside a fully touched VM. 8 would cost less while out (not measured).
+
 ## Parked
 - **Parking idle sequences in host memory** (work in progress, 2026-11-05). This is a serving capability: prefix
   reuse across more conversations than slots. It is not a speed change to the standard benchmark. Its

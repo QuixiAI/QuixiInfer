@@ -7,7 +7,12 @@
   is kept beside it as `quixiinfer.service.qwen-2026-11-19.bak`): binary `~/qx-prod/bin/quixiinfer` (`~/qx-prod/BUILD`
   names the commit), key `VLLM_API_KEY` from `/etc/slimserve/affine-king.env`, `0.0.0.0:8000`, 256k context, 3 slots,
   MemoryMax 112G, `Restart=always`, enabled at boot. It holds the GPU: `sudo systemctl stop quixiinfer` before any
-  benchmark or chain, `sudo systemctl start quixiinfer` after. The earlier user unit `quixiinfer-deepseek` is retired.
+  benchmark or chain, `sudo systemctl start quixiinfer` after (the user allowed me both, 2026-11-19; say when).
+- **The win10 VM beside it** (the user's build machine, started now and then; never started or stopped by me): the
+  unit sets `QX_DS_RAM_YIELD=12 QX_DS_YIELD_PATH=/run/libvirt/qemu/win10.pid`: while the pid file's process lives
+  (or under 4 GiB are available) the coldest 12 GiB of the RAM tier are freed and read from NVMe (gate +5.4%,
+  replies identical), 20 s after it is gone they are pinned and read back. `journalctl -u quixiinfer | grep "ram
+  tier"` shows each hand-over. Not yet seen with the real VM: check the journal after its next start.
 - Speculation: four kinds of draft with their own record (`SpecSrc`); a first-time JSON list at parity; a list with
   another reply's values under other keys +3 to +4% (backlog).
 

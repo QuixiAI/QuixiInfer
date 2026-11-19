@@ -5568,3 +5568,93 @@ One reservation: the change moves a ~3% cost from the first-time list to the lis
 removing it. Corrections applied.
 
 Raw: `perf/results/2026-11-19/x-spec-kinds/`, `x110-e-034049`, `x111-h-1-045134`, `x111-h-2-045425`.
+
+## 2026-11-19: The RAM tier's elastic part (`QX_DS_RAM_YIELD`): the service hands 12 GiB back to the host while the win10 VM runs and takes them again after — LANDED, off by default, on in production (gate score unchanged off and on; 12 GiB out: score +5.4%, replies identical)
+
+Why: the user's VM (16 GiB, 16 vCPUs, started now and then for a build) and the service (104.5 GB resident, swap
+off for the unit, the expert tier pinned) do not fit a 120 GiB box together: 19.3 GiB are available with the service alone. A test
+server was killed by systemd-oomd beside the VM on 11-18. Wanted: the VM costs speed while it runs, nothing else.
+
+What: with `QX_DS_RAM_YIELD=G` the coldest G GiB of the RAM tier's budget get their places in a second pinned
+arena per size class (`tiers.rs` `build_elastic`). `DsEngine::ram_yield(true)`, called by the scheduler between
+steps, has the driver thread (`yield_check`) wait for every copy and promotion read, return the quarantined
+places, keep the hottest records in the first arenas (memcpy of those that sat in the elastic ones), drop the
+coldest to NVMe-only, free the arenas and update the GPU's RAM table before it acknowledges. `ram_yield(false)`
+pins the arenas again (not zeroed) and `promote_one` reads the dropped records back, hottest first, turn about
+with the adaptive promotions. The trigger (`worker_ds.rs` `Yielder`, five looks a second, also while idle): out
+while `QX_DS_YIELD_PATH` exists and, if it holds a pid, that process lives (the VM's pid file: there before the
+guest touches memory), or while MemAvailable is under `QX_DS_YIELD_LOW` (4 GiB); back once the path is gone and
+MemAvailable has stayed above the part plus `QX_DS_YIELD_HIGH` (8 GiB, at least LOW + 2) for `QX_DS_YIELD_HOLD`
+(20 s). A server started beside the path builds the store with the part out. Unset: one arena per class, the
+free list in its old order.
+
+Measured (VM off, the service stopped; raw in `perf/results/2026-11-19/x-ram-yield/`). Builds: chunk175 the first
+version; chunk176 the restore not zero-filled; chunk177 the breaker's fixes; chunk178 (quixiinfer 7f139cfb47dd,
+qx-ds-check ee12685b9263; the engine as in chunk177) a warning silenced. What counts is on chunk178 unless said.
+- Gate (all three on chunk178). Variable unset (x110-f-122224): 18.468 against 18.475, identity identical. Set and
+  in (x110-g-123004): 18.470, identical; its unscored serve256k1 reads 35.68 and prints REGRESSION against 32.98
+  (f: 33.21), inside the case's known two levels (34.1-37.2). Set and out for the whole run (x110-h-123741, a pid
+  file naming pid 1): 19.471 (+5.4%): decode256k 42.3, 42.0 (39.0), serve256k3 87.57 (80.8), serve256k1 37.24,
+  decode 32.0 (30.8), prefill128 10.9 (10.5), prefill256k 2.0; identical. That is the price while the VM is up,
+  before whatever its 16 vCPUs take from the pool. The gates' sessions release and restore nothing.
+- ds-checks on ee12685b9263 (X144, parts a, b, c; `ds-checks.log`): pass, each part the same text as the X86 run.
+- Times (all builds): a release 0.51-0.72 s when few records move, 1.1-1.3 s when most do (1,252 of 1,263); a
+  restore 1.56-1.69 s (2.06 s zero-filled, chunk175); the engine thread waits that long, once each. The host has
+  the memory within a second, idle or not (X141, chunk175: 19.2 -> 21.8 -> 31.4 GiB at 0.5 s steps; the service's
+  own line two seconds after each release on chunk178: 31.5-31.6 GiB available, 19.4 before). The refill's
+  duration is not timed; on an idle server its last line follows the restore within seconds.
+- Replies on chunk178, each byte-identical to the same request before any yield. X140 c: short prompts out, back,
+  with the release mid-reply (the restore came after the reply), after two more releases of which one came before
+  the refill was over (584 records), and after a release by a pid file the service cannot read: 11 of 11, five
+  releases and restores. X142 b, prefix reuse off so every prompt runs the chunk path (chunk steps 26): a 12.5k-token
+  prompt out, refilling, and after the flapping (3 of 3 beside a control), three prompts at once out and with the
+  path coming and going twice while they ran (6 of 6 beside 3 controls); three releases (1,040, 871, 46 moved),
+  the third 71 records into a refill.
+- On earlier builds, same results: X140 a (chunk175, 10 of 10; its waits matched the store's start-up line, so
+  its phases ran early and two waits timed out: the server did the right thing, three releases); X140 b
+  (chunk176): a 12.5k-token prompt asked again out and back, decode 4.25 / 4.24, 4.19 / 4.16, 4.17 s, released
+  by a 13 GiB bytearray at LOW=8 (out at 7.0 GiB available, back 5 s after it left; resident 90.1 G out and
+  102.1 G just after the return against 104.5: not looked into); X142 a (chunk176) ended without its last prompt
+  and without its summary line: the chain's `wait` in a subshell never returned (17 CPU-minutes) while the
+  server sat idle and healthy until its 420 s limit; with explicit pids (X142 b) it ran through.
+- Bytes (`tier-check-elastic.txt`, chunk178: qx-tier-check with QX_TIER_ELASTIC=8 on a 30 GiB budget): every
+  record in RAM compared with the source GGUF after build, after churn (600 evictions, 3,000 promotion
+  candidates), after each release (417-504 moved, 630-895 dropped), after each refill, three rounds, and for a
+  store built out and then restored: 0 mismatches in 12 of 12 stages, no two records in one place. This checks
+  the store alone, not the driver's table words, copies or quarantine.
+- Started beside the path (X143 b, chunk177): 8,327 records (79.0 GiB), 92.5 G resident; path gone: 104.5 G and
+  the same reply. A pid file naming no process: no release in 4 s. Twenty releases and restores idle: resident
+  104.5 -> 104.5 G, available 19.4 -> 19.3 GiB, GPU 30,927 -> 30,927 MiB. (X143 a stopped after one release:
+  its wait helper returned failure and left the path in place; the server rightly stayed out. X143 b printed
+  one warning, "19.3 GiB available 2 s after the release": the part was back by then at HOLD=1; chunk178 says
+  nothing in that case.)
+
+Breaker (fresh context, reading only): no path found that reads or writes a freed place. Its points and what
+became of them: the memcpy branch must have run (it did: 1,251, 1,042, 867 moved); reply text is a weak detector
+for cold records (hence the byte check above); the free list's order had changed with the variable unset (put
+back); a stale pid file kept the part out for good (pid checked); HIGH below LOW could flap (clamped); a start
+beside the VM pinned everything (built out); the refill ran ahead of the adaptive promotions (turn about).
+
+Not covered:
+- The real VM, which I may not start. That its pid file exists before the guest touches memory is libvirt's
+  convention, not something seen here; the file's mode is unknown (both readable and unreadable are handled).
+  The first real start is the test, and the journal's `ram tier:` lines say what happened.
+- The release waits for the scheduler's current step: up to one prompt chunk (8,192 tokens at 2.0 ms: 16 s).
+  Whether the VM's 16 GiB plus qemu's own fit the 19.3 GiB available for that long is not measured; a test
+  server was killed beside the VM on 11-18 (its settings then are not on record).
+- The low mark was tested at 8 GiB, not at the default 4.
+- `QX_DS_GPU_SHARE`, `QX_DS_PREFETCH`, `QX_DS_STG_WAIT=words` (off by default; the breaker's "no path reads a
+  freed place" is a reading of the code, and for these three nothing more).
+- `QX_DS_ROUTE_RES` (off by default): with it a release changes which records are resident and so the replies.
+- The refill's cost to a loaded server's promotions (turn about) is not measured; its correctness under load is
+  X142 b's flapping phase.
+- `ram_yield` gives the driver 120 s to answer, then panics (the unit restarts, built out if the VM is up).
+- `QX_DS_ASYNC=0` (no driver) prints the store's line and never yields.
+
+### Adjudication (fresh context, 2026-11-19): HOLD, then lifted
+Gate arithmetic, identity, like for like and every reply comparison reproduced. HOLD for: no ds-checks on the
+binaries; the release and restore evidence taken on builds before the final one; X142 a's end unexplained; a list
+of numbers and claims stronger than the logs. Answered by X144 (ds-checks pass), X140 c and X142 b on chunk178,
+and the corrections above. The verdict's own condition: commit before the production install.
+
+Raw: `perf/results/2026-11-19/x-ram-yield/`, `x110-f-122224`, `x110-g-123004`, `x110-h-123741`.
