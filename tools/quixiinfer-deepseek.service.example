@@ -1,24 +1,44 @@
-# A systemd *user* unit for the DeepSeek-V4.1-Flash server (copy to ~/.config/systemd/user/quixiinfer-deepseek.service,
-# adjust the paths, then `systemctl --user enable --now quixiinfer-deepseek`). The memory cap matters: the expert
-# tiers pin most of the RAM, and an out-of-memory condition must kill this unit, not the session.
+# QuixiInfer serving DeepSeek-V4.1-Flash-1017 (UD-IQ2_XXS) at 262k context: the production unit of 2026-11-19 with
+# the paths made generic. Install as /etc/systemd/system/quixiinfer.service (set User, the paths and the key file),
+# then: systemctl daemon-reload && systemctl enable --now quixiinfer
 [Unit]
-Description=QuixiInfer: DeepSeek-V4.1-Flash-1017 (UD-IQ2_XXS)
-After=network.target
+Description=QuixiInfer (DeepSeek-V4.1-Flash UD-IQ2_XXS, OpenAI-compatible API)
+Wants=network-online.target
+After=network-online.target
 
 [Service]
-WorkingDirectory=/home/eric/git/QuixiInfer
+Type=simple
+User=USER
+Group=USER
+# the default --profile (golden/profile-dsv41.txt) is looked up here
+WorkingDirectory=/path/to/QuixiInfer
+# a root-owned mode 0600 file with one line: API_KEY=...
+EnvironmentFile=/etc/quixiinfer.env
+Environment=HOME=/home/USER
+Environment=RUST_BACKTRACE=1
+# the driver's JIT cache: at its 1 GiB default the kernel modules evict each other (10-20 minute cold starts)
+Environment=CUDA_CACHE_MAXSIZE=4294967296
+# The benchmarked 256k configuration on a 128 GB box: 20 GiB VRAM budget, 95 GiB RAM tier (the process is about
+# 105 GB), three slots.
+Environment=QX_DS_VRAM=20
+Environment=QX_DS_RAM=95
 Environment=QX_DS_PROMOS=32
-# EnvironmentFile=%h/.config/quixiinfer-deepseek.env   # API_KEY=... when listening beyond 127.0.0.1
-ExecStart=/home/eric/git/QuixiInfer/target/release/quixiinfer serve \
-  --model /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
-  --pack  /home/eric/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp \
-  --ctx 32768 --port 8000 --vram-gib 21 --ram-gib 100 \
-  --profile /home/eric/git/QuixiInfer/golden/profile-dsv41.txt --profile-out %h/.cache/quixiinfer-deepseek-profile.txt
-MemoryMax=118G
+Environment=QX_SCHED_STATS=1
+# Optional, for a box that sometimes runs something else that needs RAM (here a libvirt VM): while the pid file's
+# process lives, or under 4 GiB are available, the coldest 12 GiB of the RAM tier are handed back to the host
+# (replies unchanged, about 5% slower); 20 s after it is gone they return. The journal's "ram tier:" lines say when.
+#Environment=QX_DS_RAM_YIELD=12
+#Environment=QX_DS_YIELD_PATH=/run/libvirt/qemu/DOMAIN.pid
+ExecStart=/path/to/quixiinfer serve --model /path/to/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf --pack /path/to/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp --profile /path/to/QuixiInfer/golden/profile-dsv41.txt --ctx 262144 --slots 3 --window 128 --host 0.0.0.0 --port 8000 --api-key ${API_KEY}
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=90
+# an out-of-memory condition must end this unit, not the machine
+MemoryMax=112G
 MemorySwapMax=0
 LimitMEMLOCK=infinity
-Restart=on-failure
-RestartSec=10
+LimitNOFILE=1048576
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
