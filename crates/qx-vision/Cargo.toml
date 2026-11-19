@@ -1,0 +1,14 @@
+[package]
+name = "qx-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+qx-pack = { path = "../qx-pack" }
+anyhow = { workspace = true }
+half = { workspace = true }
+rayon = "1.10"
+matrixmultiply = "0.3.11"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
