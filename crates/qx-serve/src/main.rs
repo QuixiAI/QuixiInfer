@@ -312,15 +312,67 @@ async fn completions(State(app): State<Arc<App>>, h: HeaderMap, Json(body): Json
     generate(app.clone(), prompt, &body, false, false).await
 }
 
+const HELP: &str = "\
+quixiinfer: an OpenAI-compatible inference server
+
+usage:
+  quixiinfer serve [options]            serve /v1/models, /v1/chat/completions and /v1/completions
+  quixiinfer run --prompt TEXT [options]  answer one prompt on stdout
+  quixiinfer help | --help | -h         this text (loads nothing)
+
+options of both commands:
+  --model GGUF          the model file (default: QX_MODEL, else the Qwen model under ~/models)
+  --ctx N               context per sequence in tokens (default 32768)
+  --slots N             concurrent sequences (default 16; DeepSeek 2)
+  --profile RANKING     expert ranking the tiers start from
+                        (DeepSeek: else QX_DS_PROFILE, else golden/profile-dsv41.txt if present)
+  --prefill-budget-ms N prompt time allowed per step beside decoders (default 1000; not DeepSeek)
+
+serve:
+  --host ADDR           address to listen on (default 127.0.0.1; any other needs --api-key)
+  --port N              port (default 8080)
+  --api-key KEY         bearer token the clients must send
+
+run:
+  --prompt TEXT         the prompt (required)
+  --max-tokens N        tokens to generate at most (default 512)
+  --temperature T       sampling temperature (default 0: greedy)
+  --no-think            render the chat template with reasoning off
+  --raw                 feed the prompt as written, without the chat template
+
+DeepSeek-V4.1-Flash models:
+  --pack FILE.qxp       the expert pack (required; or QX_DS_PACK)
+  --window N            prompt tokens per step (default 128)
+  --vram-gib G          VRAM budget in GiB (default 21; or QX_DS_VRAM)
+  --ram-gib G           RAM expert tier in GiB (default 100; or QX_DS_RAM)
+  --profile-out FILE    save the expert ranking here and start from it next time (or QX_DS_PROFILE_OUT)
+
+Further settings are environment variables (QX_DS_*); handoff.md lists the current ones.
+";
+
 fn usage() -> ! {
-    eprintln!("usage:\n  quixiinfer serve [--host 127.0.0.1] [--port 8080] [--ctx 32768] [--slots 16] [--prefill-budget-ms 1000] [--profile RANKING] [--api-key KEY] [--model GGUF]\n  quixiinfer run --prompt TEXT [--max-tokens N] [--temperature T] [--no-think] [--raw] [--ctx N] [--profile RANKING]");
+    eprint!("{HELP}");
     std::process::exit(2)
 }
 
+/// True when the command line asks for help: `help` as the command, or `--help` / `-h` anywhere except as the text
+/// of `--prompt`.
+fn wants_help(args: &[String]) -> bool {
+    args.get(1).is_some_and(|a| a == "help") || args.iter().enumerate().skip(1).any(|(i, a)| (a == "--help" || a == "-h") && args[i - 1] != "--prompt")
+}
+
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    // before anything touches the GPU or the model: `serve --help` used to load the default model
+    if wants_help(&args) {
+        print!("{HELP}");
+        return Ok(());
+    }
+    if !matches!(args.get(1).map(|s| s.as_str()), Some("serve" | "run")) {
+        usage();
+    }
     qx_engine::tune_host_allocator();
     qx_gpu::init();
-    let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("serve") => {
             let host = arg(&args, "--host").unwrap_or_else(|| "127.0.0.1".into());
