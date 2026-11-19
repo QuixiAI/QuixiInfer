@@ -1,232 +1,42 @@
 # QuixiInfer
 
-QuixiInfer serves very large mixture-of-experts models to several users at once from a single workstation: one
-RTX 5090 (32 GB), a 16-core CPU, 128 GB of RAM and an NVMe SSD. One binary holds two engines, chosen by the model
-file's architecture:
-
-- **DeepSeek-V4.1-Flash** (284B, UD-IQ2_XXS, 262k context): the engine in production here since 2026-11-19 and the
-  one under active development. Its experts live in three tiers (VRAM, pinned RAM, NVMe). See
-  [DeepSeek-V4.1-Flash](#deepseek-v41-flash).
-- **Qwen3.8-Flash-Next** (125B MoE, 512 experts per layer, 262k context): the engine the project started with. It
-  is no longer run in production and its figures below were last measured in early November 2026; they have not
-  been re-measured since.
-
-It is written in Rust, with its own CUDA kernels, compiled at build time and launched through CubeCL. No ggml or
-llama.cpp code is linked. The server design comes from DeepInfer, DeepSeek's cluster engine, scaled down to one GPU
-with CPU expert offload:
-
-- continuous batching over sequence slots;
-- asynchronous scheduling;
-- paged FP8 KV (the Qwen engine);
-- prefix reuse;
-- exact speculative decoding;
-- structured outputs.
-
-The Qwen engine runs NVIDIA's [Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
-checkpoint, in which the routed experts are 4-bit NVFP4 and attention, GDN and the shared experts are higher
-precision. It also still runs Unsloth's IQ GGUFs (`UD-IQ3_XXS`).
-
-## Where it fits
-
-Several engines run this model, or this class of model, and each optimizes for something different:
-
-| Engine | Built for | Hardware | Concurrency | What it optimizes |
-|---|---|---|---|---|
-| **QuixiInfer** | A shared server on one workstation | One NVIDIA sm_120 GPU, Linux | Continuous batching: 8 slots of 262k each (Qwen), 3 (DeepSeek) | Aggregate throughput at 4-16 users, results that do not depend on scheduling |
-| **Basalt** | One user on one Blackwell workstation | NVIDIA sm_120, Linux; an optional second GPU as an expert tier | `--parallel 1..8`, context shared across slots | Single-stream decode speed (tuned packs, self-distilled drafter) |
-| **Strata** (Basalt's parent) | One user on a gaming PC | NVIDIA, AMD, Apple and Intel GPUs, 12 GB of VRAM and up; Windows, Linux, macOS | One request by default | Running on ordinary hardware; apps, APIs, installer |
-| **[colibri](https://github.com/JustVugg/colibri)** | Models far bigger than RAM, on any machine | CPU first; CUDA, Vulkan and Metal tiers | One request | Reach: experts streamed from NVMe, so 284B-1T models still run |
-| **SlimServe** | A multi-GPU server | 2-8 data-center or consumer GPUs (vLLM based) | vLLM batching | Throughput with tensor and expert parallelism |
-| **DeepInfer** | DeepSeek's production cluster | SM100 GPUs, Ascend NPUs, 4-64 per deployment | Data and expert parallelism | DeepSeek-V4.1-Flash at data-center scale |
-| **llama.cpp** | General local inference | Almost anything | `--parallel` | Breadth of models and hardware. QuixiInfer uses it offline only: to convert the checkpoint, and as a reference oracle |
-
-How QuixiInfer's Qwen engine differs from the engines that run that model on the same kind of machine (Strata,
-Basalt, colibri):
-
-- **It is a server, not a chat app.** Eight concurrent conversations each get the whole 262k context. New prompts
-  join running sequences between decode steps. All slots share one 16 GiB pool of pinned KV pages, and a request
-  reserves its pages when it is admitted.
-- **The GPU and CPU work concurrently, even under load.** Every expert missing from VRAM is computed on the CPU at
-  the RAM's bandwidth. A batch of several sequences runs as two interleaved halves, so one half's GPU layers run
-  while the CPU computes the other half's missing experts.
-- **Results do not depend on scheduling.** A token's logits are the same bits whether its experts ran on the GPU or
-  the CPU, whether its prefix came from the cache or was recomputed, and whether it was decoded alone or in a batch
-  (for batch sizes of up to 4 tokens per half; wider batches use a tensor-core kernel that rounds differently).
-  Speculative tokens equal plain sampling, and prefill is deterministic from run to run. Each of these properties
-  has a check tool (see [Checks](#checks)).
-
-What it does not do (yet): vision, the Anthropic API, multiple GPUs. The DeepSeek engine's own properties
-(three expert tiers, prompt chunks that are KL-bounded and not bit-exact, speculation) are described
-[below](#deepseek-v41-flash).
-
-## Performance
-
-This section is the Qwen engine, as last measured in early November 2026 and not re-measured since (the engine
-has not been run since production moved to DeepSeek; later entries in [docs/progress.md](docs/progress.md) record
-other prefill figures, 1,495 tok/s on a 23k-token prompt and 2,069 on 90k, and concurrent rows that vary by run).
-The DeepSeek engine's current figures are in [its section](#deepseek-v41-flash).
-
-The QuixiInfer figures below were measured on an RTX 5090, a Ryzen 9 9950X and 2 x 64 GB DDR5-5600 (JEDEC, about
-55 GB/s measured), through the OpenAI API, in the production layout: 8 slots x 262,144 tokens, FP8 KV and NVFP4
-experts. Every measurement is logged in [docs/progress.md](docs/progress.md).
-
-**Concurrent decode** (`tools/loadgen.py --unique`, 256-token answers, 3 rounds per level, aggregate tok/s):
-
-| Clients | 1 | 4 | 8 | 16 |
-|---|---|---|---|---|
-| Aggregate tok/s | 54 | 90 | 95 | 90 |
-| Per request | 69 | 26 | 14 | 13 |
-| Median time to first token | 1.1 s | 1.1 s | 2.1 s | 22 s (8 slots: half the requests queue) |
-
-**Prefill:** 1,070-1,139 tok/s on 25k-100k-token prompts.
-
-**One conversation** (one 64k slot, so the expert cache is larger): 95 tok/s on a 400-token answer, 113 on a
-2,000-token answer.
-
-### Against the other engines
-
-The figures below come from each project's own documentation, on different machines and settings, so treat them as
-a rough guide. The Strata and Basalt rows are the closest to QuixiInfer's machine.
-
-| Engine, setup | Single stream | Concurrent | Prefill |
-|---|---|---|---|
-| **QuixiInfer**, NVFP4, RTX 5090 + 9950X, 8 x 262k slots | 54 tok/s (API, 256-token answers); 95-113 with one 64k slot | **90-95 tok/s at 4-16 clients** | 1,070-1,139 tok/s |
-| Strata, NVFP4, RTX 5090 + 9950X3D, 128 GB, one 64k session, int8 KV | 114-116 tok/s (400-token answer) | not published | 3,900 tok/s (32k prompt) |
-| Basalt, IQ3_XXS pack, RTX 5090 at 400 W | 184 tok/s, 320 with speculation | not published | not published |
-| colibri, Qwen3.8-Flash-Next, 8-core desktop, CPU only | 1.9-2.6 tok/s; 4.0 with int4 experts | single request | 512 tokens in 30-44 s |
-| SlimServe, `qwen38fn-fp8-8`, 8 x RTX 3090, TP8 + EP | 140 tok/s | 591 at 8, 1,151 at 32 | not published |
-| DeepInfer, DeepSeek-V4.1-Flash, 4-64 SM100 GPUs | different model and scale; see its README | | |
-
-**For one conversation, QuixiInfer is slower than Strata and Basalt.** Strata is about 20% faster on a 400-token
-answer and 3-4x faster on prefill; Basalt's tuned IQ3_XXS packs with speculation are about 3x faster. The reasons
-are in [docs/strata-rca.md](docs/strata-rca.md):
-
-- Decode speed follows the share of experts already in VRAM, and the production layout gives about 2,000
-  experts of VRAM to eight full-length contexts.
-- Each new conversation starts with a cold cache.
-- Speculative decoding runs only when a single sequence is active.
-
-QuixiInfer's place is serving several users at once: at 4-16 concurrent requests it keeps 90-95 tok/s across all
-of them, on one GPU.
-
-**DeepSeek-V4.1-Flash against Strata, measured on this machine, same model files and token ids** (2026-11-15,
-one run each, VM off; `perf/optimization_status.md` of that day): QuixiInfer is ahead on prompts and on decode.
-A 16,384-token prompt: 11.7 s (1,392 tok/s) against Strata's 19.2 s (854); 2,048 tokens: 3.1 s against 10.4 s;
-128 tokens: 1.1 s against 4.0 s. The 64 tokens after a prompt: 25-27 tok/s against 16.5-18.9. Steady decode at
-1k context (2026-11-11): 32.4-32.7 tok/s against 27.2. Caveats: QuixiInfer's prompt time covers all but the last
-64 tokens (those run as single steps), and Strata's process was cold while QuixiInfer's kernels were compiled;
-as fresh processes on the 16k prompt it was 1,132-1,158 tok/s against 841-880. Strata has no server, so there is
-no concurrent comparison. Quality, teacher-forced on the same ids against the f32 reference over 1k positions
-(2026-11-07): QuixiInfer's decode path is at KL 0.011-0.020 and 96% top-1 (perplexity +0.1%); Strata's at KL
-0.025-0.046 and 93-94% (perplexity within ±2%). Details in `perf/findings.md`.
-
-**What limits it (Qwen).** At 8 concurrent sequences a decode step is 53 ms, of which 50 ms is the CPU computing the
-experts not in VRAM, at about 54 µs per expert. Misses are per token: each token picks 10 of 512 experts per layer,
-so sequences rarely share them. Batching therefore saves GPU time but not CPU time, and throughput levels off from
-about 4 users. The levers are:
-
-- more VRAM for the expert cache;
-- faster RAM (EXPO instead of JEDEC);
-- cache-aware routing (`QX_ROUTE_CACHE`, experimental, see below).
-
-## Quick start
-
-Requirements:
-
-- Linux x86-64 with AVX-512 VNNI;
-- an NVIDIA GPU: developed and measured on an RTX 5090 (sm_120); the kernels also build for the RTX 40 series
-  (sm_89) and the RTX 30 series (sm_86), see "Other GPUs" below;
-- CUDA 13 (`nvcc` at `/usr/local/cuda-13.3/bin`, or set `QX_NVCC`);
-- a recent stable Rust;
-- about 128 GB of RAM (Qwen: 63 GiB of pinned experts, plus the KV pool and the PLE row cache; DeepSeek: about
-  105 GB with a 95 GiB RAM tier);
-- the pack on an NVMe drive.
-
-**1. Build.**
-
-```sh
-cargo build --release      # target/release/quixiinfer, qx-pack and the check tools
-target/release/quixiinfer --help   # the commands and every flag; loads nothing
-```
-
-**Other GPUs (RTX 40 and 30 series).** The engine reads the card's compute capability at start and compiles its
-kernels for it (the same target CubeCL uses: `sm_120a` on Blackwell, `sm_89` / `sm_86` on Ada / Ampere). What
-differs by card: the FP8 KV-cache conversions use Ada's `cvt` instructions from sm_89 on and a bit-identical software
-form before it (checked bit for bit against the instructions over every float and every byte, `kernels/bench/e4m3_check.cu`); the bf16 tensor-core products for batched decode
-(`qx_tmv`) need 51 KB of static shared memory and exist from sm_90 on, so on the 40 and 30 series batched decode
-stays on the f32 path (exact, slower per token above 8 sequences); the expert tier is what is left of VRAM after the
-dense weights, the context slots and the staging area, so a 24 GB card at 256k context holds few experts and
-serves most from RAM (set `--ctx` and `--slots` to what the card can hold; `QX_DS_STAGE_CAP` shrinks the 2.4 GB
-staging area); PCIe 4.0 lands a 9.5 MB expert record in 0.4 ms against 0.2 on PCIe 5.0, which moves the best
-staging share (`QX_DS_STAGE_SHARE_DECODE`) toward the CPU pool. `QX_NVCC_ARCHS=sm_86,sm_89,sm_120a cargo build`
-compiles every kernel for all three at build time (the default check is `sm_120a` alone; on a 40-series box set
-`QX_NVCC_ARCHS=sm_89`, the check takes about 20 minutes per target the first time). Only the 5090 has been run
-here; the other two are build-checked.
-
-**2. Make the model pack** (Qwen; the DeepSeek commands are in [its section](#deepseek-v41-flash)). Download [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
-(`tools/pardl.py` is a parallel, resumable downloader). Convert it with llama.cpp PR #30817's converter, which
-applies the FP8 PLE table's per-tensor scale, then write and verify the pack:
-
-```sh
-python convert_hf_to_gguf.py Qwen3.8-Flash-Next-NVFP4/ --outtype q8_0 --no-mtp --outfile Qwen3.8-Flash-Next-NVFP4.gguf
-target/release/qx-pack pack   Qwen3.8-Flash-Next-NVFP4.gguf Qwen3.8-Flash-Next-NVFP4.qxp --profile routing.txt
-target/release/qx-pack verify Qwen3.8-Flash-Next-NVFP4.qxp  Qwen3.8-Flash-Next-NVFP4.gguf
-```
-
-Put the MTP drafter (`mtp-Qwen3.8-Flash-Next-Q8_0.gguf`) next to the model; it is found automatically.
-
-**3. Serve** (Qwen).
-
-```sh
-QX_POOL_CPUS=16 QX_KV_GIB=16 QX_PREFIX_GIB=4 QX_PLE_CACHE_ROWS=10000000 \
-  target/release/quixiinfer serve --host 127.0.0.1 --port 8000 --ctx 262144 --slots 8
-```
-
-Startup takes about 90 s; the first start after a reboot takes longer while the experts are read into RAM. The
-server refuses to listen beyond 127.0.0.1 without `--api-key KEY`.
-
-**4. Ask it something.**
-
-```sh
-curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
-  "messages": [{"role": "user", "content": "What is the capital of France? Answer in one sentence."}],
-  "max_tokens": 200, "chat_template_kwargs": {"enable_thinking": false}}'
-```
-
-The endpoints are `/v1/models`, `/v1/chat/completions` and `/v1/completions`, streamed or not, and work with any
-OpenAI client.
-
-- **Completion limit.** Without `max_tokens`, a request may use the rest of its context. The model thinks before
-  it answers, and thinking often takes thousands of tokens.
-- **Thinking.** `chat_template_kwargs: {"enable_thinking": false}` turns it off.
-- **Structured output.** `response_format` (`json_object`, `json_schema`) and the `guided_*` fields (regex,
-  grammar) constrain the output.
-
-**5. Run it as a service** (optional). The Qwen engine ran in production as a systemd unit until 2026-11-19 (the
-DeepSeek unit that replaced it is described in [its section](#deepseek-v41-flash)); the parts that matter:
-
-```ini
-[Service]
-EnvironmentFile=/etc/quixiinfer.env            # API_KEY=...
-Environment=QX_POOL_CPUS=16 QX_KV_GIB=16 QX_PREFIX_GIB=4 QX_PLE_CACHE_ROWS=10000000
-ExecStart=/usr/local/bin/quixiinfer serve --host 0.0.0.0 --port 8000 --api-key ${API_KEY} --ctx 262144 --slots 8
-Restart=always
-LimitMEMLOCK=infinity
-```
-
-Stop the service before benchmarking: two engines cannot both pin the experts.
-
-### DeepSeek-V4.1-Flash
-
-The same binary serves [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)
-at UD-IQ2_XXS (284 B parameters; six GGUF shards and a 282 GB pack) on the same machine, at the model's full
-262,144-token context. Its 15,360 routed-expert records (about 9.5 MB each) live in three tiers: what the VRAM
+QuixiInfer serves [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)
+at UD-IQ2_XXS (284 B parameters; six GGUF shards and a 282 GB pack) at the model's full 262,144-token context
+from a single workstation: one RTX 5090 (32 GB), a 16-core CPU, 128 GB of RAM and an NVMe SSD. Its 15,360
+routed-expert records (about 9.5 MB each) live in three tiers: what the VRAM
 has left after the context and the slots (12.3 GiB, 1,275 records, at three 262k slots, plus 4.1 GiB lent from
 the slots' unused tails), a pinned RAM tier (95 GiB in production: 9,590 records), and the rest read from the
 pack on NVMe as routed. The tiers adapt to what requests route to. Several requests run at once over sequence
 slots; a request sharing a prefix with an earlier one continues from it; parked sequences resume bit-exactly;
-structured outputs go through the same grammar engine as the Qwen path. Image input is not supported: an
+structured outputs are constrained by a grammar engine. Image input is not supported: an
 `image_url` part of a message is dropped without an error and the model answers from the text alone.
+
+It is written in Rust, with its own CUDA kernels, compiled at build time and launched through CubeCL. No ggml or
+llama.cpp code is linked. The server design comes from DeepInfer, DeepSeek's cluster engine, scaled down to one GPU
+with CPU expert offload and an NVMe tier:
+
+- continuous batching over sequence slots;
+- asynchronous scheduling;
+- prefix reuse;
+- exact speculative decoding;
+- structured outputs.
+
+What it does not do (yet): vision, the Anthropic API, multiple GPUs.
+
+## Where it fits
+
+Several engines run this class of model, and each optimizes for something different:
+
+| Engine | Built for | Hardware | Concurrency | What it optimizes |
+|---|---|---|---|---|
+| **QuixiInfer** | A shared server on one workstation | One NVIDIA sm_120 GPU, Linux | Continuous batching, 3 slots of 262k each | Several users on one box at full context; decode that does not depend on scheduling |
+| **Basalt** | One user on one Blackwell workstation | NVIDIA sm_120, Linux; an optional second GPU as an expert tier | `--parallel 1..8`, context shared across slots | Single-stream decode speed (tuned packs, self-distilled drafter) |
+| **Strata** (Basalt's parent) | One user on a gaming PC | NVIDIA, AMD, Apple and Intel GPUs, 12 GB of VRAM and up; Windows, Linux, macOS | One request by default | Running on ordinary hardware; apps, APIs, installer |
+| **[colibri](https://github.com/JustVugg/colibri)** | Models far bigger than RAM, on any machine | CPU first; CUDA, Vulkan and Metal tiers | One request | Reach: experts streamed from NVMe, so 284B-1T models still run |
+| **DeepInfer** | DeepSeek's production cluster | SM100 GPUs, Ascend NPUs, 4-64 per deployment | Data and expert parallelism | DeepSeek-V4.1-Flash at data-center scale |
+| **llama.cpp** | General local inference | Almost anything | `--parallel` | Breadth of models and hardware. QuixiInfer uses it offline only, as a reference oracle (tokenizer, golden logits) |
+
+## Performance
 
 **Measured** (RTX 5090, Ryzen 9 9950X, 2 x 64 GB DDR5-5600, win10 VM off; the harness in `perf/`, promoted rows
 in `perf/scoreboard.md`; the figures are the gate runs of 2026-11-19 against the baseline of 2026-11-15, score
@@ -268,11 +78,58 @@ activations for the dense projections and the expert kernels) sit at KL 0.011-0.
 96% top-1 agreement and perplexity +0.1% over 1,023 teacher-forced positions (`tools/logits_compare.py`,
 2026-11-07).
 
+**Against Strata, measured on this machine, same model files and token ids** (2026-11-15,
+one run each, VM off; `perf/optimization_status.md` of that day): QuixiInfer is ahead on prompts and on decode.
+A 16,384-token prompt: 11.7 s (1,392 tok/s) against Strata's 19.2 s (854); 2,048 tokens: 3.1 s against 10.4 s;
+128 tokens: 1.1 s against 4.0 s. The 64 tokens after a prompt: 25-27 tok/s against 16.5-18.9. Steady decode at
+1k context (2026-11-11): 32.4-32.7 tok/s against 27.2. Caveats: QuixiInfer's prompt time covers all but the last
+64 tokens (those run as single steps), and Strata's process was cold while QuixiInfer's kernels were compiled;
+as fresh processes on the 16k prompt it was 1,132-1,158 tok/s against 841-880. Strata has no server, so there is
+no concurrent comparison. Quality, teacher-forced on the same ids against the f32 reference over 1k positions
+(2026-11-07): QuixiInfer's decode path is at KL 0.011-0.020 and 96% top-1 (perplexity +0.1%); Strata's at KL
+0.025-0.046 and 93-94% (perplexity within ±2%). Details in `perf/findings.md`.
+
+## Quick start
+
+Requirements:
+
+- Linux x86-64 with AVX-512 VNNI;
+- an NVIDIA GPU: developed and measured on an RTX 5090 (sm_120); the kernels also build for the RTX 40 series
+  (sm_89) and the RTX 30 series (sm_86), see "Other GPUs" below;
+- CUDA 13 (`nvcc` at `/usr/local/cuda-13.3/bin`, or set `QX_NVCC`);
+- a recent stable Rust;
+- about 128 GB of RAM (the process is about 105 GB with a 95 GiB RAM tier);
+- the pack (282 GB) on an NVMe drive.
+
+**1. Build.**
+
+```sh
+cargo build --release      # target/release/quixiinfer, qx-pack and the check tools
+target/release/quixiinfer --help   # the commands and every flag; loads nothing
+```
+
+**Other GPUs (RTX 40 and 30 series).** The engine reads the card's compute capability at start and compiles its
+kernels for it (the same target CubeCL uses: `sm_120a` on Blackwell, `sm_89` / `sm_86` on Ada / Ampere). The
+expert tier is what is left of VRAM after the dense weights, the context slots and the staging area, so a 24 GB
+card at 256k context holds few experts and serves most from RAM (set `--ctx` and `--slots` to what the card can
+hold; `QX_DS_STAGE_CAP` shrinks the staging area); PCIe 4.0 lands a 9.5 MB expert record in 0.4 ms against 0.2 on
+PCIe 5.0, which moves the best staging share (`QX_DS_STAGE_SHARE_DECODE`) toward the CPU pool.
+`QX_NVCC_ARCHS=sm_86,sm_89,sm_120a cargo build` compiles every kernel for all three at build time (the default
+check is `sm_120a` alone; the check takes about 20 minutes per target the first time). Only the 5090 has been
+run here; the other two are build-checked.
+
+**2. Make the model pack.** Download the six UD-IQ2_XXS shards (`tools/pardl.py` is a parallel, resumable
+downloader), then write and verify the pack:
+
 ```sh
 # the pack from the six GGUF shards (pass the first), once
 target/release/qx-pack pack   DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp
 target/release/qx-pack verify DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf
+```
 
+**3. Serve.**
+
+```sh
 # serve at the full context: the engine is chosen by the GGUF's architecture; cap the memory, the tiers pin most of the RAM
 systemd-run --user --scope -p MemoryMax=112G -p MemorySwapMax=0 -- \
   env CUDA_CACHE_MAXSIZE=4294967296 QX_DS_VRAM=20 QX_DS_RAM=95 QX_DS_PROMOS=32 \
@@ -280,6 +137,7 @@ systemd-run --user --scope -p MemoryMax=112G -p MemorySwapMax=0 -- \
   --pack DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.qxp --ctx 262144 --slots 3 --port 8000 \
   --profile golden/profile-dsv41.txt
 ```
+
 
 That is the benchmarked and production configuration; the process is about 105 GB and is ready about 35 s
 after start. `--profile` ranks the experts the tiers are filled with at start (`golden/profile-dsv41.txt` comes
@@ -292,9 +150,28 @@ the window graphs, and a kernel that would need compiling after the warm-up abor
 failed to load). `CUDA_CACHE_MAXSIZE` raises the driver's JIT cache from its 1 GiB default: the engine's kernel
 modules evict each other from it, and a cold start then spends 10-20 minutes in ptxas.
 
-**As a service, beside something else that needs the RAM.** `tools/quixiinfer-deepseek.service.example` is the
+The server refuses to listen beyond 127.0.0.1 without `--api-key KEY`.
+
+**4. Ask it something.**
+
+```sh
+curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "messages": [{"role": "user", "content": "What is the capital of France? Answer in one sentence."}],
+  "max_tokens": 200, "chat_template_kwargs": {"enable_thinking": false}}'
+```
+
+The endpoints are `/v1/models`, `/v1/chat/completions` and `/v1/completions`, streamed or not, and work with any
+OpenAI client.
+
+- **Completion limit.** Without `max_tokens`, a request may use the rest of its context. The model thinks before
+  it answers, and thinking often takes thousands of tokens.
+- **Thinking.** `chat_template_kwargs: {"enable_thinking": false}` turns it off.
+- **Structured output.** `response_format` (`json_object`, `json_schema`) and the `guided_*` fields (regex,
+  grammar) constrain the output.
+
+**5. Run it as a service.** `tools/quixiinfer-deepseek.service.example` is the
 production unit with the paths made generic. The service's memory cannot be swapped, so a second large tenant
-(here a 16 GiB virtual machine started now and then) would end in an out-of-memory kill. With `QX_DS_RAM_YIELD=12`
+(here a 16 GiB virtual machine started now and then) can end in an out-of-memory kill. With `QX_DS_RAM_YIELD=12`
 the coldest 12 GiB of the RAM tier sit in arenas of their own; while `QX_DS_YIELD_PATH` names a live process
 (the VM's pid file) or the host has under 4 GiB available, the service frees them and reads those records from
 NVMe, and 20 s after the path is gone it pins them again and reads the records back. Replies are the same
@@ -302,7 +179,11 @@ bytes throughout; a benchmark run with the 12 GiB out scores 5.4% slower (decode
 and each hand-over pauses requests for 0.5-1.7 s. Measured with a stand-in for the VM (a pid file, and a 13 GiB
 allocation), not yet with the VM itself; the journal's `ram tier:` lines record each hand-over.
 
-| Setting (DeepSeek) | What it does |
+Stop the service before benchmarking: two engines cannot both hold the GPU and pin the experts.
+
+### Settings
+
+| Setting | What it does |
 |---|---|
 | `QX_DS_CHUNK` | Rows per prompt chunk: 8192 by default at 32k of context and above, off below (prompts run in windows); `0` turns chunks off. |
 | `QX_DS_PREFILL_EXACT=1` | Exact kernels for prompt chunks (bit-identical to single steps), slower. |
@@ -317,99 +198,58 @@ allocation), not yet with the VM itself; the journal's `ram tier:` lines record 
 | `QX_DS_PROMOS` | Expert promotions into VRAM per token (4; the benchmarked configuration uses 32). |
 | `QX_DS_TOPK_KERNEL=1`, `QX_DS_IDX_KERNEL=1`, `QX_MGEMV_ZGROUPS=0` | The previous indexer top-k, scorer and dense-GEMV kernels, for A/B runs. |
 
-### Settings (Qwen engine)
+## How it works
 
-| Setting | What it does |
-|---|---|
-| `--ctx N` | Tokens of context per slot. |
-| `--slots N` | Concurrent sequences. Each slot holds about 0.5 GiB of VRAM at 262k (taken from the expert cache), so more slots make every request slower; 8 is the measured best here. |
-| `--api-key KEY` | Required to listen beyond 127.0.0.1. |
-| `QX_KV_GIB` | Size of the pinned KV page pool. |
-| `QX_PREFIX_GIB` | Size of the prefix cache. |
-| `QX_POOL_CPUS` | CPU expert pool threads: a count or a CPU list. Physical cores are faster than SMT siblings. |
-| `QX_PLE_CACHE_ROWS` | Rows of the PLE n-gram table cached in RAM. |
-| `QX_PREFILL_CHUNK` | Prompt tokens per prefill chunk (default and maximum 2048). |
-| `QX_SPLIT` | Batches of several sequences may run as two interleaved halves. `auto` (the default): from 4 tokens, split or not per batch width, whichever measures faster. `N`: always split from N tokens. `0`: never. |
-| `QX_ROUTE_CACHE=J,M` | Experimental and lossy, off by default. Cache-aware routing: each token keeps its top J experts and fills the rest of its 10 from its top M, preferring experts already in VRAM. Measured at 8 / 16 users against off: `6,16` gives +28% / +80% for +3.0% perplexity; `3,16` gives +48% / +121% for +4.7% ([docs/progress.md](docs/progress.md)). |
-| `QX_HALF_LIFE`, `QX_SWAPS` | The expert swapper's routing-score half-life (tokens) and swaps per token. |
-| `QX_MODEL` | Model path for the tools: a pack or a GGUF. |
-
-## How it works (Qwen engine)
-
-- **Experts.** Every expert sits in pinned RAM (63 GiB for NVFP4). The hottest ones also sit in a VRAM cache, about
-  6,400 of 24,576 in production. A swapper in the CPU driver thread ranks experts by decayed routing frequency and
-  copies hot experts in over cold ones. A prompt's routing seeds it before decoding starts.
-- **One decode step without the host.** The GPU posts each layer's missing experts to a mapped mailbox. The CPU
-  pool (AVX-512 VNNI, bit-equal to the GPU kernels) computes them while the GPU computes the resident ones. Steps
-  are CUDA graphs, and tokens are sampled on the GPU.
-- **Batches.** One sequence's windows of up to 8 tokens, and batch halves of up to 4, use fused matrix-vector
-  kernels with int8 activations. Wider batches use int8 tensor-core kernels (`qx_tmv_q8`). Batches of several
-  sequences run split in two halves, so GPU and CPU work overlap.
-- **Memory.** The KV cache is FP8 E4M3 with a scale per 32 dimensions. It is paged in pinned RAM, and the most
-  recent cells are mirrored in VRAM. The prompt buffers are borrowed from the expert cache's tail during prefill.
-  The PLE n-gram table is read from the SSD with io_uring and O_DIRECT, behind a RAM row cache.
+- **Three expert tiers.** Each of the 15,360 routed-expert records is in VRAM, in pinned RAM or only on NVMe. A
+  driver thread ranks experts by decayed routing frequency and promotes hot records over cold ones, NVMe to RAM
+  and RAM to VRAM; `--profile` seeds the ranking at start.
+- **One decode step.** The GPU posts each layer's experts that are not in VRAM to a mapped mailbox. A share of
+  those in RAM is copied into a VRAM staging area by DMA; the CPU pool (AVX-512 VNNI) computes the rest from
+  pinned memory; records on NVMe are read with io_uring and O_DIRECT into pinned landing places first. Steps and
+  windows are CUDA graphs.
+- **Prompts.** Long prompts run in chunks of up to 8,192 rows, layer by layer, each needed expert streamed once
+  per layer into tensor-core kernels; the chunk's buffers borrow the tail of the VRAM expert arena for the
+  prompt's duration.
+- **Scheduling.** Requests occupy sequence slots; a new request takes the slot that shares the longest prefix
+  with its prompt and continues from there. A lone decoder speculates (drafts verified in the same step).
 
 ## What is in the repository
 
 | Crate | Contents |
 |---|---|
 | `qx-gpu` | CubeCL runtime glue and device memory. Its build script flattens `kernels/*.cu` and checks them with nvcc; at run time each module is also checked once with NVRTC, so a kernel that fails to compile fails loudly. |
-| `qx-engine` | The engine: the forward pass, the expert cache and its swapper, sequence slots and batched decode, chunked prefill, paged FP8 KV, the prefix cache, speculation and the PLE reader. Also the check and bench binaries. |
-| `qx-cpu` | The CPU expert pool: AVX-512 VNNI kernels for NVFP4, IQ2_S, IQ3_S and IQ4_NL, each bit-equal to its GPU kernel. |
+| `qx-engine` | The engine (`dsv41/`): the forward pass, the expert tiers and their driver thread, sequence slots, windows and prompt chunks, rewind and park. Also the check and bench binaries. |
+| `qx-cpu` | The CPU expert pool: AVX-512 VNNI kernels. |
 | `qx-quant`, `qx-pack` | Dequantizers, the GGUF reader, and the pack writer and verifier. |
-| `qx-ref` | The f32 CPU reference of the whole model, which the engine is checked against. |
+| `qx-ref` | The f32 CPU reference, which the engine is checked against. |
 | `qx-tok` | The tokenizer, which matches llama.cpp token for token. |
 | `qx-serve` | The OpenAI-compatible server and its continuous-batching scheduler. |
 
 `kernels/` holds the CUDA sources. `tools/` holds:
 
-- `loadgen.py`: concurrent load at c=1/4/8/16;
-- `longprompt.py`;
+- `loadgen.py`: concurrent load;
+- `longprompt.py`: one long prompt through the API, with time to first token;
 - `pardl.py`;
-- `golden/`: llama.cpp golden logits;
-- `ds-checks.sh`, `capped.sh`: the DeepSeek engine's regression checks, and a memory-capped scope to run heavy jobs in;
-- `quixiinfer-deepseek.service.example`: the DeepSeek production unit with generic paths;
+- `ds-checks.sh`, `capped.sh`: the engine's regression checks, and a memory-capped scope to run heavy jobs in;
+- `quixiinfer-deepseek.service.example`: the production unit with generic paths;
 - `logits_compare.py`: teacher-forced top-1, KL and perplexity between runs (logits dumps or Strata score rows).
 
-`perf/` is the measurement harness for the DeepSeek engine: `harness/bench.sh` (the standard cases, three repeats,
-spreads, a correctness gate), `perf_diff.py` (gate against the promoted baseline, promote, score), the scoreboard,
-the notebook of every experiment (`optimization_status.md`), `findings.md` (what is known and what was rejected),
-`presuppositions.md` (the assumptions tested so far) and `backlog.md`.
+`perf/` is the measurement harness: `harness/bench.sh` (the standard cases, a correctness gate), `perf_diff.py`
+(gate against the promoted baseline, promote, score), the scoreboard, the notebook of every experiment
+(`optimization_status.md`), `findings.md` (what is known and what was rejected), `presuppositions.md` (the
+assumptions tested so far) and `backlog.md`.
 
 ## Checks
 
-Each tool loads the model and checks one property:
-
 | Tool | What it checks |
 |---|---|
-| `qx-check` | Engine logits against the f32 reference, per position and per activation. Needs a GGUF. |
-| `qx-invariance` | Two expert-cache sizes (different experts on the GPU and the CPU) give bit-identical logits. |
-| `qx-window-check` | Multi-token windows equal one-token steps, bit for bit. |
-| `qx-batch-check` | Slots decoded in mixed and split batches equal each slot decoded alone. |
-| `qx-prefix-check` | A restored prefix continues exactly as an uninterrupted run. |
-| `qx-spec-check` | Speculative decoding gives exactly the plain-decoding tokens, greedy and sampled. |
-| `qx-prefill-check` | Batched prefill agrees with token-by-token decode. |
-| `qx-gen-check` | The production generation paths produce the eager forward pass's tokens; "The capital of France is" must give " Paris". |
-| `qx-nvfp4-check` | The GPU and CPU NVFP4 expert kernels agree bit for bit on random records. |
-| `qx-ppl` | Next-token NLL, expert hit rate, and KL and top-1 agreement against a saved run: the quality gate for lossy modes such as `QX_ROUTE_CACHE`. |
-| `qx-batch-bench` | Decode throughput at several batch sizes, with the CPU pool's share of each step. |
-| `qx-ds-check` (`tools/ds-checks.sh`) | The DeepSeek engine, nine checks: the f32 mode against the CPU reference (exact), the production numerics against it (KL, top-1), windows of 3, 8 and 64 against one-token steps (bit-identical, also with the tiers adapting), the tokenizer against llama.cpp, rewind and park/unpark against the straight pass, windows over several sequences, rewinds by a replay chunk and from checkpoints (all bit-identical). It also saves and resumes 256k states and dumps logits for `tools/logits_compare.py`. |
+| `qx-ds-check` (`tools/ds-checks.sh`) | Nine checks: the f32 mode against the CPU reference (exact), the production numerics against it (KL, top-1), windows of 3, 8 and 64 against one-token steps (bit-identical, also with the tiers adapting), the tokenizer against llama.cpp, rewind and park/unpark against the straight pass, windows over several sequences, rewinds by a replay chunk and from checkpoints (all bit-identical). It also saves and resumes 256k states and dumps logits for `tools/logits_compare.py`. |
 | `qx-tier-check` | The expert store: RAM places and NVMe reads against the source GGUF byte for byte; with `QX_TIER_ELASTIC=G`, every record through churn, release and restore of the elastic part. |
 | `qx-ds-replay` | Replays a recorded scheduler trace as single steps and compares every row's hash (the exactness check for speculation and scheduling changes). |
 
-**Parity checks are not enough on their own.** The first NVFP4 GGUF passed every one of them while producing
-nonsense: the converter had dropped the PLE table's scale, so the reference, the engine and llama.cpp all agreed
-on a broken file. Before benchmarking a new model file, also check:
-
-- the golden logits' next-token accuracy on their own text;
-- a few tensors of each kind against the original checkpoint;
-- a question with a known answer, asked through the server.
-
 ## License
 
-MIT ([LICENSE](LICENSE)). The models keep their own licenses: Qwen3.8-Flash-Next under the
-[Qwen Community License](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), DeepSeek-V4.1-Flash under
-DeepSeek's model license. `third_party/cubecl-cuda` is a patched copy of the cubecl-cuda crate under its own license
-(MIT/Apache-2.0). QuixiInfer learns from DeepInfer, Strata, Basalt, colibri, Big-MoE-Small-Box and llama.cpp (see
-[docs/kernel-references.md](docs/kernel-references.md)), but it contains no code from them. The IQ lookup grids are
-ggml's data tables.
+MIT ([LICENSE](LICENSE)). The model keeps its own license (DeepSeek's model license). `third_party/cubecl-cuda` is
+a patched copy of the cubecl-cuda crate under its own license (MIT/Apache-2.0). QuixiInfer learns from DeepInfer,
+Strata, Basalt, colibri, Big-MoE-Small-Box and llama.cpp (see [docs/kernel-references.md](docs/kernel-references.md)),
+but it contains no code from them. The IQ lookup grids are ggml's data tables.
