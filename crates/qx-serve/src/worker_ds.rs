@@ -117,11 +117,27 @@ struct Req<'a> {
     refeed: Vec<u32>,
     drafts: Vec<u32>,
     srow: Option<usize>,
-    spec_k: usize,
-    spec_cool: usize,
-    /// The share of this request's drafts accepted, lately (0.7 of the old value and 0.3 of the last step's).
-    spec_rate: f32,
+    /// Per kind of draft (the slot's own history or the corpus of other replies, and an agreement under 16 tokens
+    /// or of 16 and more: 0 own short, 1 own long, 2 corpus short, 3 corpus long): the draft length to try, the
+    /// steps to sit out, what the kind's drafts have been worth lately and how often in a row that fell under
+    /// zero. Structure (a list's keys) agrees shortly and fails at the values; a list with other keys agrees long
+    /// and fails at each key; a copy agrees long and holds: each kind stands on its own record. `spec_src`: the
+    /// kind of the last step's drafts.
+    spec: [SpecSrc; 4],
+    spec_src: usize,
 }
+
+/// One source's standing with a request. `gain` is in draft rows: a step's accepted tokens count 2 each (a token
+/// costs a step, a draft row about half of one; beside other decoders 1.33), its draft rows and the token fed
+/// again after a rejection 1 each; 0.7 of the old value and 0.3 of the last step's.
+#[derive(Clone, Copy)]
+struct SpecSrc {
+    k: usize,
+    cool: usize,
+    gain: f32,
+    trips: u32,
+}
+const SPEC_NEW: SpecSrc = SpecSrc { k: 2, cool: 0, gain: 1.0, trips: 0 };
 
 /// Drafts by suffix: the place in `seq` whose preceding tokens agree with the end of `suf` over the most tokens
 /// (at least `n`, at most 24 counted; the latest such place on a tie), and the up to `k` tokens that follow it
@@ -334,9 +350,11 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         let spec_n_corpus: usize = std::env::var("QX_DS_SPEC_N_CORPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let mut corpus: Vec<u32> = Vec::new();
         let mut spec_corpus_steps = 0usize;
+        let mut spec_trips = 0usize;
         let mut n_dec = 0usize;
         let mut spec_sat_out = 0usize;
-        // (QX_DS_SPEC_COOL: steps a request sits out after a step with no draft accepted, default 8)
+        // (QX_DS_SPEC_COOL: steps a source sits out after a step with no draft accepted, and the first time its
+        // drafts have cost more than they gave, default 8; twice as long each time in a row, 256 at most)
         let spec_cool: usize = std::env::var("QX_DS_SPEC_COOL").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let admit_window: usize = std::env::var("QX_DS_ADMIT_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
         let (mut front_skips, mut admit_reordered) = (0usize, 0usize);
@@ -467,7 +485,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     eng.reset(slot);
                 }
                 let job_think = job.grammar_after_think;
-                running.push(Req { job, slot, detok: Detok { tok, ids: Vec::new(), sent: 0 }, text: String::new(), n: 0, t0: t_admit, t_prompt: None, finish: None, in_think: job_think && matcher.is_some(), matcher, read: reuse, reused: reuse, next: None, logits: None, refeed: Vec::new(), drafts: Vec::new(), srow: None, spec_k: 2, spec_cool: 0, spec_rate: 1.0 });
+                running.push(Req { job, slot, detok: Detok { tok, ids: Vec::new(), sent: 0 }, text: String::new(), n: 0, t0: t_admit, t_prompt: None, finish: None, in_think: job_think && matcher.is_some(), matcher, read: reuse, reused: reuse, next: None, logits: None, refeed: Vec::new(), drafts: Vec::new(), srow: None, spec: [SPEC_NEW; 4], spec_src: 0 });
             }
             if running.is_empty() {
                 continue;
@@ -596,9 +614,10 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     if out_now[ri] {
                         continue;
                     }
-                    if r.spec_cool > 0 {
-                        r.spec_cool -= 1;
-                        continue;
+                    // (each kind sits its own steps out)
+                    let ready = [r.spec[0].cool == 0, r.spec[1].cool == 0, r.spec[2].cool == 0, r.spec[3].cool == 0];
+                    for sp in r.spec.iter_mut() {
+                        sp.cool = sp.cool.saturating_sub(1);
                     }
                     let pos = eng.pos(r.slot);
                     // (not under a constraint: its mask follows the samples one by one; not before the rings
@@ -614,16 +633,22 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     let mut suf = hist[hist.len().saturating_sub(23)..].to_vec();
                     suf.push(id);
                     let n = if n_dec > 1 { spec_n_multi } else { spec_n };
-                    let kk = r.spec_k.min(if n_dec > 1 { spec_max_multi } else { spec_max }).min(left);
-                    // its own slot's history, or the finished replies of every request where they agree longer
-                    let (m_own, own) = suffix_draft(&hist, &suf, n, kk);
-                    let (m_corp, corp) = if corpus.is_empty() { (0, Vec::new()) } else { suffix_draft(&corpus, &suf, n.max(spec_n_corpus), kk) };
-                    wanted[ri] = if m_corp > m_own && !corp.is_empty() {
+                    let cap = (if n_dec > 1 { spec_max_multi } else { spec_max }).min(left);
+                    // its own slot's history, or the finished replies of every request where they agree longer;
+                    // a short agreement earns a short draft (half the agreed length), a long one its kind's length
+                    let (m_own, own) = suffix_draft(&hist, &suf, n, cap);
+                    let (m_corp, corp) = if corpus.is_empty() { (0, Vec::new()) } else { suffix_draft(&corpus, &suf, n.max(spec_n_corpus), cap) };
+                    let kind = |src: usize, m: usize| 2 * src + (m >= 16) as usize;
+                    let (ko, kc) = (kind(0, m_own), kind(1, m_corp));
+                    let own_ok = !own.is_empty() && ready[ko];
+                    let corp_ok = !corp.is_empty() && ready[kc];
+                    let (kd, m, mut d) = if corp_ok && (m_corp > m_own || !own_ok) { (kc, m_corp, corp) } else if own_ok { (ko, m_own, own) } else { continue };
+                    d.truncate(r.spec[kd].k.min(if m < 16 { (m / 2).max(1) } else { usize::MAX }));
+                    if kd >= 2 {
                         spec_corpus_steps += 1;
-                        corp
-                    } else {
-                        own
-                    };
+                    }
+                    r.spec_src = kd;
+                    wanted[ri] = d;
                 }
                 let all: usize = wanted.iter().map(|w| w.len()).sum();
                 let mut give = WIDTHS.iter().copied().filter(|&w| w >= base && w <= base + all && w <= DS_TMAX).max().map_or(0, |w| w - base);
@@ -788,20 +813,41 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 }
                 if k > 0 {
                     spec_accepted += accepted;
-                    // (under half accepted lately: a draft row costs about half a step, so it no longer pays;
-                    // the request sits out twice the usual steps and tries again)
-                    r.spec_rate = 0.7 * r.spec_rate + 0.3 * accepted as f32 / k as f32;
-                    if r.spec_rate < if n_dec > 1 { 0.75 } else { 0.5 } {
-                        r.spec_cool = 2 * spec_cool;
-                        r.spec_rate = 0.8;
-                    }
+                    // What the step was worth to its source, in draft rows; a source whose drafts have cost more than
+                    // they gave lately sits out, twice as long each time in a row (QX_DS_SPEC_COOL steps the first,
+                    // 256 at most), and starts again from short drafts. A list of another topic agrees in its
+                    // structure and not in its values: until 2026-11-19 one rate for both sources (under half
+                    // accepted: 16 steps out) let such drafts cost a first-time JSON list 4-5%.
+                    let end = pos_first + accepted;
+                    let fed_again = if accepted < k { end % group } else { 0 };
+                    // (a rejection also costs the rewind and the experts its rows fetched for nothing: counted as two
+                    // rows; with one, a list that agrees long with another and fails at each key still read +3.5%)
+                    let net = (if n_dec > 1 { 1.33 } else { 2.0 }) * accepted as f32 - k as f32 - fed_again as f32 - if accepted < k { 2.0 } else { 0.0 };
+                    let sp = &mut r.spec[r.spec_src];
+                    sp.gain = 0.7 * sp.gain + 0.3 * net;
                     if accepted == k {
-                        r.spec_k = (2 * r.spec_k + 1).min(spec_max);
+                        // (the next length from the one that was accepted, not from one a short agreement cut)
+                        sp.k = sp.k.max((2 * k + 1).min(spec_max));
                     } else {
-                        r.spec_k = accepted.max(1);
+                        sp.k = accepted.max(1);
                         if accepted == 0 {
-                            r.spec_cool = r.spec_cool.max(spec_cool);
+                            sp.cool = sp.cool.max(spec_cool);
                         }
+                    }
+                    // (the doublings are forgotten only by drafts that pay well: a short draft's best is 2, so a kind
+                    // that has cost more than it gave stays mostly out for the request; a copy, of the long kind,
+                    // has its own record and is found again once 16 of its tokens have been written)
+                    if sp.gain > 2.0 {
+                        sp.trips = 0;
+                    }
+                    if sp.gain < 0.0 {
+                        sp.cool = (spec_cool << sp.trips.min(5)).min(256);
+                        sp.trips += 1;
+                        sp.gain = 0.5;
+                        sp.k = 2;
+                        spec_trips += 1;
+                    }
+                    if accepted < k {
                         if r.finish.is_none() {
                             // the slot ran the rejected drafts: back to the group boundary under the accepted
                             // tokens' end, and what lies between is fed again with the next sample
@@ -838,7 +884,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 }
             }
             if stats && (steps % 200 == 0 || running.is_empty()) {
-                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}, chunk steps {chunk_steps} ({multi_chunks} of several slots), prefix copies {prefix_copies}, speculation {spec_steps} steps: {spec_accepted} of {spec_drafted} drafts accepted, {spec_refed} tokens fed again, {spec_corpus_steps} steps drafted from other replies ({spec_sat_out} decoders sat a step out), {admit_reordered} admitted out of order", running.len(), waiting.len(), width_hist);
+                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}, chunk steps {chunk_steps} ({multi_chunks} of several slots), prefix copies {prefix_copies}, speculation {spec_steps} steps: {spec_accepted} of {spec_drafted} drafts accepted, {spec_refed} tokens fed again, {spec_corpus_steps} steps drafted from other replies, {spec_trips} sit-outs for drafts that cost more than they gave ({spec_sat_out} decoders sat a step out), {admit_reordered} admitted out of order", running.len(), waiting.len(), width_hist);
                 if acc_steps > 0 {
                     let k = acc_steps as f64 / 1e3;
                     // the wall between forwards is everything outside the engine: host sampling, detokenizing,
