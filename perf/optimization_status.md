@@ -5500,3 +5500,71 @@ text) does not show in 2,048 tokens. The true picks stay (they cost nothing and 
 model asked for); the knob stays opt-in for the reason it was: replies differ run to run.
 
 Raw: `perf/results/2026-11-19/x-corpus-topic/`, `x111-g-1-022731`.
+
+## 2026-11-19: Speculation's standing kept per kind of draft (source x agreement length) — LANDED, default on, not a promotion (a first-time JSON list +3 to +5% -> -0.1 to +1.0%; the corpus on fresh tasks +2.3% -> -0.8%; a list with another reply's values under other keys 0 -> +3 to +4%)
+
+Asked for by the user ("fix the first-time JSON slowdown with per-source acceptance tracking"). Candidate:
+`perf/results/2026-11-19/x-spec-kinds/candidate.diff` (`worker_ds.rs` only; binaries `~/qx-bins/chunk174`,
+quixiinfer f319384fef1b; the engine binary is unchanged, 5bd79a005c2f). VM shut off in every preflight.
+
+Before: one acceptance rate, one draft length and one sit-out a request. Now four kinds of draft, each with its own
+record (`SpecSrc`): the slot's own history or the corpus, and an agreement under 16 tokens or of 16 and more. A
+kind's record is what its steps were worth in draft rows (an accepted token 2, or 1.33 beside other decoders; a
+draft row and the token fed again 1; a rejection 2), 0.7 of the old value and 0.3 of the last step's. Under zero:
+the kind sits out `QX_DS_SPEC_COOL` steps, twice as long each time in a row (256 at most; forgotten only above
+2, which drafts of 2 cannot reach; the code's comment says "a short draft's best is 2", wrong for agreements of
+6-15 tokens, whose drafts are 3-7), and starts again from 2 drafts. A short agreement earns a draft of half its
+length; the next length grows from the one accepted.
+
+Why four and not two (the builds tried, one session each; "off" is speculation off):
+
+| build | first-time JSON, 400 tokens (off 14.97) | first-time JSON, 300 (off 11.95-12.04) | a list with other keys (off 8.92-8.98) | JSON then a file copied, 1,091 tokens (off 41.87) |
+|---|--:|--:|--:|--:|
+| chunk168, before (12.44 and 8.99 are chunk166's, the same counters; X126 def8 on chunk168: 15.66) | 15.42, 15.66 | 12.30, 12.44 | 8.91, 8.99 | 30.01 |
+| chunk169: per source, a rate rule | 15.66 | | | |
+| chunk170: + draft by agreement length, sticky doubling | 15.00 | 12.12, 12.13 | 8.92, 8.94 | 34.18 (the source locked out when the copy began) |
+| chunk171: + a long agreement ends a sit-out | | 12.19 | 9.36 | 29.54 |
+| chunk172: per kind, forgiving doubling | 14.98 | 12.60 | 9.30 | 29.20 |
+| chunk173: per kind, sticky doubling | 14.94 | 12.17 | 9.23 | 29.29 |
+| **chunk174: + a rejection counts 2** | **14.96** | **12.09, 12.16** | 9.24, 9.27 | **29.44** |
+
+On chunk174 against speculation off in the next session (X129 n174 / off174): essay 8.94 / 8.89 s, the essay with
+one more instruction 7.07 / 7.10, JSON list 12.09 / 12.04 (+0.4%), the list with other keys 9.24 / 8.98 (+2.9%),
+essay at temperature 1.3 8.90 / 8.65 (+2.9%), file edit 17.02 / 27.25 (-38%), quotation 8.70 / 12.75 (-32%).
+Asked again (X126 n174): essay 6.35 s, JSON list 6.66 against 6.49 / 6.50 on chunk168 (37 forwards against 35:
++2.6%, the same on chunk172-174).
+The corpus with 11,700 tokens and three fresh tasks (X131): n174b 11.35 + 10.57 + 12.42 = 34.34 s and n174 34.14
+(during one of the two the author launched `quixiinfer serve --help`, which started the default engine and died of
+CUDA out-of-memory within seconds; the journal does not show it and the two sessions agree) against 34.62 with
+the corpus off and 35.41 with it on, both on chunk167 at 02:10-02:24 (the JSON task 10.57 against 10.87 and
+11.45). Not strictly held out: chunk171 read 34.56 before chunk172-174 were built.
+
+What the change costs: a list that agrees long with another reply and fails at each key was at parity before
+(8.91, 8.99 against 8.92-8.98) and reads 9.24, 9.27 now (+2.9 to +3.9%); a sampled essay +2.9 to +4.8% (+0.6 to
++4.2% before). Same-binary repeats differ by 0.1-0.9%, so these are real: drafts of the long corpus kind that the
+record lets through. X129's session totals are flat (71.63 / 72.59 before, 71.96 / 72.22 after); the gains are the
+first-time list (-3.0 to -4.5%), the corpus on fresh tasks (-3.0%) and the list-then-copy (-1.9%).
+
+Exactness: every reply of every session byte-identical to speculation off (X126, X129, X131, X134 on each build);
+a recorded session on chunk174 replayed as single steps (X129 r174-replay): 1,339 forwards, 3,041 rows, 0
+mismatching. Breaker (fresh context, on chunk170): policy only, the rewind and re-feed block unchanged; its two
+policy holes (the doubling never forgotten locks a source out; a kind sitting out was not searched, so a copy
+beginning then went unseen: confirmed by X134, 34.18 s) are what chunk171-174 answer: the long kind has its own
+record and is found once 16 of a copy's tokens are written.
+
+Gate on chunk170 (x110-e-034049): 18.496 against 18.475, identity identical; the serve cases' sessions have 6-7
+speculating steps, so the gate does not see this change.
+
+Identity on chunk174 (X111 h): default identical (serve256k1 34.82, serve256k3 79.87); with the corpus on
+identical (40 steps from other replies, 456 of 456 drafts; serve256k1 19.03, serve256k3 79.81). ds-checks X127 on
+5bd79a005c2f: pass, attached by hand. The gate ran chunk170 (same engine binary); its serve256k1 35.63 prints
+REGRESSION against 32.98, the case's standing level since 11-18 (34.55-37.19). `candidate.diff` sha256
+c41096aca961. Untested: `QX_DS_SPEC_MULTI` above 0 with the new record (the 1.33 weight); no breaker pass on
+chunk171-174.
+
+### Adjudication (fresh context, 2026-11-19): LANDED
+Gate reproduced (18.496); every reply text compared again, all identical; the diff's rewind block only re-nested.
+One reservation: the change moves a ~3% cost from the first-time list to the list with other keys rather than
+removing it. Corrections applied.
+
+Raw: `perf/results/2026-11-19/x-spec-kinds/`, `x110-e-034049`, `x111-h-1-045134`, `x111-h-2-045425`.

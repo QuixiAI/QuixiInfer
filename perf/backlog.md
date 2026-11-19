@@ -9,6 +9,12 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-19, later (speculation's record per kind of draft landed; the DeepSeek service deployed)
+1. The long corpus kind: a list with another reply's values under other keys +3 to +4%, a sampled essay +3 to +5%,
+   a JSON list asked again 6.50 -> 6.66 s. `QX_DS_SPEC_MULTI` above 0 untested with the new record.
+2. Small: the comment "a short draft's best is 2" in `worker_ds.rs` (false for agreements of 6-15 tokens).
+3. A production service holds the GPU (`systemctl --user stop quixiinfer-deepseek` before any benchmark).
+
 ### Queue as of 2026-11-19 (suffix decoding landed, its corpus opt-in; true picks scored under the routing knob)
 1. **Drafts on repetitive structure**: a first-time JSON list reads +4% from its own history and +5% more from a
    corpus of other lists (drafts at half acceptance or less): a stricter rule there (acceptance by source).
