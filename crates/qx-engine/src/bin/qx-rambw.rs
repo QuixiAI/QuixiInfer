@@ -1,6 +1,7 @@
 //! `qx-rambw`: how close the CPU expert pool gets to the RAM's read bandwidth, and which thread layout gets it
 //! there. Allocates the records the way `host_experts` does (anonymous memory with MADV_HUGEPAGE), then measures
-//! a plain AVX-512 streaming read and the pool's NVFP4 decode job for several CPU sets.
+//! a plain streaming read (AVX-512 when the CPU has it, else AVX2, else a scalar loop) and the pool's NVFP4
+//! decode job for several CPU sets.
 use qx_cpu::pool::{Expert, ExpertFmt, Pool};
 use std::arch::x86_64::*;
 
@@ -25,7 +26,7 @@ fn pin(cpu: usize) {
 }
 
 #[target_feature(enable = "avx512f")]
-unsafe fn read_span(p: *const u8, n: usize, prefetch: usize) -> u64 {
+unsafe fn read_span_avx512(p: *const u8, n: usize, prefetch: usize) -> u64 {
     let mut a = _mm512_setzero_si512();
     let mut b = _mm512_setzero_si512();
     let mut o = 0;
@@ -38,6 +39,63 @@ unsafe fn read_span(p: *const u8, n: usize, prefetch: usize) -> u64 {
         o += 128;
     }
     _mm512_reduce_add_epi64(_mm512_add_epi64(a, b)) as u64
+}
+
+/// The same read with 32-byte registers, for a CPU without AVX-512.
+#[target_feature(enable = "avx2")]
+unsafe fn read_span_avx2(p: *const u8, n: usize, prefetch: usize) -> u64 {
+    let mut a = _mm256_setzero_si256();
+    let mut b = _mm256_setzero_si256();
+    let mut o = 0;
+    while o + 64 <= n {
+        if prefetch > 0 {
+            _mm_prefetch::<_MM_HINT_T0>(p.add(o + prefetch) as *const i8);
+        }
+        a = _mm256_xor_si256(a, _mm256_loadu_si256(p.add(o) as *const __m256i));
+        b = _mm256_xor_si256(b, _mm256_loadu_si256(p.add(o + 32) as *const __m256i));
+        o += 64;
+    }
+    let mut t = [0u64; 4];
+    _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, _mm256_xor_si256(a, b));
+    let mut acc = t[0].wrapping_add(t[1]).wrapping_add(t[2]).wrapping_add(t[3]);
+    while o + 8 <= n {
+        acc = acc.wrapping_add((p.add(o) as *const u64).read_unaligned());
+        o += 8;
+    }
+    while o < n {
+        acc = acc.wrapping_add(*p.add(o) as u64);
+        o += 1;
+    }
+    acc
+}
+
+/// The same read without vector code, for very old CPUs.
+unsafe fn read_span_plain(p: *const u8, n: usize, prefetch: usize) -> u64 {
+    let mut acc = 0u64;
+    let mut o = 0;
+    while o + 8 <= n {
+        if prefetch > 0 {
+            _mm_prefetch::<_MM_HINT_T0>(p.add(o + prefetch) as *const i8);
+        }
+        acc = acc.wrapping_add((p.add(o) as *const u64).read_unaligned());
+        o += 8;
+    }
+    while o < n {
+        acc = acc.wrapping_add(*p.add(o) as u64);
+        o += 1;
+    }
+    acc
+}
+
+/// The best read the CPU can do, so the probe does not SIGILL on a machine without AVX-512.
+unsafe fn read_span(p: *const u8, n: usize, prefetch: usize) -> u64 {
+    if is_x86_feature_detected!("avx512f") {
+        read_span_avx512(p, n, prefetch)
+    } else if is_x86_feature_detected!("avx2") {
+        read_span_avx2(p, n, prefetch)
+    } else {
+        read_span_plain(p, n, prefetch)
+    }
 }
 
 /// Threads in `cpus` each stream their share of `bytes`, 2 MiB pieces handed out round-robin; GB/s.

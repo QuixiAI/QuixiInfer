@@ -63,7 +63,71 @@ unsafe fn sum_avx512(p: *const u8, len: usize) -> u64 {
         i += 256;
     }
     let s = _mm512_add_epi64(_mm512_add_epi64(acc[0], acc[1]), _mm512_add_epi64(acc[2], acc[3]));
-    _mm512_reduce_add_epi64(s) as u64
+    let mut total = _mm512_reduce_add_epi64(s) as u64;
+    while i + 8 <= len {
+        total = total.wrapping_add((p.add(i) as *const u64).read_unaligned());
+        i += 8;
+    }
+    while i < len {
+        total = total.wrapping_add(*p.add(i) as u64);
+        i += 1;
+    }
+    total
+}
+
+/// The same sum with 32-byte registers, for a CPU without AVX-512.
+#[target_feature(enable = "avx2")]
+unsafe fn sum_avx2(p: *const u8, len: usize) -> u64 {
+    use std::arch::x86_64::*;
+    let mut acc = [_mm256_setzero_si256(); 4];
+    let mut i = 0;
+    while i + 128 <= len {
+        for (k, a) in acc.iter_mut().enumerate() {
+            let v = _mm256_loadu_si256(p.add(i + 32 * k) as *const __m256i);
+            *a = _mm256_add_epi64(*a, v);
+        }
+        i += 128;
+    }
+    let mut t = [0u64; 16];
+    for (k, a) in acc.iter().enumerate() {
+        _mm256_storeu_si256(t.as_mut_ptr().add(4 * k) as *mut __m256i, *a);
+    }
+    let mut total = t.iter().fold(0u64, |x, &y| x.wrapping_add(y));
+    while i + 8 <= len {
+        total = total.wrapping_add((p.add(i) as *const u64).read_unaligned());
+        i += 8;
+    }
+    while i < len {
+        total = total.wrapping_add(*p.add(i) as u64);
+        i += 1;
+    }
+    total
+}
+
+/// The same sum without vector code, for very old CPUs.
+unsafe fn sum_plain(p: *const u8, len: usize) -> u64 {
+    let mut total = 0u64;
+    let mut i = 0;
+    while i + 8 <= len {
+        total = total.wrapping_add((p.add(i) as *const u64).read_unaligned());
+        i += 8;
+    }
+    while i < len {
+        total = total.wrapping_add(*p.add(i) as u64);
+        i += 1;
+    }
+    total
+}
+
+/// The best sum the CPU can do, so the probe does not SIGILL on a machine without AVX-512.
+unsafe fn sum(p: *const u8, len: usize) -> u64 {
+    if is_x86_feature_detected!("avx512f") {
+        sum_avx512(p, len)
+    } else if is_x86_feature_detected!("avx2") {
+        sum_avx2(p, len)
+    } else {
+        sum_plain(p, len)
+    }
 }
 
 fn ram() -> anyhow::Result<()> {
@@ -100,7 +164,7 @@ fn ram() -> anyhow::Result<()> {
                     let p = buf as usize + i * chunk;
                     s.spawn(move || {
                         pin_to(cpu);
-                        std::hint::black_box(unsafe { sum_avx512(p as *const u8, chunk) });
+                        std::hint::black_box(unsafe { sum(p as *const u8, chunk) });
                     });
                 }
             });
