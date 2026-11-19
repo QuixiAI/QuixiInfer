@@ -1580,7 +1580,7 @@ impl<'a> DsEngine<'a> {
         self.rms(s.xpre_p.ptr, w.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l) as u64;
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale)]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0]);
         if prefetch_k() > 0 && !self.warm {
             // (never from a dry pass: its routing is not a real job's)
             // tell the driver: layer and tokens; the kernel adds a device-side counter so every prediction is
@@ -1605,7 +1605,7 @@ impl<'a> DsEngine<'a> {
         self.rms(s.xpre.ptr, w1.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l + 1) as u64;
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w1.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale)]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w1.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0]);
         if prefetch_k() > 0 && !self.warm && t <= 8 {
             // the prefetch on the cheap predictor: one norm and one router GEMV, a whole expert phase of lead
             if let Some(ab) = self.abufs.as_ref() {
@@ -2823,7 +2823,7 @@ impl<'a> DsEngine<'a> {
                     self.chunk_predict(l, t, r0, pred_buf.as_ref());
                     continue;
                 }
-                self.layer_ffn_pre(l, t, &mut None);
+                self.layer_ffn_pre(l, t, false, &mut None);
                 self.chunk_predict(l, t, r0, pred_buf.as_ref());
                 if trace && l < 8 {
                     self.gpu.sync();
@@ -3454,7 +3454,7 @@ impl<'a> DsEngine<'a> {
             if !self.layer_attn(l, t, pos, last, &mut act, kv_only) {
                 return;
             }
-            self.layer_ffn_pre(l, t, &mut act);
+            self.layer_ffn_pre(l, t, !self.replaying, &mut act);
             let (combine_gpu, cpu_rows, slots_ptr) = self.layer_moe_window(l, t, &mut act);
             self.layer_ffn_post(l, t, combine_gpu, cpu_rows, slots_ptr, self.s.shy.ptr, &mut act);
             if layer_trace_on() && !self.warm {
@@ -3657,7 +3657,8 @@ impl<'a> DsEngine<'a> {
 
     /// Layer `l`'s FFN sublayer up to the routing: the hc terms (into `pre_f`), the norm into `x`, the router
     /// logits and the selections (`ids`, `wts`).
-    fn layer_ffn_pre(&self, l: usize, t: usize, act: &mut Option<&mut dyn FnMut(&str, Vec<f32>)>) {
+    /// `res_ok`: the residency-aware routing may apply (steps and windows outside a replay; never a chunk's slabs).
+    fn layer_ffn_pre(&self, l: usize, t: usize, res_ok: bool, act: &mut Option<&mut dyn FnMut(&str, Vec<f32>)>) {
         let c = &self.cfg;
         let w = &self.layers[l];
         self.hc_terms(&w.hc_ffn, &self.s.pre_f, t);
@@ -3670,7 +3671,18 @@ impl<'a> DsEngine<'a> {
         self.dump(format!("ffn_norm-{l}"), &self.s.x, E, act);
         self.mgt(&w.g_ffn, self.s.x.ptr, E, t, "g_ffn");
         self.dump(format!("ffn_moe_logits-{l}"), &self.s.logits_r, c.n_expert, act);
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[self.s.logits_r.ptr, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, self.s.ids.ptr, self.s.wts.ptr, bits(c.w_scale)]);
+        // QX_DS_ROUTE_RES=m (> 1; lossy, off by default): single steps and windows of at most QX_DS_ROUTE_RES_T
+        // tokens (default 8) prefer the experts the VRAM tier holds: their selection score is p * m + bias
+        // (QX_DS_ROUTE_KEEP=J, default 0: a token's first J picks go by the true score; QX_DS_ROUTE_L0 / _L1:
+        // the layers it applies to, default all)
+        static RES: std::sync::OnceLock<(f32, usize, u64, usize, usize)> = std::sync::OnceLock::new();
+        let ev = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+        let (res_mul, res_t, res_keep, res_l0, res_l1) = *RES.get_or_init(|| (ev("QX_DS_ROUTE_RES", 1.0) as f32, ev("QX_DS_ROUTE_RES_T", 8.0) as usize, ev("QX_DS_ROUTE_KEEP", 0.0) as u64, ev("QX_DS_ROUTE_L0", 0.0) as usize, ev("QX_DS_ROUTE_L1", 1e6) as usize));
+        let res = match &self.abufs {
+            Some(ab) if res_ok && res_mul > 1.0 && t <= res_t && l >= res_l0 && l < res_l1 => [ab.table_dev.ptr, (l * c.n_expert) as u64, bits(res_mul), res_keep],
+            _ => [0, 0, 0, 0],
+        };
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[self.s.logits_r.ptr, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, self.s.ids.ptr, self.s.wts.ptr, bits(c.w_scale), res[0], res[1], res[2], res[3]]);
     }
 
     /// The FFN's dense part for every row of a chunk at once (`QX_DS_CHUNK_GEMM=1`): the router logits (f32) and the
@@ -3705,7 +3717,7 @@ impl<'a> DsEngine<'a> {
         let pk = crate::mailbox::PRED_K;
         self.rms(s.xpre.ptr, w1.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, pk as u64, w1.router_bias.ptr, pb.ptr + (r0 * pk * 4) as u64, s.wts_p.ptr, bits(c.w_scale)]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, pk as u64, w1.router_bias.ptr, pb.ptr + (r0 * pk * 4) as u64, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0]);
     }
 
     fn chunk_ffn_alloc(&mut self, rows_max: usize) {
@@ -3726,7 +3738,7 @@ impl<'a> DsEngine<'a> {
         // (rows `ra` on: the chunk's rows from which this layer runs)
         let ku = (ra * c.n_expert_used * 4) as u64;
         w.g_ffn.run_blas_to(&self.gpu, cb.x.ptr + (ra * E * 4) as u64, rows, &[lg, g, u], x16, w16);
-        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr + ku, cb.wts.ptr + ku, bits(c.w_scale)]);
+        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr + ku, cb.wts.ptr + ku, bits(c.w_scale), 0, 0, 0, 0]);
         self.k("qx_ds_silu_mul_clamp", 256, (((c.ff_exp * rows) as u32).div_ceil(256), 1, 1), &[g, u, h, (c.ff_exp * rows) as u64, bits(c.clamp_shexp[l])]);
         w.g_shd.run_blas_to(&self.gpu, h, rows, &[cb.shy.ptr + (ra * E * 4) as u64], x16, w16);
     }

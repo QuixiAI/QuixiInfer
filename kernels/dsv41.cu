@@ -219,31 +219,40 @@ extern "C" __global__ void qx_ds_engram_gate(const u64* info) {
 /// weights = probs / (sum of the k + 1e-20) * scale. Lane l holds experts l, l+32, ... One block of 32 threads per
 /// token. info: [0] logits (T x n), [1] n (<= 1024), [2] k (<= 32), [3] bias (n), [4] ids out (i32 T x k),
 /// [5] weights out (f32 T x k), [6] scale bits.
+/// Residency-aware routing (lossy, opt-in) when [7] != 0: the selection score of an expert the VRAM tier holds
+/// (table [7] at entry [8] + id, nonzero: resident) is p * [9] (f32 bits, > 1) + bias for the picks after the
+/// first [10], which go by the true score; the weights stay the true probs over the picks.
 extern "C" __global__ void qx_ds_route(const u64* info) {
     const u32 n = U(1), k = U(2), l = threadIdx.x, t = blockIdx.x;
     const float* lg = CF(0) + (u64)t * n;
     const float* bias = CF(3);
     const u32 per = (n + 31) / 32;
-    float p[32], s[32];
+    const u64* table = info[7] ? reinterpret_cast<const u64*>(info[7]) + info[8] : nullptr;
+    const float res_mul = __uint_as_float(U(9));
+    float p[32], s[32], s2[32];
     for (u32 i = 0; i < per; ++i) {
         const u32 e = i * 32 + l;
         if (e < n) {
             const float x = lg[e];
             p[i] = sqrtf(x > 20.f ? x : log1pf(expf(x)));
             s[i] = p[i] + bias[e];
+            s2[i] = table && *reinterpret_cast<const volatile u64*>(&table[e]) != 0 ? p[i] * res_mul + bias[e] : s[i];
         } else {
             p[i] = 0.f;
-            s[i] = -3.402823466e38f;
+            s[i] = s2[i] = -3.402823466e38f;
         }
     }
     float mine = 0.f, tot = 0.f;
     i32 myid = 0;
+    const u32 keep = table ? U(10) : k;
     for (u32 r = 0; r < k; ++r) {
         float bv = -3.402823466e38f;
         i32 bi = 0x7fffffff;
+        // the first `keep` picks by the true score, the rest by the residency-aware one
+        const float* sc = r < keep ? s : s2;
         for (u32 i = 0; i < per; ++i) {
             const i32 e = (i32)(i * 32 + l);
-            if (e < (i32)n && (s[i] > bv || (s[i] == bv && e < bi))) { bv = s[i]; bi = e; }
+            if (e < (i32)n && (sc[i] > bv || (sc[i] == bv && e < bi))) { bv = sc[i]; bi = e; }
         }
         for (int o = 16; o > 0; o >>= 1) {
             const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
@@ -254,7 +263,7 @@ extern "C" __global__ void qx_ds_route(const u64* info) {
         // bi stays at the sentinel only for NaN logits: never index with it
         if (bi != 0x7fffffff && (u32)(bi % 32) == l) {
             pv = p[bi / 32];
-            s[bi / 32] = -3.402823466e38f;
+            s[bi / 32] = s2[bi / 32] = -3.402823466e38f;
         }
         pv = __shfl_sync(0xffffffffu, pv, bi != 0x7fffffff ? bi % 32 : 0);
         if (bi == 0x7fffffff) bi = 0;

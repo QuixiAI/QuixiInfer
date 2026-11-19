@@ -111,6 +111,32 @@ struct Req<'a> {
     next: Option<u32>,
     /// The distribution to sample from (after the step that ran the prompt's last token or a sample).
     logits: Option<Vec<f32>>,
+    /// Prompt-lookup speculation (QX_DS_SPEC): tokens already passed on that the next step feeds again before
+    /// `next` (after a rejected draft the slot is rewound to a group boundary), the drafts the last step fed after
+    /// `next`, the row of `next` in the step's output, the draft length to try, and steps to sit out.
+    refeed: Vec<u32>,
+    drafts: Vec<u32>,
+    srow: Option<usize>,
+    spec_k: usize,
+    spec_cool: usize,
+    /// The share of this request's drafts accepted, lately (0.7 of the old value and 0.3 of the last step's).
+    spec_rate: f32,
+}
+
+/// The continuation of the most recent earlier occurrence of the sequence's last `n` tokens (`hist` then `next`),
+/// at most `k` tokens, all of them known; empty when there is none.
+fn lookup_draft(hist: &[u32], next: u32, n: usize, k: usize) -> Vec<u32> {
+    if n < 2 || k == 0 || hist.len() < n {
+        return Vec::new();
+    }
+    let suf = &hist[hist.len() - (n - 1)..];
+    // e: the index in `hist` of an earlier copy of `next` whose n - 1 predecessors match too
+    for e in (n - 1..hist.len() - 1).rev() {
+        if hist[e] == next && hist[e + 1 - n..e] == *suf {
+            return hist[e + 1..hist.len().min(e + 1 + k)].to_vec();
+        }
+    }
+    Vec::new()
 }
 
 impl Req<'_> {
@@ -263,6 +289,26 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         let mut post_t = std::time::Instant::now();
         let stats = std::env::var("QX_SCHED_STATS").is_ok();
         let group = eng.cfg.ratio.iter().copied().max().unwrap_or(1).max(1) as usize;
+        // Prompt-lookup speculation (QX_DS_SPEC=K, the most drafts per request and step, default 15; 0: off): a
+        // decoder whose last QX_DS_SPEC_N tokens (default 4) occurred before in its slot feeds what followed them
+        // after its sample, and the step's rows are sampled in turn while the samples equal the drafts. Exact: a
+        // window's rows are those of single steps, and after a rejected draft the slot is rewound (free: the
+        // rings hold it) to the group boundary below and the tokens from there are fed again.
+        let spec_max: usize = std::env::var("QX_DS_SPEC").ok().and_then(|v| v.parse().ok()).unwrap_or(15).min(DS_TMAX / 2);
+        let spec_n: usize = std::env::var("QX_DS_SPEC_N").ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(2);
+        // Beside other decoders a draft row costs about three quarters of a token's share of the step, not half:
+        // the match must be QX_DS_SPEC_N_MULTI tokens long (default 8) and three quarters of the drafts accepted.
+        let spec_n_multi: usize = std::env::var("QX_DS_SPEC_N_MULTI").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(2);
+        // (and at most QX_DS_SPEC_MULTI drafts, default 0, none: the other decoders get one token from the step however
+        // wide it is. Measured 2026-11-18 with 3: a file edit beside an essay 30.9 -> 25.4 s, the essay 23.2 -> 29.4 s)
+        let spec_max_multi: usize = std::env::var("QX_DS_SPEC_MULTI").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(spec_max);
+        let mut n_dec = 0usize;
+        let mut spec_sat_out = 0usize;
+        // (QX_DS_SPEC_COOL: steps a request sits out after a step with no draft accepted, default 8)
+        let spec_cool: usize = std::env::var("QX_DS_SPEC_COOL").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let admit_window: usize = std::env::var("QX_DS_ADMIT_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let (mut front_skips, mut admit_reordered) = (0usize, 0usize);
+        let (mut spec_steps, mut spec_drafted, mut spec_accepted, mut spec_refed) = (0usize, 0usize, 0usize, 0usize);
         let mut last_save: Option<std::time::Instant> = None;
         let mut free: Vec<usize> = (0..eng.slots).rev().collect();
         let mut waiting: std::collections::VecDeque<Job> = Default::default();
@@ -288,7 +334,28 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             }
             // admit: a free slot each, the one sharing the longest prefix with the prompt when there is one
             while !free.is_empty() {
-                let Some(job) = waiting.pop_front() else { break };
+                // Among the first QX_DS_ADMIT_WINDOW waiting requests (default 4; 1: arrival order), the one that
+                // shares the longest prefix (256+ tokens) with a free slot goes first: its prompt work is saved
+                // before another request resets that slot. The front request is passed over three times at most.
+                let mut wi = 0;
+                if prefix_on && admit_window > 1 && waiting.len() > 1 && front_skips < 3 {
+                    let mut best = 255;
+                    for (i, j) in waiting.iter().enumerate().take(admit_window) {
+                        // (what the admission below would reuse: a prefix the rings reach, or a deep one)
+                        let l = free.iter().map(|&sl| {
+                            let mut l = eng.tokens(sl).iter().zip(&j.prompt).take_while(|(a, b)| a == b).count().min(j.prompt.len().saturating_sub(1));
+                            l -= l % group;
+                            if l >= 256 && eng.rewind_fast(sl, l) { l } else if l >= rewind_deep_min { l.saturating_sub(replay_cost) } else { 0 }
+                        }).max().unwrap_or(0);
+                        if l > best {
+                            best = l;
+                            wi = i;
+                        }
+                    }
+                }
+                front_skips = if wi == 0 { 0 } else { front_skips + 1 };
+                admit_reordered += (wi != 0) as usize;
+                let Some(job) = waiting.remove(wi) else { break };
                 if job.prompt.is_empty() || job.prompt.len() + 1 >= opt.max_ctx {
                     let _ = job.events.send(Event::Error(format!("prompt of {} tokens does not fit the {}-token context", job.prompt.len(), opt.max_ctx)));
                     continue;
@@ -368,7 +435,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     eng.reset(slot);
                 }
                 let job_think = job.grammar_after_think;
-                running.push(Req { job, slot, detok: Detok { tok, ids: Vec::new(), sent: 0 }, text: String::new(), n: 0, t0: t_admit, t_prompt: None, finish: None, in_think: job_think && matcher.is_some(), matcher, read: reuse, reused: reuse, next: None, logits: None });
+                running.push(Req { job, slot, detok: Detok { tok, ids: Vec::new(), sent: 0 }, text: String::new(), n: 0, t0: t_admit, t_prompt: None, finish: None, in_think: job_think && matcher.is_some(), matcher, read: reuse, reused: reuse, next: None, logits: None, refeed: Vec::new(), drafts: Vec::new(), srow: None, spec_k: 2, spec_cool: 0, spec_rate: 1.0 });
             }
             if running.is_empty() {
                 continue;
@@ -470,10 +537,73 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             if !chunked {
             // the window: decoders first (one token each), then prompt tokens up to the largest width of WIDTHS
             // the prompts can fill (at most `window` per prompt)
-            for (ri, r) in running.iter().enumerate() {
+            // (with speculation: the tokens to feed again, the sample, then the drafts; drafts only in a step
+            // without prompt tokens, and as many as bring the step to a width of WIDTHS)
+            let prompt_rows = running.iter().any(|r| r.next.is_none() && r.read < r.job.prompt.len());
+            // (tokens fed again can bring the decoders' rows to a width the server never loaded, 5 or 7: decoders
+            // with such tokens then sit this step out, last first, until the rows are a width of WIDTHS)
+            let mut out_now: Vec<bool> = vec![false; running.len()];
+            let mut base: usize = running.iter().filter(|r| r.next.is_some()).map(|r| r.refeed.len() + 1).sum();
+            if running.iter().any(|r| r.next.is_some() && !r.refeed.is_empty()) {
+                for ri in (0..running.len()).rev() {
+                    if WIDTHS.contains(&base) {
+                        break;
+                    }
+                    if running[ri].next.is_some() && !running[ri].refeed.is_empty() {
+                        out_now[ri] = true;
+                        base -= running[ri].refeed.len() + 1;
+                        spec_sat_out += 1;
+                    }
+                }
+            }
+            let mut wanted: Vec<Vec<u32>> = vec![Vec::new(); running.len()];
+            n_dec = running.iter().filter(|r| r.next.is_some()).count();
+            if spec_max > 0 && !prompt_rows {
+                for (ri, r) in running.iter_mut().enumerate() {
+                    let Some(id) = r.next else { continue };
+                    if out_now[ri] {
+                        continue;
+                    }
+                    if r.spec_cool > 0 {
+                        r.spec_cool -= 1;
+                        continue;
+                    }
+                    let pos = eng.pos(r.slot);
+                    // (not under a constraint: its mask follows the samples one by one; not before the rings
+                    // can take the rewind; not where a rewind would cross the prompt's end and its checkpoint;
+                    // not past the request's or the context's end)
+                    let left = r.job.max_tokens.saturating_sub(r.n + 1).min(opt.max_ctx.saturating_sub(pos + r.refeed.len() + 3));
+                    if r.matcher.is_some() || pos < r.job.prompt.len() + group || left == 0 || !eng.rewind_fast(r.slot, pos - pos % group) {
+                        continue;
+                    }
+                    let mut hist = eng.tokens(r.slot).to_vec();
+                    hist.extend(&r.refeed);
+                    wanted[ri] = lookup_draft(&hist, id, if n_dec > 1 { spec_n_multi } else { spec_n }, r.spec_k.min(if n_dec > 1 { spec_max_multi } else { spec_max }).min(left));
+                }
+                let all: usize = wanted.iter().map(|w| w.len()).sum();
+                let mut give = WIDTHS.iter().copied().filter(|&w| w >= base && w <= base + all && w <= DS_TMAX).max().map_or(0, |w| w - base);
+                for w in wanted.iter_mut() {
+                    w.truncate(give);
+                    give -= w.len();
+                }
+            }
+            for (ri, r) in running.iter_mut().enumerate() {
+                if out_now[ri] {
+                    continue;
+                }
                 if let Some(id) = r.next {
+                    r.srow = Some(segs.len() + r.refeed.len());
+                    segs.extend(r.refeed.iter().map(|&t| (r.slot, t)));
                     segs.push((r.slot, id));
-                    plan.push((ri, 1, true));
+                    r.drafts = std::mem::take(&mut wanted[ri]);
+                    segs.extend(r.drafts.iter().map(|&t| (r.slot, t)));
+                    plan.push((ri, r.refeed.len() + 1 + r.drafts.len(), true));
+                    spec_refed += r.refeed.len();
+                    if !r.drafts.is_empty() {
+                        spec_steps += 1;
+                        spec_drafted += r.drafts.len();
+                    }
+                    r.refeed.clear();
                 }
             }
             let d = segs.len();
@@ -540,7 +670,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                         prompt_done = true;
                     }
                 }
-                if samples {
+                if samples && r.srow.is_none() {
                     r.logits = Some(out[(row + n - 1) * n_vocab..(row + n) * n_vocab].to_vec());
                 }
                 row += n;
@@ -552,8 +682,21 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             }
             // sample for every request with a distribution
             for r in running.iter_mut() {
-                let Some(mut logits) = r.logits.take() else { continue };
-                let pos = eng.pos(r.slot);
+                // a decoder's rows: its sample's, then one per draft, read while the samples equal the drafts
+                let srow = r.srow.take();
+                if srow.is_none() && r.logits.is_none() {
+                    continue;
+                }
+                let drafts = std::mem::take(&mut r.drafts);
+                let k = drafts.len();
+                let pos_first = eng.pos(r.slot) - k;
+                let mut accepted = 0usize;
+                for i in 0..=k {
+                let mut logits = match srow {
+                    Some(b) => out[(b + i) * n_vocab..(b + i + 1) * n_vocab].to_vec(),
+                    None => r.logits.take().unwrap(),
+                };
+                let pos = pos_first + i;
                 if pos == r.job.prompt.len() && pos >= 256 {
                     // the prompt's end: the rings kept, so the next turn's rewind to here is free however long
                     // the reply (a client that drops the reasoning from the history shares exactly this prefix)
@@ -565,7 +708,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                         Err(e) => {
                             let _ = r.job.events.send(Event::Error(format!("grammar: {e}")));
                             r.finish = Some("error");
-                            continue;
+                            break;
                         }
                     }
                 }
@@ -576,7 +719,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                         if let Err(e) = m.consume_token(id) {
                             let _ = r.job.events.send(Event::Error(format!("grammar: {e}")));
                             r.finish = Some("error");
-                            continue;
+                            break;
                         }
                     }
                 }
@@ -584,11 +727,44 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 if r.in_think && r.text.contains("</think>") {
                     r.in_think = false;
                 }
-                if live {
-                    if r.matcher.as_ref().is_some_and(|m| m.is_stopped()) {
-                        r.finish = Some("stop");
+                if !live {
+                    break;
+                }
+                if r.matcher.as_ref().is_some_and(|m| m.is_stopped()) {
+                    r.finish = Some("stop");
+                    break;
+                }
+                if i < k && id == drafts[i] {
+                    accepted += 1;
+                    continue;
+                }
+                r.next = Some(id);
+                break;
+                }
+                if k > 0 {
+                    spec_accepted += accepted;
+                    // (under half accepted lately: a draft row costs about half a step, so it no longer pays;
+                    // the request sits out twice the usual steps and tries again)
+                    r.spec_rate = 0.7 * r.spec_rate + 0.3 * accepted as f32 / k as f32;
+                    if r.spec_rate < if n_dec > 1 { 0.75 } else { 0.5 } {
+                        r.spec_cool = 2 * spec_cool;
+                        r.spec_rate = 0.8;
+                    }
+                    if accepted == k {
+                        r.spec_k = (2 * r.spec_k + 1).min(spec_max);
                     } else {
-                        r.next = Some(id);
+                        r.spec_k = accepted.max(1);
+                        if accepted == 0 {
+                            r.spec_cool = r.spec_cool.max(spec_cool);
+                        }
+                        if r.finish.is_none() {
+                            // the slot ran the rejected drafts: back to the group boundary under the accepted
+                            // tokens' end, and what lies between is fed again with the next sample
+                            let end = pos_first + accepted;
+                            let g = end - end % group;
+                            r.refeed = eng.tokens(r.slot)[g..end].to_vec();
+                            eng.rewind(r.slot, g);
+                        }
                     }
                 }
             }
@@ -604,7 +780,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 }
             }
             if stats && (steps % 200 == 0 || running.is_empty()) {
-                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}, chunk steps {chunk_steps} ({multi_chunks} of several slots), prefix copies {prefix_copies}", running.len(), waiting.len(), width_hist);
+                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}, chunk steps {chunk_steps} ({multi_chunks} of several slots), prefix copies {prefix_copies}, speculation {spec_steps} steps: {spec_accepted} of {spec_drafted} drafts accepted, {spec_refed} tokens fed again ({spec_sat_out} decoders sat a step out), {admit_reordered} admitted out of order", running.len(), waiting.len(), width_hist);
                 if acc_steps > 0 {
                     let k = acc_steps as f64 / 1e3;
                     // the wall between forwards is everything outside the engine: host sampling, detokenizing,
