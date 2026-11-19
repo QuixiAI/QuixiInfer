@@ -2,6 +2,14 @@
 
 
 
+## Resume 2026-11-19, later: the DeepSeek engine is deployed as a service; speculation's record kept per kind of draft
+- **Production**: `systemctl --user status quixiinfer-deepseek` (unit in `~/.config/systemd/user/`, binary
+  `~/qx-prod/bin/quixiinfer` from 182c58f, key in `~/qx-prod/api-key.env`, `0.0.0.0:8000`, 256k context, 3 slots,
+  linger on). It holds the GPU: `systemctl --user stop quixiinfer-deepseek` before any benchmark or chain, start it
+  after. The system unit `quixiinfer.service` (Qwen, same port, enabled at boot) conflicts with it and needs sudo.
+- Speculation: four kinds of draft with their own record (`SpecSrc`); a first-time JSON list at parity; a list with
+  another reply's values under other keys +3 to +4% (backlog).
+
 ## Resume 2026-11-19: suffix decoding landed (own history by longest agreement; the corpus of other replies opt-in); the tier scores the true picks under the routing knob
 - The corpus of other requests' replies is on by default since X131 (`QX_DS_SPEC_CORPUS`, 262,144 tokens; 0: off;
   a repeated essay 10.75 -> 6.35 s, three fresh tasks +2.3% with 11.7k tokens in it). Binaries `~/qx-bins/chunk168`. `bench.sh` starts
