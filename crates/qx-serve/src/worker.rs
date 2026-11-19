@@ -24,6 +24,18 @@ pub struct Job {
     pub sampling: Sampling,
     pub stop: Vec<String>,
     pub events: tokio::sync::mpsc::UnboundedSender<Event>,
+    /// The prompt's images (DeepSeek): each spans `n` positions of `prompt` from `at` (placeholders until the
+    /// engine thread gives them their ids).
+    pub images: Vec<JobImage>,
+}
+
+pub struct JobImage {
+    pub at: usize,
+    pub n: usize,
+    /// Of the image's content: the same image in another request shares its rows.
+    pub key: u64,
+    /// The block from the vision tower: `n` rows of the model's embedding width.
+    pub rows: std::sync::Arc<Vec<f32>>,
 }
 
 pub enum Event {

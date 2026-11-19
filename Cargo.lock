@@ -4688,6 +4688,8 @@ dependencies = [
  "qx-gpu",
  "qx-pack",
  "qx-tok",
+ "qx-vision",
+ "rayon",
  "serde",
  "serde_json",
  "tokio",

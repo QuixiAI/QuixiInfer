@@ -28,6 +28,158 @@ struct App {
     max_ctx: usize,
     /// The model id the API reports: the GGUF's `general.name`.
     model_id: String,
+    /// The vision tower (`--mmproj`), the id of the chat template's image placeholder token, the blocks of the
+    /// last few images (by the hash of their bytes), and the lock that lets one image be encoded at a time.
+    vision: Option<Arc<qx_vision::Vision>>,
+    image_tok: Option<u32>,
+    vis_cache: Mutex<Vec<(u64, Arc<Vec<f32>>)>>,
+    vis_lock: tokio::sync::Mutex<()>,
+    /// The vision tower's own threads: free to run on every CPU the process may use (the engine pins its threads,
+    /// and a thread started from a pinned one inherits its one CPU: the tower then took 14 s where it takes 2).
+    vis_pool: Option<Arc<rayon::ThreadPool>>,
+}
+
+/// The chat template's image placeholder (one token).
+const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
+
+/// Standard base64 (padding and whitespace tolerated).
+fn base64_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => return Err("invalid base64 in an image".into()),
+        };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// The bytes of one image part: an OpenAI `image_url` (a `data:` URL) or an Anthropic `image` (`source.data`).
+fn image_bytes(part: &Value) -> std::result::Result<Vec<u8>, String> {
+    let url = part.pointer("/image_url/url").or_else(|| part.get("image_url")).or_else(|| part.pointer("/source/url")).or_else(|| part.get("url")).and_then(|v| v.as_str());
+    if let Some(d) = part.pointer("/source/data").or_else(|| part.get("data")).and_then(|v| v.as_str()) {
+        return base64_decode(d);
+    }
+    let Some(url) = url else { return Err("an image part has neither image_url.url nor source.data".into()) };
+    if let Some(rest) = url.strip_prefix("data:") {
+        let Some((header, payload)) = rest.split_once(',') else { return Err("malformed data: URL in an image part".into()) };
+        if !header.contains(";base64") {
+            return Err("an image data: URL must be base64".into());
+        }
+        return base64_decode(payload);
+    }
+    Err("this server does not fetch image URLs: send the image inline as a data: URL (data:image/png;base64,...)".into())
+}
+
+/// The image parts of the messages in the order the chat template writes their placeholders: message by message,
+/// part by part, the parts of a tool result in place.
+fn collect_images(messages: &Value, out: &mut Vec<Vec<u8>>) -> std::result::Result<(), String> {
+    fn parts(content: &Value, out: &mut Vec<Vec<u8>>) -> std::result::Result<(), String> {
+        let Some(arr) = content.as_array() else { return Ok(()) };
+        for p in arr {
+            match p.get("type").and_then(|v| v.as_str()) {
+                Some("image") | Some("image_url") => out.push(image_bytes(p)?),
+                Some("tool_result") => {
+                    if let Some(c) = p.get("content") {
+                        parts(c, out)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    for m in messages.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        if let Some(c) = m.get("content") {
+            parts(c, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Images above this many bytes, or more of them in one request, are refused.
+const IMAGE_MAX_BYTES: usize = 20 << 20;
+const IMAGES_MAX: usize = 16;
+
+/// The cached block of the image with this key; a hit becomes the most recent entry.
+fn cached_block(app: &App, key: u64) -> Option<Arc<Vec<f32>>> {
+    let mut c = app.vis_cache.lock().unwrap();
+    let i = c.iter().position(|(k, _)| *k == key)?;
+    let hit = c.remove(i);
+    let rows = hit.1.clone();
+    c.push(hit);
+    Some(rows)
+}
+
+/// The block of one image (rows of the model's embedding width), from the cache or the vision tower. The encode
+/// runs in a task of its own, one at a time, and its result goes to the cache whether or not the request that
+/// asked is still there (a client that gives up and asks again finds it instead of starting another encode).
+async fn image_block(app: &Arc<App>, bytes: Vec<u8>) -> std::result::Result<(u64, Arc<Vec<f32>>), String> {
+    use std::hash::{Hash, Hasher};
+    let vision = app.vision.clone().ok_or("this server was started without the vision projector (--mmproj): it cannot take images")?;
+    if bytes.len() > IMAGE_MAX_BYTES {
+        return Err(format!("an image of {} bytes is over the limit of {IMAGE_MAX_BYTES}", bytes.len()));
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let key = h.finish();
+    if let Some(r) = cached_block(app, key) {
+        return Ok((key, r));
+    }
+    let app = app.clone();
+    tokio::spawn(async move {
+        let _one = app.vis_lock.lock().await;
+        if let Some(r) = cached_block(&app, key) {
+            return Ok((key, r));
+        }
+        let t0 = std::time::Instant::now();
+        let pool = app.vis_pool.clone().expect("vision pool");
+        let (rows, gh, gw, w, h) = tokio::task::spawn_blocking(move || -> std::result::Result<_, String> {
+            pool.install(|| {
+                let im = vision.preprocess(&bytes).map_err(|e| format!("{e:#}"))?;
+                let (rows, gh, gw) = vision.encode(&im);
+                Ok((rows, gh, gw, im.w, im.h))
+            })
+        })
+        .await
+        .map_err(|e| format!("vision tower: {e}"))??;
+        if std::env::var("QX_SCHED_STATS").is_ok() {
+            eprintln!("vision: an image fitted to {w}x{h}, grid {gh}x{gw}, {} positions in {:.2} s", qx_vision::Vision::block_tokens(gh, gw), t0.elapsed().as_secs_f64());
+        }
+        let rows = Arc::new(rows);
+        let mut c = app.vis_cache.lock().unwrap();
+        c.push((key, rows.clone()));
+        // the most recent blocks, VIS_CACHE_FLOATS of them at most (and always the newest)
+        while c.len() > 1 && c.iter().map(|(_, r)| r.len()).sum::<usize>() > VIS_CACHE_FLOATS {
+            c.remove(0);
+        }
+        Ok((key, rows))
+    })
+    .await
+    .map_err(|e| format!("vision task: {e}"))?
+}
+
+/// Floats of image blocks kept for images sent again (335 MB: about 16 images of the largest size, 80 typical).
+const VIS_CACHE_FLOATS: usize = 16384 * 5120;
+
+/// Requests without the key end here, before their body is read.
+async fn auth_layer(State(app): State<Arc<App>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !authorized(&app, req.headers()) {
+        return err(StatusCode::UNAUTHORIZED, "invalid API key");
+    }
+    next.run(req).await
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -176,7 +328,7 @@ async fn models(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
     Json(json!({"object": "list", "data": [{"id": app.model_id, "object": "model", "created": 0, "owned_by": "quixiinfer"}]})).into_response()
 }
 
-async fn generate(app: Arc<App>, prompt: Vec<u32>, body: &Value, chat: bool, thinking: bool) -> Response {
+async fn generate(app: Arc<App>, prompt: Vec<u32>, images: Vec<worker::JobImage>, body: &Value, chat: bool, thinking: bool) -> Response {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     // no limit given: the rest of the context (a thinking model spends thousands of tokens before its answer;
     // a 4096 default cut long answers off inside the reasoning)
@@ -185,7 +337,7 @@ async fn generate(app: Arc<App>, prompt: Vec<u32>, body: &Value, chat: bool, thi
         Ok(g) => g,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
-    let job = Job { arrived: std::time::Instant::now(), prompt, grammar, grammar_after_think: chat && thinking, max_tokens, sampling: sampling_from(body), stop: stops_from(body), events: tx };
+    let job = Job { arrived: std::time::Instant::now(), prompt, grammar, grammar_after_think: chat && thinking, max_tokens, sampling: sampling_from(body), stop: stops_from(body), events: tx, images };
     if app.jobs.lock().unwrap().send(job).is_err() {
         return err(StatusCode::SERVICE_UNAVAILABLE, "engine stopped");
     }
@@ -285,10 +437,49 @@ async fn chat_completions(State(app): State<Arc<App>>, h: HeaderMap, Json(body):
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
     let t1 = std::time::Instant::now();
-    let prompt = match app.tok.encode(&text) {
+    let mut prompt = match app.tok.encode(&text) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
+    // images: each placeholder token becomes the image's block of positions
+    let mut image_files = Vec::new();
+    if let Err(e) = collect_images(messages, &mut image_files) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    let placeholders = app.image_tok.map_or(0, |it| prompt.iter().filter(|&&t| t == it).count());
+    let mut images = Vec::new();
+    if !image_files.is_empty() || placeholders > 0 {
+        let Some(it) = app.image_tok.filter(|_| app.vision.is_some()) else {
+            return err(StatusCode::BAD_REQUEST, "this server was started without the vision projector (--mmproj): it cannot take images");
+        };
+        if image_files.len() != placeholders {
+            return err(StatusCode::BAD_REQUEST, format!("the request has {} images but its rendered prompt has {placeholders} image placeholders (images belong in their own content parts)", image_files.len()));
+        }
+        if image_files.len() > IMAGES_MAX {
+            return err(StatusCode::BAD_REQUEST, format!("{} images in one request (at most {IMAGES_MAX})", image_files.len()));
+        }
+        let mut blocks = Vec::new();
+        for bytes in image_files {
+            match image_block(&app, bytes).await {
+                Ok(b) => blocks.push(b),
+                Err(e) => return err(StatusCode::BAD_REQUEST, e),
+            }
+        }
+        let width = app.vision.as_ref().unwrap().out_dim;
+        let mut expanded = Vec::with_capacity(prompt.len() + blocks.iter().map(|b| b.1.len() / width).sum::<usize>());
+        let mut next = blocks.into_iter();
+        for &t in &prompt {
+            if t == it {
+                let (key, rows) = next.next().unwrap();
+                let n = rows.len() / width;
+                images.push(worker::JobImage { at: expanded.len(), n, key, rows });
+                expanded.extend(std::iter::repeat_n(it, n));
+            } else {
+                expanded.push(t);
+            }
+        }
+        prompt = expanded;
+    }
     if std::env::var("QX_SCHED_STATS").is_ok() {
         eprintln!("chat: template {:.0} ms, tokenizer {:.0} ms ({} chars, {} tokens)", 1e3 * (t1 - t0).as_secs_f64(), 1e3 * t1.elapsed().as_secs_f64(), text.len(), prompt.len());
     }
@@ -296,7 +487,7 @@ async fn chat_completions(State(app): State<Arc<App>>, h: HeaderMap, Json(body):
     // assistant prefill, a task token or a lone system message): the split of the reply and a structured-output
     // constraint's start both follow that, not the request's flag
     let think_open = thinking && text.trim_end().ends_with("<think>");
-    generate(app.clone(), prompt, &body, true, think_open).await
+    generate(app.clone(), prompt, images, &body, true, think_open).await
 }
 
 async fn completions(State(app): State<Arc<App>>, h: HeaderMap, Json(body): Json<Value>) -> Response {
@@ -309,7 +500,7 @@ async fn completions(State(app): State<Arc<App>>, h: HeaderMap, Json(body): Json
         Ok(_) => return err(StatusCode::BAD_REQUEST, "empty prompt"),
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
-    generate(app.clone(), prompt, &body, false, false).await
+    generate(app.clone(), prompt, Vec::new(), &body, false, false).await
 }
 
 const HELP: &str = "\
@@ -321,7 +512,7 @@ usage:
   quixiinfer help | --help | -h         this text (loads nothing)
 
 options of both commands:
-  --model GGUF          the model file (default: QX_MODEL, else the Qwen model under ~/models)
+  --model GGUF          the model file (or QX_MODEL)
   --ctx N               context per sequence in tokens (default 32768)
   --slots N             concurrent sequences (default 16; DeepSeek 2)
   --profile RANKING     expert ranking the tiers start from
@@ -346,6 +537,8 @@ DeepSeek-V4.1-Flash models:
   --vram-gib G          VRAM budget in GiB (default 21; or QX_DS_VRAM)
   --ram-gib G           RAM expert tier in GiB (default 100; or QX_DS_RAM)
   --profile-out FILE    save the expert ranking here and start from it next time (or QX_DS_PROFILE_OUT)
+  --mmproj FILE         the vision projector GGUF for image input (or QX_DS_MMPROJ; default: mmproj-F16.gguf
+                        in or above the model's directory; the word none: no image input)
 
 Further settings are environment variables (QX_DS_*); handoff.md lists the current ones.
 ";
@@ -362,6 +555,9 @@ fn wants_help(args: &[String]) -> bool {
 }
 
 fn main() -> Result<()> {
+    // the CPUs this process may use, before the engine pins anything
+    let mut all_cpus: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut all_cpus) };
     let args: Vec<String> = std::env::args().collect();
     // before anything touches the GPU or the model: `serve --help` used to load the default model
     if wants_help(&args) {
@@ -383,11 +579,43 @@ fn main() -> Result<()> {
             let port: u16 = arg(&args, "--port").map(|s| s.parse()).transpose()?.unwrap_or(8080);
             let (jobs, tok, tpl, ctx) = load(&args)?;
             let model_id = qx_pack::gguf::Gguf::open(std::path::Path::new(&model_path(&args))).ok().and_then(|g| g.get("general.name").and_then(|v| v.as_str()).map(|s| s.to_lowercase().replace(' ', "-"))).unwrap_or_else(|| "quixiinfer".into());
-            let app = Arc::new(App { jobs: Mutex::new(jobs), tok, tpl, api_key, max_ctx: ctx, model_id });
+            // the vision tower: --mmproj FILE, QX_DS_MMPROJ, or an mmproj-F16.gguf beside the model's directory
+            let model_dir = std::path::Path::new(&model_path(&args)).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let mmproj = arg(&args, "--mmproj").or_else(|| std::env::var("QX_DS_MMPROJ").ok()).map(std::path::PathBuf::from).or_else(|| [model_dir.join("mmproj-F16.gguf"), model_dir.join("../mmproj-F16.gguf")].into_iter().find(|p| p.exists()));
+            let image_tok = tok.encode(IMAGE_PLACEHOLDER).ok().filter(|t| t.len() == 1).map(|t| t[0]);
+            let vision = match (&mmproj, image_tok) {
+                (Some(p), Some(_)) if p.as_os_str() != "none" => {
+                    let v = qx_vision::Vision::load(p)?;
+                    // (a projector of another model would hand the engine rows of the wrong width)
+                    let width = qx_pack::gguf::Gguf::open(std::path::Path::new(&model_path(&args))).ok().and_then(|g| g.tensor("token_embd.weight").map(|t| t.shape[0] as usize));
+                    if width.is_some_and(|w| w != v.out_dim) {
+                        return Err(anyhow!("{}: the projector's rows are {} wide, the model's embeddings {}", p.display(), v.out_dim, width.unwrap()));
+                    }
+                    eprintln!("quixiinfer: vision tower from {} (images of up to {} positions, encoded on the CPU)", p.display(), v.max_tokens);
+                    Some(Arc::new(v))
+                }
+                _ => {
+                    eprintln!("quixiinfer: no vision projector (--mmproj): requests with images are refused");
+                    None
+                }
+            };
+            let vis_pool = match &vision {
+                Some(_) => {
+                    let n = std::env::var("QX_VISION_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+                    Some(Arc::new(rayon::ThreadPoolBuilder::new().num_threads(n).thread_name(|i| format!("qx-vision-{i}")).start_handler(move |_| unsafe {
+                        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &all_cpus);
+                    }).build()?))
+                }
+                None => None,
+            };
+            let app = Arc::new(App { jobs: Mutex::new(jobs), tok, tpl, api_key, max_ctx: ctx, model_id, vision, image_tok, vis_cache: Mutex::new(Vec::new()), vis_lock: tokio::sync::Mutex::new(()), vis_pool });
             let router = Router::new()
                 .route("/v1/models", get(models))
                 .route("/v1/chat/completions", post(chat_completions))
                 .route("/v1/completions", post(completions))
+                // (axum's default body limit is 2 MB: a photograph in base64 is more)
+                .layer(axum::extract::DefaultBodyLimit::max(96 << 20))
+                .layer(axum::middleware::from_fn_with_state(app.clone(), auth_layer))
                 .with_state(app);
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
             rt.block_on(async move {
@@ -409,7 +637,7 @@ fn main() -> Result<()> {
             let prompt = tok.encode(&text)?;
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let sampling = Sampling { temperature, top_p: 0.95, min_p: 0.0, top_k: if temperature > 0.0 { 20 } else { 1 }, seed: 1234 };
-            jobs.send(Job { arrived: std::time::Instant::now(), prompt, grammar: None, grammar_after_think: false, max_tokens, sampling, stop: Vec::new(), events: tx })?;
+            jobs.send(Job { arrived: std::time::Instant::now(), prompt, grammar: None, grammar_after_think: false, max_tokens, sampling, stop: Vec::new(), events: tx, images: Vec::new() })?;
             use std::io::Write;
             while let Some(ev) = rx.blocking_recv() {
                 match ev {

@@ -173,7 +173,8 @@ fn suffix_draft(seq: &[u32], suf: &[u32], n: usize, k: usize) -> (usize, Vec<u32
     if best < n {
         return (0, Vec::new());
     }
-    (best, seq[at + 1..seq.len().min(at + 1 + k)].iter().copied().take_while(|&t| t != SEP).collect())
+    // (a draft ends at a reply's end and never holds an image position: both are at or above IMG_BASE)
+    (best, seq[at + 1..seq.len().min(at + 1 + k)].iter().copied().take_while(|&t| t < qx_engine::dsv41::IMG_BASE).collect())
 }
 
 impl Req<'_> {
@@ -485,19 +486,20 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         let mut acc_steps = 0usize;
         let mut last_step_end: Option<std::time::Instant> = None;
         let mut yielder = Yielder::new(&eng);
+        let mut arrived: Vec<Job> = Vec::new();
         loop {
             if running.is_empty() && waiting.is_empty() {
                 match &mut yielder {
                     // idle: the host is still looked at
                     Some(y) => loop {
                         match rx.recv_timeout(std::time::Duration::from_millis(250)) {
-                            Ok(j) => break waiting.push_back(j),
+                            Ok(j) => break arrived.push(j),
                             Err(mpsc::RecvTimeoutError::Timeout) => y.check(&mut eng),
                             Err(mpsc::RecvTimeoutError::Disconnected) => return,
                         }
                     },
                     None => match rx.recv() {
-                        Ok(j) => waiting.push_back(j),
+                        Ok(j) => arrived.push(j),
                         Err(_) => return,
                     },
                 }
@@ -506,6 +508,32 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 y.check(&mut eng);
             }
             while let Ok(j) = rx.try_recv() {
+                arrived.push(j);
+            }
+            // a request with images: its blocks into the engine's image table, their ids into the prompt (before
+            // any prefix is compared). The blocks of requests waiting or running stay.
+            for mut j in arrived.drain(..) {
+                if !j.images.is_empty() {
+                    let blocks: Vec<(u64, &[f32])> = j.images.iter().map(|im| (im.key, im.rows.as_slice())).collect();
+                    let named = |lo: u32, hi: u32| waiting.iter().map(|w| &w.prompt).chain(running.iter().map(|r| &r.job.prompt)).any(|p| p.iter().any(|&t| t >= lo && t < hi));
+                    match eng.image_ids(&blocks, &named, &free) {
+                        Ok(ids) if j.images.iter().zip(&ids).any(|(im, ids)| ids.len() != im.n) => {
+                            let _ = j.events.send(Event::Error("an image block does not have the model's embedding width".into()));
+                            continue;
+                        }
+                        Ok(ids) => {
+                            for (im, ids) in j.images.iter().zip(&ids) {
+                                j.prompt[im.at..im.at + im.n].copy_from_slice(ids);
+                            }
+                            // (the rows live in the table now)
+                            j.images.clear();
+                        }
+                        Err(e) => {
+                            let _ = j.events.send(Event::Error(e));
+                            continue;
+                        }
+                    }
+                }
                 waiting.push_back(j);
             }
             // admit: a free slot each, the one sharing the longest prefix with the prompt when there is one

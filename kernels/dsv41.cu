@@ -128,10 +128,16 @@ extern "C" __global__ void qx_ds_hc_post(const u64* info) {
 }
 
 /// hc_init for one token: R[c][e] = e[e] for every stream. info: [0] R (T x hc*E), [1] x (T x E), [2] E, [3] hc.
-/// Grid (ceil(hc*E / 256), T).
+/// Grid (ceil(hc*E / 256), T). An image position ([4]: the tokens' device ids, u32 per token, 0: none; bit 31 set:
+/// the low bits are a row of the image table [5], host-mapped rows of E floats) takes that row as its embedding.
 extern "C" __global__ void qx_ds_hc_init(const u64* info) {
     const u32 i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y, E = U(2), hc = U(3);
     if (i >= hc * E) return;
+    const u32 id = info[4] ? reinterpret_cast<const u32*>(info[4])[t] : 0;
+    if (id >> 31) {
+        F(0)[(u64)t * hc * E + i] = reinterpret_cast<const volatile float*>(info[5])[(u64)(id & 0x7fffffffu) * E + i % E];
+        return;
+    }
     F(0)[(u64)t * hc * E + i] = CF(1)[(u64)t * E + i % E];
 }
 
@@ -189,9 +195,15 @@ extern "C" __global__ void qx_ds_silu_mul_clamp(const u64* info) {
 /// gate_c = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot)), R_c += value * gate_c. The keys and the value come
 /// from `engram_kv`'s output: [hc keys of E | value of E] per token. info: [0] R (T x hc*E), [1] kv (T x (hc+1)*E),
 /// [2] gate weights (hc x E), [3] E, [4] eps bits, [5] gates out (T x hc; 0: none). Grid (hc, T), 256 threads.
+/// [6] (0: none): the tokens' device ids; an image position (bit 31) gets no Engram contribution (gate 0), as the
+/// reference masks it.
 extern "C" __global__ void qx_ds_engram_gate(const u64* info) {
     __shared__ float sc[32];
     const u32 c = blockIdx.x, t = blockIdx.y, E = U(3), hc = gridDim.x;
+    if (info[6] && (reinterpret_cast<const u32*>(info[6])[t] >> 31)) {
+        if (threadIdx.x == 0 && info[5]) F(5)[(u64)t * hc + c] = 0.f;
+        return;
+    }
     float* r = F(0) + (u64)t * hc * E + (u64)c * E;
     const float* key = CF(1) + (u64)t * (hc + 1) * E + (u64)c * E;
     const float* value = CF(1) + (u64)t * (hc + 1) * E + (u64)hc * E;
@@ -223,10 +235,12 @@ extern "C" __global__ void qx_ds_engram_gate(const u64* info) {
 /// (table [7] at entry [8] + id, nonzero: resident) is p * [9] (f32 bits, > 1) + bias for the picks after the
 /// first [10], which go by the true score; the weights stay the true probs over the picks. [11] (when not 0): the
 /// picks by the true score alone (i32 T x k), for the tier's scoring: what the model asked for, not what it got.
+/// [12] (0: none) the bias of image positions (the reference's `bias_vl`), taken by the tokens whose device id
+/// in [13] (u32 per token) has bit 31 set.
 extern "C" __global__ void qx_ds_route(const u64* info) {
     const u32 n = U(1), k = U(2), l = threadIdx.x, t = blockIdx.x;
     const float* lg = CF(0) + (u64)t * n;
-    const float* bias = CF(3);
+    const float* bias = info[12] && info[13] && (reinterpret_cast<const u32*>(info[13])[t] >> 31) ? CF(12) : CF(3);
     const u32 per = (n + 31) / 32;
     const u64* table = info[7] ? reinterpret_cast<const u64*>(info[7]) + info[8] : nullptr;
     const float res_mul = __uint_as_float(U(9));

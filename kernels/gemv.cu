@@ -55,12 +55,16 @@ extern "C" __global__ void qx_gemv_q5_k(const u64* info) { gemv_row<QX_Q5_K>(inf
 /// Decodes rows [row0, row0 + rows) to f32: out[r * cols + i]. info: [0] W, [1] out, [2] rows, [3] cols,
 /// [4] row0, [5] address of a u32 added to row0 (0: none), e.g. the token id for an embedding lookup,
 /// [6] gather (1): output row r is row row0 + u32[info[5] + 4r], an embedding lookup per token of a window.
+/// A gathered id with bit 31 set is not a table row (an image position: its embedding comes from elsewhere,
+/// `qx_ds_hc_init`); row 0 is decoded in its place so that nothing outside the table is read.
 template <int T> QX_DEV void dequant_rows(const u64* info) {
     const u32 warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
     const u32 rows = (u32)info[2], cols = (u32)info[3];
     if (warp >= rows) return;
     const bool gather = info[6] == 1;
-    const u64 r0 = info[4] + (info[5] ? reinterpret_cast<const u32*>(info[5])[gather ? warp : 0] : 0);
+    u32 add = info[5] ? reinterpret_cast<const u32*>(info[5])[gather ? warp : 0] : 0;
+    if (gather && (add >> 31)) add = 0;
+    const u64 r0 = info[4] + add;
     const u8* row = reinterpret_cast<const u8*>(info[0]) + (u64)((gather ? 0 : warp) + r0) * row_bytes<T>(cols);
     float* out = reinterpret_cast<float*>(info[1]) + (u64)warp * cols;
     for (u32 c = 0; c * 256 < cols; ++c) {

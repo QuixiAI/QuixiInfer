@@ -131,6 +131,8 @@ struct Layer<'a> {
     g_ffn: MGemv,
     g_shd: MGemv,
     router_bias: DeviceBuf,
+    /// The router bias of image positions (the reference's `bias_vl`); None when the model file has none.
+    router_bias_vl: Option<DeviceBuf>,
     /// The router alone, into the predictor's logits (`QX_DS_PREDICT`).
     g_route: MGemv,
     experts: Experts<'a>,
@@ -425,6 +427,59 @@ pub struct AsyncBufs {
     gu: DeviceBuf,
 }
 
+/// Token ids from here on are image positions: `IMG_BASE + serial`, a row of an image's block (`image_ids`). They
+/// compare like tokens (the same image in two prompts has the same ids while its block lives, so its prefix is
+/// reused), are outside the Engram's token map (dead to every n-gram, as the reference has them), and reach the
+/// device as bit 31 plus their row of the image table.
+pub const IMG_BASE: u32 = 0x4000_0000;
+
+struct ImgBlock {
+    key: u64,
+    serial: u32,
+    n: usize,
+    used: u64,
+}
+
+/// The image blocks in one host-mapped table (rows of E floats, read by `qx_ds_hc_init` over the bus), packed in
+/// `blocks` order. Rows move when a block leaves (ids are serials, mapped to rows at each upload).
+struct ImgTable {
+    host: qx_gpu::mem::HostMapped,
+    cap: usize,
+    blocks: Vec<ImgBlock>,
+    next_serial: u32,
+    clock: u64,
+}
+
+impl ImgTable {
+    fn new(cap: usize) -> Self {
+        Self { host: qx_gpu::mem::HostMapped::new(cap.max(1) * E * 4), cap, blocks: Vec::new(), next_serial: 0, clock: 0 }
+    }
+
+    fn rows(&self) -> usize {
+        self.blocks.iter().map(|b| b.n).sum()
+    }
+
+    /// The table row of serial `sr`, None when its block is gone.
+    fn row_of(&self, sr: u32) -> Option<usize> {
+        let mut r0 = 0;
+        for b in &self.blocks {
+            if sr >= b.serial && ((sr - b.serial) as usize) < b.n {
+                return Some(r0 + (sr - b.serial) as usize);
+            }
+            r0 += b.n;
+        }
+        None
+    }
+
+    fn remove(&mut self, i: usize) {
+        let r0: usize = self.blocks[..i].iter().map(|b| b.n).sum();
+        let n = self.blocks[i].n;
+        let total = self.rows();
+        self.host.slice::<f32>(0, total * E).copy_within((r0 + n) * E..total * E, r0 * E);
+        self.blocks.remove(i);
+    }
+}
+
 pub struct DsEngine<'a> {
     pub cfg: Config,
     gpu: Gpu,
@@ -436,6 +491,8 @@ pub struct DsEngine<'a> {
     layers: Vec<Layer<'a>>,
     s: Scratch,
     st: State,
+    /// The image rows (`image_ids`): the embeddings of the image positions in the slots' contexts.
+    img: std::cell::RefCell<ImgTable>,
     /// The chunk path's buffers (`forward_chunk`), allocated at load when `QX_DS_CHUNK` is set.
     chunk: Option<ChunkBufs>,
     /// The Engram host rows' layout for the next launches: rows per Engram-layer region and the first row the
@@ -1094,6 +1151,7 @@ impl<'a> DsEngine<'a> {
                 g_ffn,
                 g_shd,
                 router_bias: vecf(&b("exp_probs_b.bias"))?,
+                router_bias_vl: if g.tensor(&b("exp_probs_b_vl.bias")).is_some() { Some(vecf(&b("exp_probs_b_vl.bias"))?) } else { None },
                 g_route,
                 experts: Experts { gate, up, down, fmt, gate_ty: gt.ty, down_ty: dt.ty, gate_row_bytes, down_row_bytes },
                 has_comp,
@@ -1465,6 +1523,7 @@ impl<'a> DsEngine<'a> {
             layers,
             s,
             st: State { rings, ring_tables, stores, sels, tokens: vec![Vec::new(); slots], pos: vec![0; slots], exact_from: vec![0; slots], ckpt: (0..slots).map(|_| None).collect(), ring_hi: vec![0; slots] },
+            img: std::cell::RefCell::new(ImgTable::new(std::env::var("QX_DS_IMG_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16384))),
             chunk,
             erows_stride: DS_TMAX,
             erows_row0: 0,
@@ -1615,7 +1674,7 @@ impl<'a> DsEngine<'a> {
         self.rms(s.xpre_p.ptr, w.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l) as u64;
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0, 0, 0]);
         if prefetch_k() > 0 && !self.warm {
             // (never from a dry pass: its routing is not a real job's)
             // tell the driver: layer and tokens; the kernel adds a device-side counter so every prediction is
@@ -1640,7 +1699,7 @@ impl<'a> DsEngine<'a> {
         self.rms(s.xpre.ptr, w1.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l + 1) as u64;
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w1.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w1.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0, 0, 0]);
         if prefetch_k() > 0 && !self.warm && t <= 8 {
             // the prefetch on the cheap predictor: one norm and one router GEMV, a whole expert phase of lead
             if let Some(ab) = self.abufs.as_ref() {
@@ -2541,7 +2600,7 @@ impl<'a> DsEngine<'a> {
             part_r0.push(positions.len());
             let p0 = self.st.pos[sl];
             for (i, &t) in pt.iter().enumerate() {
-                assert!((t as usize) < n_vocab, "token id {t} outside the vocabulary");
+                assert!((t as usize) < n_vocab || t >= IMG_BASE, "token id {t} outside the vocabulary");
                 positions.push((p0 + i) as u32);
                 slots_v.push(sl as u32);
                 segs.push((sl, t));
@@ -2577,7 +2636,8 @@ impl<'a> DsEngine<'a> {
         // first slab narrower than a later one (a mixed chunk whose KV-only part is a few rows) the wider dry
         // passes ran on stale positions and overwrote other positions' stored keys: 0 of 64 rows, 2026-11-11)
         let t0 = slabs.iter().map(|&(_, t)| t).max().unwrap();
-        self.s.tok.upload(&toks[..t0]);
+        let dev_toks: Vec<u32> = toks.iter().map(|&t| self.dev_tok(t)).collect();
+        self.s.tok.upload(&dev_toks[..t0]);
         self.s.pos.upload(&positions[..t0]);
         self.s.slot.upload(&slots_v[..t0]);
         let mut widths: Vec<usize> = slabs.iter().map(|&(_, t)| t).collect();
@@ -2595,7 +2655,7 @@ impl<'a> DsEngine<'a> {
         // the chunk arrays and the Engram rows of every row
         {
             let cb = self.chunk.as_ref().unwrap();
-            cb.tok.upload(toks);
+            cb.tok.upload(&dev_toks);
             cb.pos.upload(&positions);
             cb.slot.upload(&slots_v);
         }
@@ -3322,6 +3382,113 @@ impl<'a> DsEngine<'a> {
         }
     }
 
+    /// Registers the image blocks of a request: per image a key (of its content) and its rows (`cfg.n_embd` floats
+    /// each, from the vision tower). Returns per image the ids of its positions, `IMG_BASE` on. A block that is
+    /// already there is shared (same ids: the prefix of a prompt with the same image is reused). A block stays
+    /// while a slot's context holds its ids or `in_use(lo, hi)` says a request not yet in a slot names an id in
+    /// [lo, hi). When the table is full the least recently used block that nothing names leaves; failing that, one
+    /// that only the contexts of `idle` slots name (kept for prefix reuse, serving nobody now), and those slots
+    /// are reset. Call between forwards. Err when the images do not fit beside the ones in use.
+    pub fn image_ids(&mut self, images: &[(u64, &[f32])], in_use: &dyn Fn(u32, u32) -> bool, idle: &[usize]) -> Result<Vec<Vec<u32>>, String> {
+        let clock = {
+            let mut tab = self.img.borrow_mut();
+            tab.clock += 1;
+            tab.clock
+        };
+        // a request whose images cannot fit even an empty table fails before anything is evicted for it
+        {
+            let tab = self.img.borrow();
+            let mut seen: Vec<u64> = Vec::new();
+            let mut need = 0usize;
+            for &(key, rows) in images {
+                if !seen.contains(&key) {
+                    seen.push(key);
+                    need += rows.len() / E;
+                }
+            }
+            if need > tab.cap {
+                return Err(format!("the request's images take {need} positions; the image table holds {} (QX_DS_IMG_ROWS)", tab.cap));
+            }
+        }
+        let mut out: Vec<Vec<u32>> = Vec::with_capacity(images.len());
+        for &(key, rows) in images {
+            let n = rows.len() / E;
+            if n == 0 || rows.len() % E != 0 {
+                return Err(format!("an image block of {} floats is not rows of {E}", rows.len()));
+            }
+            let found = self.img.borrow().blocks.iter().position(|b| b.key == key && b.n == n);
+            let at = match found {
+                Some(i) => i,
+                None => {
+                    loop {
+                        let (held, cap) = { let tab = self.img.borrow(); (tab.rows(), tab.cap) };
+                        if held + n <= cap {
+                            break;
+                        }
+                        // per block: is it free to go, and which slots' contexts name it
+                        let pick = {
+                            let tab = self.img.borrow();
+                            let st = &self.st;
+                            let mut best: Option<(bool, u64, usize, Vec<usize>)> = None;
+                            for (i, b) in tab.blocks.iter().enumerate() {
+                                let (lo, hi) = (IMG_BASE + b.serial, IMG_BASE + b.serial + b.n as u32);
+                                if out.iter().any(|o| o[0] == lo) || in_use(lo, hi) {
+                                    continue;
+                                }
+                                let slots: Vec<usize> = (0..st.tokens.len()).filter(|&sl| st.tokens[sl].iter().any(|&t| t >= lo && t < hi)).collect();
+                                if slots.iter().any(|sl| !idle.contains(sl)) {
+                                    continue;
+                                }
+                                // unnamed blocks before those of idle contexts, then the least recently used
+                                let cand = (!slots.is_empty(), b.used, i, slots);
+                                if best.as_ref().is_none_or(|x| (cand.0, cand.1) < (x.0, x.1)) {
+                                    best = Some(cand);
+                                }
+                            }
+                            best
+                        };
+                        match pick {
+                            Some((_, _, i, slots)) => {
+                                for sl in slots {
+                                    self.reset(sl);
+                                }
+                                self.img.borrow_mut().remove(i);
+                            }
+                            None => return Err(format!("no room for an image of {n} positions: the image table holds {held} of {cap} rows, all named by running or waiting requests (QX_DS_IMG_ROWS)")),
+                        }
+                    }
+                    let mut tab = self.img.borrow_mut();
+                    let r0 = tab.rows();
+                    tab.host.slice::<f32>(r0 * E * 4, n * E).copy_from_slice(rows);
+                    let serial = tab.next_serial;
+                    tab.next_serial = tab.next_serial.checked_add(n as u32).filter(|&v| v < 0x3000_0000).expect("image serials exhausted");
+                    tab.blocks.push(ImgBlock { key, serial, n, used: clock });
+                    tab.blocks.len() - 1
+                }
+            };
+            let mut tab = self.img.borrow_mut();
+            let serial = tab.blocks[at].serial;
+            tab.blocks[at].used = clock;
+            out.push((0..n as u32).map(|i| IMG_BASE + serial + i).collect());
+        }
+        Ok(out)
+    }
+
+    /// (image rows in the table, its capacity, blocks)
+    pub fn image_stats(&self) -> (usize, usize, usize) {
+        let tab = self.img.borrow();
+        (tab.rows(), tab.cap, tab.blocks.len())
+    }
+
+    /// A token id as the device arrays hold it: itself, or bit 31 plus the image table's row for an image position.
+    fn dev_tok(&self, tok: u32) -> u32 {
+        if tok < IMG_BASE {
+            return tok;
+        }
+        let row = self.img.borrow().row_of(tok - IMG_BASE).unwrap_or_else(|| panic!("image position {tok}: its block left the image table while a context still named it"));
+        0x8000_0000 | row as u32
+    }
+
     /// Bytes of the RAM tier that `ram_yield` can hand back to the host (0: none, QX_DS_RAM_YIELD unset).
     pub fn ram_elastic(&self) -> usize {
         self.driver.as_ref().map(|d| d.shared.yield_bytes.load(std::sync::atomic::Ordering::Relaxed) as usize).unwrap_or(0)
@@ -3400,10 +3567,10 @@ impl<'a> DsEngine<'a> {
         let mut counted: Vec<usize> = vec![0; self.slots];
         for &(sl, tok) in toks {
             assert!(sl < self.slots, "slot {sl} of {}", self.slots);
-            assert!((tok as usize) < self.cfg.n_vocab, "token id {tok} outside the vocabulary ({}): the token file was made with another tokenizer", self.cfg.n_vocab);
+            assert!((tok as usize) < self.cfg.n_vocab || tok >= IMG_BASE, "token id {tok} outside the vocabulary ({}): the token file was made with another tokenizer", self.cfg.n_vocab);
             positions.push((self.st.pos[sl] + counted[sl]) as u32);
             slots_v.push(sl as u32);
-            ids.push(tok);
+            ids.push(self.dev_tok(tok));
             counted[sl] += 1;
             self.st.tokens[sl].push(tok);
         }
@@ -3546,7 +3713,7 @@ impl<'a> DsEngine<'a> {
         self.trace("dequant_gather");
         ops::dequant_gather(&self.gpu, self.embd.ty, self.embd.buf.ptr, self.s.e.ptr, t, self.embd.cols, self.s.tok.ptr);
         self.trace_done();
-        self.k("qx_ds_hc_init", 256, ((hcd as u32).div_ceil(256), t as u32, 1), &[self.s.r.ptr, self.s.e.ptr, E as u64, c.hc as u64]);
+        self.k("qx_ds_hc_init", 256, ((hcd as u32).div_ceil(256), t as u32, 1), &[self.s.r.ptr, self.s.e.ptr, E as u64, c.hc as u64, self.s.tok.ptr, self.img.borrow().host.dptr]);
         self.dump("hc_init".into(), &self.s.r, hcd, act);
     }
 
@@ -3574,7 +3741,7 @@ impl<'a> DsEngine<'a> {
             self.k("qx_ds_copy_f32", 256, (((n * t) as u32).div_ceil(256), 1, 1), &[self.s.erows_host.dptr + (ei * self.erows_stride * n * 4) as u64 + (self.erows_row0 * n * 4) as u64, self.s.erows.ptr, (n * t) as u64]);
             self.mgt(g_ekv, self.s.erows.ptr, n, t, "engram_kv");
             self.dump(format!("engram_kv-{l}"), &self.s.ekv, (hc + 1) * E, act);
-            self.k("qx_ds_engram_gate", 256, (hc as u32, tt, 1), &[self.s.r.ptr, self.s.ekv.ptr, egate.ptr, E as u64, bits(1e-20), self.s.egates.ptr]);
+            self.k("qx_ds_engram_gate", 256, (hc as u32, tt, 1), &[self.s.r.ptr, self.s.ekv.ptr, egate.ptr, E as u64, bits(1e-20), self.s.egates.ptr, self.s.tok.ptr]);
             self.dump(format!("engram_gate-{l}"), &self.s.egates, hc, act);
             self.dump(format!("engram_out-{l}"), &self.s.r, hcd, act);
         }
@@ -3752,7 +3919,8 @@ impl<'a> DsEngine<'a> {
             Some(ab) if res_ok && res_mul > 1.0 && t <= res_t && l >= res_l0 && l < res_l1 => [ab.table_dev.ptr, (l * c.n_expert) as u64, bits(res_mul), res_keep],
             _ => [0, 0, 0, 0],
         };
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[self.s.logits_r.ptr, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, self.s.ids.ptr, self.s.wts.ptr, bits(c.w_scale), res[0], res[1], res[2], res[3], if res[0] != 0 && route_true_on() { self.s.ids_true.ptr } else { 0 }]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[self.s.logits_r.ptr, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, self.s.ids.ptr, self.s.wts.ptr, bits(c.w_scale), res[0], res[1], res[2], res[3], if res[0] != 0 && route_true_on() { self.s.ids_true.ptr } else { 0 }, w.router_bias_vl.as_ref().map_or(0, |b| b.ptr), self.s.tok.ptr]);
+        self.dump(format!("ffn_moe_ids-{l}"), &self.s.ids, c.n_expert_used, act);
         self.route_true.set(res[0] != 0 && route_true_on());
     }
 
@@ -3788,7 +3956,7 @@ impl<'a> DsEngine<'a> {
         let pk = crate::mailbox::PRED_K;
         self.rms(s.xpre.ptr, w1.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, pk as u64, w1.router_bias.ptr, pb.ptr + (r0 * pk * 4) as u64, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, pk as u64, w1.router_bias.ptr, pb.ptr + (r0 * pk * 4) as u64, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0, 0, 0]);
     }
 
     fn chunk_ffn_alloc(&mut self, rows_max: usize) {
@@ -3809,7 +3977,7 @@ impl<'a> DsEngine<'a> {
         // (rows `ra` on: the chunk's rows from which this layer runs)
         let ku = (ra * c.n_expert_used * 4) as u64;
         w.g_ffn.run_blas_to(&self.gpu, cb.x.ptr + (ra * E * 4) as u64, rows, &[lg, g, u], x16, w16);
-        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr + ku, cb.wts.ptr + ku, bits(c.w_scale), 0, 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr + ku, cb.wts.ptr + ku, bits(c.w_scale), 0, 0, 0, 0, 0, w.router_bias_vl.as_ref().map_or(0, |b| b.ptr), cb.tok.ptr + (ra * 4) as u64]);
         self.k("qx_ds_silu_mul_clamp", 256, (((c.ff_exp * rows) as u32).div_ceil(256), 1, 1), &[g, u, h, (c.ff_exp * rows) as u64, bits(c.clamp_shexp[l])]);
         w.g_shd.run_blas_to(&self.gpu, h, rows, &[cb.shy.ptr + (ra * E * 4) as u64], x16, w16);
     }
