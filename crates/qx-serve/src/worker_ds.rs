@@ -324,10 +324,11 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         // wide it is. Measured 2026-11-18 with 3: a file edit beside an essay 30.9 -> 25.4 s, the essay 23.2 -> 29.4 s)
         let spec_max_multi: usize = std::env::var("QX_DS_SPEC_MULTI").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(spec_max);
         // Suffix decoding (vLLM's): the replies of finished requests, up to QX_DS_SPEC_CORPUS tokens of them (default
-        // 0, none; 262,144 is the size tried), are a second source of drafts. Opt-in: a full corpus on fresh text is
-        // unmeasured, and a reply's speed can tell a client that another request produced the same continuation. A draft is only ever a guess the model's own rows
-        // confirm, so no reply's content reaches another request; its speed can.
-        let corpus_max: usize = std::env::var("QX_DS_SPEC_CORPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        // 262,144; 0: none), are a second source of drafts. A draft is only ever a guess the model's own rows
+        // confirm, so no reply's content reaches another request; its speed can (a reply drafted from another
+        // request's is faster): 0 for a server whose clients must not learn that. Measured 2026-11-19 with 11,700
+        // tokens of 39 replies in it: three fresh tasks 34.62 -> 35.41 s (+2.3%), a reply asked again -41 to -48%.
+        let corpus_max: usize = std::env::var("QX_DS_SPEC_CORPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(262_144);
         // (a place in another reply must agree over QX_DS_SPEC_N_CORPUS tokens, default 8: a full corpus of replies
         // in one style agrees over 4 with almost anything)
         let spec_n_corpus: usize = std::env::var("QX_DS_SPEC_N_CORPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
