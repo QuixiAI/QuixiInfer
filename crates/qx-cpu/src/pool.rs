@@ -428,10 +428,10 @@ mod tests {
         let j = deepseek_job();
         let base = deepseek_run(&j, *dot::kernels());
         let mut sets = vec![("scalar", dot::kernels_for(dot::Isa::Scalar))];
-        if dot::isa() != dot::Isa::Scalar {
+        if dot::cpu_has_avx2() {
             sets.push(("avx2", dot::kernels_for(dot::Isa::Avx2)));
         }
-        if dot::isa() == dot::Isa::Avx512 {
+        if dot::cpu_has_avx512() {
             sets.push(("avx512", dot::kernels_for(dot::Isa::Avx512)));
         }
         for (name, k) in sets {

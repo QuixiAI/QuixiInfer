@@ -299,7 +299,7 @@ pub fn q2k_q8k_scalar(row: &[u8], x: &[Q8K]) -> f32 {
 // ---- dispatch -----------------------------------------------------------------------------------
 
 /// Which kernel set the CPU runs. AVX-512 is chosen only when every feature any AVX-512 kernel lists is present
-/// (vl and vbmi included), so no AVX-512 kernel can be reached on a CPU that lacks one of its instructions.
+/// (f, bw, vnni and vl), so no AVX-512 kernel can be reached on a CPU that lacks one of its instructions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Isa {
     Scalar,
@@ -309,9 +309,9 @@ pub enum Isa {
 
 #[cfg(target_arch = "x86_64")]
 fn detect() -> Isa {
-    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx512vbmi") {
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512vl") {
         Isa::Avx512
-    } else if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+    } else if is_x86_feature_detected!("avx2") {
         Isa::Avx2
     } else {
         Isa::Scalar
@@ -414,6 +414,32 @@ pub fn kernels() -> &'static Kernels {
     K.get_or_init(|| kernels_for(isa()))
 }
 
+/// Whether the CPU itself has the AVX-512 features the kernels need, regardless of `QX_CPU_ISA`.
+#[cfg(test)]
+pub(crate) fn cpu_has_avx512() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512vl")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Whether the CPU itself has AVX2, regardless of `QX_CPU_ISA`.
+#[cfg(test)]
+pub(crate) fn cpu_has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 // ---- AVX-512 ------------------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -429,6 +455,10 @@ pub mod avx512 {
     }
 
     /// IQ2_S . Q8_K, 64 elements (8 groups, 4 sub-blocks of 16) per step.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `x.len()` 82-byte blocks.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub unsafe fn iq2s_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let mut acc = 0f32;
@@ -466,6 +496,10 @@ pub mod avx512 {
     }
 
     /// IQ2_S . Q8_K with the 8 grid indices of a step computed in vector registers and fetched by one gather.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `x.len()` 82-byte blocks.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub unsafe fn iq2s_q8k_gather(row: &[u8], x: &[Q8K]) -> f32 {
         let grid = IQ2S_GRID.as_ptr() as *const i64;
@@ -502,6 +536,10 @@ pub mod avx512 {
     }
 
     /// IQ3_S . Q8_K, 64 elements (8 groups, 2 sub-blocks of 32) per step.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `x.len()` 110-byte blocks.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub unsafe fn iq3s_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let mut acc = 0f32;
@@ -533,6 +571,10 @@ pub mod avx512 {
 
     /// NVFP4 . Q8_K, bit-equal to `nvfp4_q8k_scalar`: integer sub-block sums by VNNI, the 16 values of a chunk
     /// in a vector, the pairwise tree by lane permutes.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `x.len()` 144-byte chunks.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512vl")]
     pub unsafe fn nvfp4_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let lut = _mm512_broadcast_i32x4(_mm_loadu_si128(FP4_MAG.as_ptr() as *const _));
@@ -581,6 +623,10 @@ pub mod avx512 {
     }
 
     /// NVFP4 . Q8_0, bit-equal to `nvfp4_q80_scalar`.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `36 * (x.len() + 1) / 2` bytes.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512vl")]
     pub unsafe fn nvfp4_q80(row: &[u8], x: &[Q80]) -> f32 {
         let lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(FP4_MAG.as_ptr() as *const _));
@@ -593,10 +639,10 @@ pub mod avx512 {
         };
         let mut acc = 0f32;
         for (b, q) in x.iter().enumerate() {
-            let blk = row.as_ptr().add(36 * (b / 2));
+            let blk = &row[36 * (b / 2)..36 * (b / 2) + 36];
             let a0 = 2 * (b % 2);
-            let (da, db) = (UE4M3_HALF[*blk.add(a0) as usize], UE4M3_HALF[*blk.add(a0 + 1) as usize]);
-            let codes = _mm_loadu_si128(blk.add(4 + 8 * a0) as *const _);
+            let (da, db) = (UE4M3_HALF[blk[a0] as usize], UE4M3_HALF[blk[a0 + 1] as usize]);
+            let codes = _mm_loadu_si128(blk.as_ptr().add(4 + 8 * a0) as *const _);
             let lo = _mm_and_si128(codes, m4);
             let hi = _mm_and_si128(_mm_srli_epi16(codes, 4), m4);
             // element order: sub a low nibbles, sub a high, sub b low, sub b high
@@ -613,7 +659,11 @@ pub mod avx512 {
     }
 
     /// IQ4_NL . Q8_0, two 32-element blocks per step (one 64-byte activation load).
-    #[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512vbmi")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `x.len()` 18-byte blocks.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512vl")]
     pub unsafe fn iq4nl_q80(row: &[u8], x: &[Q80]) -> f32 {
         let lut = _mm512_broadcast_i32x4(_mm_loadu_si128(IQ4NL_VALUES.as_ptr() as *const _));
         let m4 = _mm_set1_epi8(0xf);
@@ -665,6 +715,10 @@ pub mod avx512 {
     }
 
     /// IQ2_XXS . Q8_K, 64 elements (two sub-blocks of 32) per step.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `x.len()` 66-byte blocks.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub unsafe fn iq2xxs_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let mut acc = 0f32;
@@ -691,6 +745,10 @@ pub mod avx512 {
     }
 
     /// IQ2_XS . Q8_K, 64 elements (8 groups, 4 sub-blocks of 16) per step.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `x.len()` 74-byte blocks.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub unsafe fn iq2xs_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let mut acc = 0f32;
@@ -719,6 +777,10 @@ pub mod avx512 {
     }
 
     /// IQ3_XXS . Q8_K, 64 elements (two sub-blocks of 32) per step.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `x.len()` 98-byte blocks.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub unsafe fn iq3xxs_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let mut acc = 0f32;
@@ -745,6 +807,10 @@ pub mod avx512 {
 
     /// IQ1_S . Q8_K, bit-equal to `iq1s_q8k_scalar`: the grid bytes (0, 1, 2) dotted as unsigned, the activation
     /// sum subtracted once and added or subtracted again for the +-1/8 offset, all in integers.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `x.len()` 50-byte blocks.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub unsafe fn iq1s_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let ones = _mm512_set1_epi8(1);
@@ -776,6 +842,10 @@ pub mod avx512 {
 
     /// Q2_K . Q8_K, bit-equal to `q2k_q8k_scalar`: per 32-byte chunk and 2-bit plane, 32 values against 32
     /// activations (two sub-blocks of 16, lanes 0..4 and 4..8), scales and mins applied as integers.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX-512 F, BW, VNNI and VL, and `row` holds exactly `x.len()` 84-byte blocks.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512vl")]
     pub unsafe fn q2k_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let m3 = _mm256_set1_epi8(3);
@@ -878,7 +948,11 @@ pub mod avx2 {
     }
 
     /// IQ2_S . Q8_K, 64 elements (8 groups, 4 sub-blocks of 16) per step.
-    #[target_feature(enable = "avx2,fma")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `row` holds exactly `x.len()` 82-byte blocks.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn iq2s_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let mut acc = 0f32;
         for (b, q) in row.chunks_exact(82).zip(x) {
@@ -911,7 +985,11 @@ pub mod avx2 {
     }
 
     /// IQ3_S . Q8_K, 64 elements (8 groups, 2 sub-blocks of 32) per step.
-    #[target_feature(enable = "avx2,fma")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `row` holds exactly `x.len()` 110-byte blocks.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn iq3s_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let mut acc = 0f32;
         for (b, q) in row.chunks_exact(110).zip(x) {
@@ -944,7 +1022,11 @@ pub mod avx2 {
 
     /// NVFP4 . Q8_K, equal to `nvfp4_q8k_scalar`: the sub-block integer sums by `maddubs`, the 16 `d_s * isum_s`
     /// values and their fixed pairwise tree the scalar way (16 float ops per chunk).
-    #[target_feature(enable = "avx2,fma")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `row` holds exactly `x.len()` 144-byte chunks.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn nvfp4_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(FP4_MAG.as_ptr() as *const __m128i));
         let m4 = _mm256_set1_epi8(0xf);
@@ -985,7 +1067,11 @@ pub mod avx2 {
     }
 
     /// NVFP4 . Q8_0, equal to `nvfp4_q80_scalar`.
-    #[target_feature(enable = "avx2,fma")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `row` holds exactly `36 * (x.len() + 1) / 2` bytes.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn nvfp4_q80(row: &[u8], x: &[Q80]) -> f32 {
         let lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(FP4_MAG.as_ptr() as *const __m128i));
         let m4 = _mm_set1_epi8(0xf);
@@ -993,10 +1079,10 @@ pub mod avx2 {
         let one = _mm256_set1_epi8(1);
         let mut acc = 0f32;
         for (b, q) in x.iter().enumerate() {
-            let blk = row.as_ptr().add(36 * (b / 2));
+            let blk = &row[36 * (b / 2)..36 * (b / 2) + 36];
             let a0 = 2 * (b % 2);
-            let (da, db) = (UE4M3_HALF[*blk.add(a0) as usize], UE4M3_HALF[*blk.add(a0 + 1) as usize]);
-            let codes = _mm_loadu_si128(blk.add(4 + 8 * a0) as *const __m128i);
+            let (da, db) = (UE4M3_HALF[blk[a0] as usize], UE4M3_HALF[blk[a0 + 1] as usize]);
+            let codes = _mm_loadu_si128(blk.as_ptr().add(4 + 8 * a0) as *const __m128i);
             let lo = _mm_and_si128(codes, m4);
             let hi = _mm_and_si128(_mm_srli_epi16::<4>(codes), m4);
             // [lo 8 bytes | hi 8 bytes] is sub a (16 elements), then sub b
@@ -1012,7 +1098,11 @@ pub mod avx2 {
     }
 
     /// IQ4_NL . Q8_0, equal to `iq4nl_q80_scalar`: signed table values as `|w| . (a * sign(w))`.
-    #[target_feature(enable = "avx2,fma")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `row` holds exactly `x.len()` 18-byte blocks.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn iq4nl_q80(row: &[u8], x: &[Q80]) -> f32 {
         let lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(IQ4NL_VALUES.as_ptr() as *const __m128i));
         let m4 = _mm_set1_epi8(0xf);
@@ -1032,7 +1122,11 @@ pub mod avx2 {
     }
 
     /// IQ2_XXS . Q8_K, one 32-element sub-block per step.
-    #[target_feature(enable = "avx2,fma")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `row` holds exactly `x.len()` 66-byte blocks.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn iq2xxs_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let mut acc = 0f32;
         for (b, q) in row.chunks_exact(66).zip(x) {
@@ -1057,7 +1151,11 @@ pub mod avx2 {
     }
 
     /// IQ2_XS . Q8_K, 64 elements (8 groups, 4 sub-blocks of 16) per step.
-    #[target_feature(enable = "avx2,fma")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `row` holds exactly `x.len()` 74-byte blocks.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn iq2xs_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let mut acc = 0f32;
         for (b, q) in row.chunks_exact(74).zip(x) {
@@ -1089,7 +1187,11 @@ pub mod avx2 {
     }
 
     /// IQ3_XXS . Q8_K, 64 elements (two sub-blocks of 32) per step.
-    #[target_feature(enable = "avx2,fma")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `row` holds exactly `x.len()` 98-byte blocks.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn iq3xxs_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let mut acc = 0f32;
         for (b, q) in row.chunks_exact(98).zip(x) {
@@ -1121,7 +1223,11 @@ pub mod avx2 {
 
     /// IQ1_S . Q8_K, equal to `iq1s_q8k_scalar`: the grid bytes (0, 1, 2) dotted as unsigned, the activation sum
     /// scaled by -7 or -9 for the +-1/8 offset, all in integers.
-    #[target_feature(enable = "avx2,fma")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `row` holds exactly `x.len()` 50-byte blocks.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn iq1s_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let ones = _mm256_set1_epi8(1);
         let mut acc = 0f32;
@@ -1150,7 +1256,11 @@ pub mod avx2 {
 
     /// Q2_K . Q8_K, equal to `q2k_q8k_scalar`: per 32-byte chunk and 2-bit plane, 32 values against 32
     /// activations (two sub-blocks of 16), scales and mins applied as integers.
-    #[target_feature(enable = "avx2,fma")]
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `row` holds exactly `x.len()` 84-byte blocks.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn q2k_q8k(row: &[u8], x: &[Q8K]) -> f32 {
         let m3 = _mm256_set1_epi8(3);
         let ones = _mm256_set1_epi8(1);
@@ -1201,7 +1311,7 @@ pub mod avx2 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
     use crate::act::{quantize_q8_0, quantize_q8_k};
@@ -1231,37 +1341,18 @@ mod tests {
         (a - b).abs() <= 1e-5 * a.abs().max(b.abs()).max(1e-3)
     }
 
-    /// Whether the CPU itself has the AVX-512 features the kernels need, regardless of `QX_CPU_ISA`.
-    fn cpu_has_avx512() -> bool {
-        #[cfg(target_arch = "x86_64")]
-        {
-            is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx512vbmi")
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
-    }
-
     /// Whether the selected kernel set is AVX-512.
     fn have_avx512() -> bool {
         isa() == Isa::Avx512
     }
 
     fn have_avx2() -> bool {
-        #[cfg(target_arch = "x86_64")]
-        {
-            is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
+        cpu_has_avx2()
     }
 
     fn skip_avx512(name: &str) -> bool {
         if !cpu_has_avx512() {
-            eprintln!("skipping {name}: no AVX-512 F/BW/VNNI/VL/VBMI");
+            eprintln!("skipping {name}: no AVX-512 F/BW/VNNI/VL");
             return true;
         }
         if !have_avx512() {
@@ -1273,7 +1364,7 @@ mod tests {
 
     fn skip_avx2(name: &str) -> bool {
         if !have_avx2() {
-            eprintln!("skipping {name}: no AVX2+FMA");
+            eprintln!("skipping {name}: no AVX2");
             return true;
         }
         false
@@ -1290,9 +1381,9 @@ mod tests {
             let mut q = Vec::new();
             quantize_q8_k(&act(2560, &mut s), &mut q);
             let (a, b) = (iq2s_q8k_scalar(&w, &q), unsafe { avx512::iq2s_q8k(&w, &q) });
-            assert!(close(a, b), "{a} vs {b}");
+            assert!(a.to_bits() == b.to_bits(), "{a} vs {b}");
             let c = unsafe { avx512::iq2s_q8k_gather(&w, &q) };
-            assert!(close(a, c), "gather {a} vs {c}");
+            assert!(a.to_bits() == c.to_bits(), "gather {a} vs {c}");
         }
     }
 
@@ -1307,7 +1398,7 @@ mod tests {
             let mut q = Vec::new();
             quantize_q8_k(&act(2560, &mut s), &mut q);
             let (a, b) = (iq3s_q8k_scalar(&w, &q), unsafe { avx512::iq3s_q8k(&w, &q) });
-            assert!(close(a, b), "{a} vs {b}");
+            assert!(a.to_bits() == b.to_bits(), "{a} vs {b}");
         }
     }
 
@@ -1322,7 +1413,7 @@ mod tests {
             let mut q = Vec::new();
             quantize_q8_0(&act(640, &mut s), &mut q);
             let (a, b) = (iq4nl_q80_scalar(&w, &q), unsafe { avx512::iq4nl_q80(&w, &q) });
-            assert!(close(a, b), "{a} vs {b}");
+            assert!(a.to_bits() == b.to_bits(), "{a} vs {b}");
         }
     }
 
@@ -1728,28 +1819,30 @@ mod tests {
     #[test]
     fn grid_magnitudes_cannot_saturate() {
         let mut max = 0u64;
-        let mut scan = |t: &[u64], w: usize| {
-            for &v in t {
-                for k in 0..w {
-                    max = max.max((v >> (8 * k)) & 0xff);
+        {
+            let mut scan = |t: &[u64], w: usize| {
+                for &v in t {
+                    for k in 0..w {
+                        max = max.max((v >> (8 * k)) & 0xff);
+                    }
                 }
-            }
-        };
-        scan(&qx_quant::tables::IQ2S_GRID, 8);
-        scan(&qx_quant::tables::IQ2XS_GRID, 8);
-        scan(&qx_quant::tables::IQ2XXS_GRID, 8);
-        scan(&qx_quant::tables::IQ1S_GRID, 8);
-        drop(scan);
-        let mut scan32 = |t: &[u32], w: usize| {
-            for &v in t {
-                for k in 0..w {
-                    max = max.max(((v >> (8 * k)) & 0xff) as u64);
+            };
+            scan(&qx_quant::tables::IQ2S_GRID, 8);
+            scan(&qx_quant::tables::IQ2XS_GRID, 8);
+            scan(&qx_quant::tables::IQ2XXS_GRID, 8);
+            scan(&qx_quant::tables::IQ1S_GRID, 8);
+        }
+        {
+            let mut scan32 = |t: &[u32], w: usize| {
+                for &v in t {
+                    for k in 0..w {
+                        max = max.max(((v >> (8 * k)) & 0xff) as u64);
+                    }
                 }
-            }
-        };
-        scan32(&qx_quant::tables::IQ3S_GRID, 4);
-        scan32(&qx_quant::tables::IQ3XXS_GRID, 4);
-        drop(scan32);
+            };
+            scan32(&qx_quant::tables::IQ3S_GRID, 4);
+            scan32(&qx_quant::tables::IQ3XXS_GRID, 4);
+        }
         assert!(max <= 129, "grid byte {max} * 127 * 2 would saturate maddubs");
         let m = qx_quant::tables::IQ4NL_VALUES.iter().map(|v| v.unsigned_abs()).max().unwrap();
         assert!(m <= 127 && 2 * 127u32 * 127 <= 32767, "IQ4_NL magnitude {m} would saturate maddubs");
