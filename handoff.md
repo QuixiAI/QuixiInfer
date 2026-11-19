@@ -2,6 +2,14 @@
 
 
 
+## Resume 2026-11-19: suffix decoding landed (own history by longest agreement; the corpus of other replies opt-in); the tier scores the true picks under the routing knob
+- `QX_DS_SPEC_CORPUS=262144` turns the corpus on (a repeated essay 10.75 -> 6.35 s); default 0. `bench.sh` starts
+  its server with it off: the load generator's warm-up asks the measured prompts.
+- File edit 27.1 -> 17.3 s, quotation 12.7 -> 8.8 s; a first-time JSON list +4%.
+- `QX_DS_ROUTE_RES` now scores the true picks (`QX_DS_ROUTE_TRUE=0`: as before): promotions as with the knob off,
+  same speed and KL. Kernel info words are NOT zero-padded by the launcher: every call site passes the full list.
+- Baseline 18.475 (gate 18.482). Binaries `~/qx-bins/chunk167` in `target/release`.
+
 ## Resume 2026-11-18: decode exactness relaxed by the user; prompt-lookup speculation and admission by prefix landed; a lossy routing knob kept opt-in
 - The user: "Relax exactness on decode"; no hardware can be added. Baseline unchanged, 18.475 (final gate 18.470).
 - **Speculation** (`worker_ds.rs`, `QX_DS_SPEC` default 15, 0 off): a sole decoder drafts from its slot's history;

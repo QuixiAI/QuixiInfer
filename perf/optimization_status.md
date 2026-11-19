@@ -5368,3 +5368,94 @@ provenance chain verified; serve256k1's REGRESSION print judged not caused by th
 Presuppositions attacked: 63 (decode must be exact), 64 (a decode step yields one token a request).
 
 Raw: `perf/results/2026-11-18/x-spec/`, `x111-b-1-212007`, `x111-c-*`, `x110-b-215006`, `x110-c-222808`.
+
+## 2026-11-19: Suffix decoding — LANDED (the longest agreement in the slot's own history, default on; the corpus of other requests' replies KEPT opt-in); the tier scores the true picks under the routing knob — KEPT under the opt-in knob
+
+Both asked for by the user on 2026-11-18. Candidate: `perf/results/2026-11-19/x-suffix-true/candidate.diff`
+(binaries `~/qx-bins/chunk166`: quixiinfer 486c3078ae0b, qx-ds-check 5bd79a005c2f, qx-ds-replay e15e16efbdf4).
+The win10 VM ran from 23:22:05 to 00:23:27 (the journal): the first X126 sessions (chunk165) and X113 b are
+VM-on runs and are not used for times; ds-checks part a and most of b ran with it on (correctness only). At
+23:57:19 systemd-oomd killed X126's first speculation-off server (memory pressure 62.65%); that arm was re-run.
+Everything from X129 on has "vm shut off" in its preflight.
+
+**Suffix decoding** (`worker_ds.rs`). `suffix_draft` replaces the most recent 4-token match: the place whose
+preceding tokens agree with the sequence's end over the most tokens (at least `QX_DS_SPEC_N` 4, 24 counted), in
+the slot's own history or in a corpus of finished requests' reply tokens (`QX_DS_SPEC_CORPUS`, default 0: off;
+262,144 is the size tried; a place there must agree over `QX_DS_SPEC_N_CORPUS` 8), whichever agrees longer. The search stops
+after 200,000 comparisons. A draft is still only a guess the window's rows confirm.
+
+| task (one client, 256k three-slot server) | speculation off | chunk166 | note |
+|---|--:|--:|---|
+| file edit, 695 tokens (X129) | 27.12 s | 17.30 (-36%) | 18.89 with the most recent match (X121) |
+| quotation, 333 tokens | 12.74 s | 8.76 (-31%) | 9.28 before |
+| an essay asked again, 300 tokens (X126 on6 / off6, VM off) | 10.75 s | 6.35 (-41%) | 11.28 with the corpus off |
+| a JSON list asked again, 400 tokens | 12.51 s | 6.49 (-48%) | 12.49 with the corpus off |
+| the essay / the list / a reworded essay, first time (same sessions) | 11.94 / 14.87 / 10.98 s | 11.99 / 15.51 (+4.3%) / 10.95 | |
+| essay, first time, 220 tokens (X129) | 8.88 s | 9.06 (+2.0%) | |
+| the essay with one more instruction | 7.09 s | 7.11 | drafts from the corpus, rejected where it leaves |
+| JSON list, 300 tokens / other field names | 11.95 / 8.92 s | 12.44 (+4.1%) / 8.99 | |
+| essay, temperature 1.3, seed 7 | 8.57 s | 8.93 (+4.2%) | |
+
+One session an arm. Prose with nothing to copy is within a single request's scatter (the first-time essay had one
+speculating step in 221; `nocorp6` against `off6` differs by 5% on a request with one such step). What
+reproduces is a first-time JSON list: +4.1% (X129), +4.3% (on6), +3.8% (nocorp6), with 58 of 118-126 drafts
+accepted and no corpus step: drafts from its own history at half acceptance. Whether the longest agreement made
+that worse than yesterday's +1.9% at K <= 7 is not isolated. Exactness: all seven replies of X129 and all five of X126 (chunk165 with the VM on, and
+chunk166 with it off: on6, off6, nocorp6) byte-identical to speculation off; X129's session replayed as single steps: 1,276 forwards, 3,093 rows, 0 mismatching (33 steps drafted from
+the corpus, 26 tokens fed again).
+
+Breaker (fresh context; no result-corrupting defect): (1) the load generator's warm-up asks the prompts the serve
+cases measure, so the corpus would draft every measured reply: `bench.sh` now starts its server with
+`QX_DS_SPEC_CORPUS=0` (an experiment's own setting overrides it); (2) the search no longer stopped at the first
+match: the comparison budget; (3) `QX_DS_SPEC_N` above 24 disabled speculation: clamped; (4) a full corpus agrees
+over 4 tokens with almost anything: 8 for the corpus. Not measured: a full 262,144-token corpus (2.8 hours of
+generation) on fresh text. A reply's speed can tell a client that another request produced the same continuation:
+`QX_DS_SPEC_CORPUS=0` for a server with clients that must not learn that.
+
+**True-pick scoring** (`dsv41.cu` `qx_ds_route` [11], `step.cu` `qx_moe_post` [21], `route_true_on`). With
+`QX_DS_ROUTE_RES` on, the router also writes the picks by the true score; the post kernel lists those for the
+tier's scoring and the driver takes the ones VRAM does not hold as promotion candidates. `QX_DS_ROUTE_TRUE=0`:
+the selected ones, as before. 4,096 teacher-forced steps from 245,760, m 1.3 on layers 20-39 (X113 c, VM off):
+
+| arm | ms/token | VRAM / RAM promotions | VRAM hits | NVMe | mean KL | top-1 |
+|---|--:|--:|--:|--:|--:|--:|
+| knob off | 37.6 | 13,582 / 11,586 | 651,372 | 7,438 | 0 | 100% |
+| old scoring | 35.7 | 12,158 / 9,579 | 690,387 | 6,123 | 0.0103 | 96.2% |
+| true picks | 35.6 | 13,576 / 11,621 | 695,443 | 5,622 | 0.0102 | 96.6% |
+
+The tier adapts as with the knob off again, at the same speed and KL. What it buys over a topic change is not
+measured. With the knob on, every job's selected experts outside VRAM are candidates too (the switch is global).
+A 256k three-slot server with the knob, speculation windows and three clients (X120 route): no panic.
+Kernel info words are not zero-padded by the launcher: every `qx_ds_route` call passes 12 words, `qx_moe_post` 22
+(the older engine's call padded with zeros; that engine was not run).
+
+Knob off: ds-checks a, b, c on 5bd79a005c2f (X127): pass. `dsv41.cu` and `step.cu` compile for sm_86, sm_89,
+sm_120a (`nvcc-archs.txt`). Gate (x110-d-005348, chunk166, VM off, the corpus off in the server): decode256k 38.9
+/ 39.5, prefill256k 2.0, serve256k3 80.52, decode 31.2, prefill128 10.5, identity identical, score 18.482 against
+18.475: not a promotion. serve256k1 37.19 prints REGRESSION against 32.98: the slow mode of that case again (6
+speculating steps in the session; 34.69-37.16 with speculation off on 2026-11-18).
+
+Second and third identity sessions on the final binary (chunk167: quixiinfer ba327ac433b3, the corpus's default
+set to 0, nothing else; X111 f, VM off): default: identical, serve256k1 34.55, serve256k3 80.58; with
+`QX_DS_SPEC_CORPUS=262144`: identical, 38 steps drafted from other replies (462 of 462 drafts accepted), and
+serve256k1 reads 19.02: the warm-up's replies replayed, as the breaker said, which is why the gate's server runs
+with the corpus off (the settings string of `run.json` does not carry that; the command line does). The gate
+x110-d ran chunk166 with the corpus off in the server: one identity session; preflight 00:53:48, memory used
+3,445 MiB, swap 1,239 MiB used, pressure avg10 0.00, no build tools; its `run.json` says c58e45b plus `bench.sh`,
+correctness skipped (ds-checks attached by hand), `experiment_env QX_X=1` (read by nothing).
+
+True picks also read VRAM hits +0.7% and NVMe reads -8% against the old scoring (X113 b and c); the equal
+promotion counts follow partly from the larger candidate set.
+
+### Adjudication (fresh context, 2026-11-19)
+Gate, like for like, provenance, ds-checks and the true-pick table reproduced; serve256k1's print is the case's
+slow mode (37.19 inside the 32.88-37.66 of 23 earlier sessions). Suffix decoding in the slot's own history: HOLD
+for a second identity session, then LANDED: X111 f lifted it. The corpus: opt-in on today's evidence (the largest
+corpus any run held is ~1,400 tokens of 262,144; a new timing channel on reply content); what would make it the
+default is two 8.5-minute sessions with a ~13k-token corpus and fresh tasks within +3%. True-pick scoring: KEPT
+under the opt-in knob (no speed gain shown; the benefit over a topic change unmeasured). Twelve text corrections,
+applied.
+
+Presuppositions attacked: 65 (a draft's source is the request's own history).
+
+Raw: `perf/results/2026-11-19/x-suffix-true/`, `x110-d-005348`.

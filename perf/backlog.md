@@ -9,6 +9,13 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-19 (suffix decoding landed, its corpus opt-in; true picks scored under the routing knob)
+1. **The corpus as a default**: two 8.5-minute sessions (three clients fill ~13k tokens, then fresh tasks) with and
+   without it; pass at +3% on the fresh tasks. And the first-time JSON list's +4% from own-history drafts at half
+   acceptance (a stricter rule for repetitive structure).
+2. **The routing knob over a topic change** with true picks (a token file that switches text after the state).
+3. A per-token serve metric (ms per step misreads speculating sessions).
+
 ### Queue as of 2026-11-18 (decode exactness relaxed by the user; speculation and admission landed)
 1. **The routing knob's open halves**: score the true picks in the tier (a displaced expert is never a promotion
    candidate now), then re-measure m 1.3 / L0 20 over a topic change; an identity check that tolerates it.
