@@ -10,7 +10,7 @@
 //! whichever tier computed each; the arithmetic matches the GPU expert kernels bit for bit.
 //! The calling thread is worker 0, so a job costs no wake-up latency on the caller's side.
 use crate::act::{quantize_q8_0, quantize_q8_k, Q80, Q8K};
-use crate::dot::avx512;
+use crate::dot;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -132,6 +132,7 @@ impl Shared {
     /// Worker `t`'s share of the posted job.
     unsafe fn run(&self, t: usize, seq: u64) {
         let job = &mut *self.job.get();
+        let k = dot::kernels();
         let nt = self.n_threads;
         let target = seq * nt as u64;
         let (ff, n) = (job.ff, job.n_embd);
@@ -146,14 +147,14 @@ impl Shared {
             for j in a..b {
                 let xq = &job.xq[job.experts[j].tok];
                 let v = match job.fmt.gate {
-                    WType::Iq2S => avx512::iq2s_q8k_gather(row, xq),
-                    WType::Iq3S => avx512::iq3s_q8k(row, xq),
-                    WType::Nvfp4 => avx512::nvfp4_q8k(row, xq) * e.scale[if rr < ff { 0 } else { 1 }],
-                    WType::Iq2Xxs => avx512::iq2xxs_q8k(row, xq),
-                    WType::Iq2Xs => avx512::iq2xs_q8k(row, xq),
-                    WType::Iq3Xxs => avx512::iq3xxs_q8k(row, xq),
-                    WType::Iq1S => avx512::iq1s_q8k(row, xq),
-                    WType::Q2K => avx512::q2k_q8k(row, xq),
+                    WType::Iq2S => (k.iq2s_q8k)(row, xq),
+                    WType::Iq3S => (k.iq3s_q8k)(row, xq),
+                    WType::Nvfp4 => (k.nvfp4_q8k)(row, xq) * e.scale[if rr < ff { 0 } else { 1 }],
+                    WType::Iq2Xxs => (k.iq2xxs_q8k)(row, xq),
+                    WType::Iq2Xs => (k.iq2xs_q8k)(row, xq),
+                    WType::Iq3Xxs => (k.iq3xxs_q8k)(row, xq),
+                    WType::Iq1S => (k.iq1s_q8k)(row, xq),
+                    WType::Q2K => (k.q2k_q8k)(row, xq),
                     WType::Iq4Nl => panic!("IQ4_NL gate rows are not supported"),
                 };
                 *job.gu.as_ptr().add(j * 2 * ff + rr).cast_mut() = v;
@@ -184,15 +185,15 @@ impl Shared {
                 let row = std::slice::from_raw_parts(job.experts[a].down.add(r * job.down_row_bytes), job.down_row_bytes);
                 for j in a..b {
                     let v = match job.fmt.down {
-                        WType::Nvfp4 => avx512::nvfp4_q80(row, &job.hq[j]) * job.experts[a].scale[2],
-                        WType::Iq4Nl => avx512::iq4nl_q80(row, &job.hq[j]),
-                        WType::Iq2S => avx512::iq2s_q8k_gather(row, &job.hqk[j]),
-                        WType::Iq3S => avx512::iq3s_q8k(row, &job.hqk[j]),
-                        WType::Iq2Xxs => avx512::iq2xxs_q8k(row, &job.hqk[j]),
-                        WType::Iq2Xs => avx512::iq2xs_q8k(row, &job.hqk[j]),
-                        WType::Iq3Xxs => avx512::iq3xxs_q8k(row, &job.hqk[j]),
-                        WType::Iq1S => avx512::iq1s_q8k(row, &job.hqk[j]),
-                        WType::Q2K => avx512::q2k_q8k(row, &job.hqk[j]),
+                        WType::Nvfp4 => (k.nvfp4_q80)(row, &job.hq[j]) * job.experts[a].scale[2],
+                        WType::Iq4Nl => (k.iq4nl_q80)(row, &job.hq[j]),
+                        WType::Iq2S => (k.iq2s_q8k)(row, &job.hqk[j]),
+                        WType::Iq3S => (k.iq3s_q8k)(row, &job.hqk[j]),
+                        WType::Iq2Xxs => (k.iq2xxs_q8k)(row, &job.hqk[j]),
+                        WType::Iq2Xs => (k.iq2xs_q8k)(row, &job.hqk[j]),
+                        WType::Iq3Xxs => (k.iq3xxs_q8k)(row, &job.hqk[j]),
+                        WType::Iq1S => (k.iq1s_q8k)(row, &job.hqk[j]),
+                        WType::Q2K => (k.q2k_q8k)(row, &job.hqk[j]),
                     };
                     *job.y.add(job.experts[j].out * n + r) = v;
                 }
