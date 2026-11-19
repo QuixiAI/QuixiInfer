@@ -9,6 +9,15 @@ invented one. The aggregate score lives in `scoreboard.md`.
 
 ## Beam
 
+### Queue as of 2026-11-18 (decode exactness relaxed by the user; speculation and admission landed)
+1. **The routing knob's open halves**: score the true picks in the tier (a displaced expert is never a promotion
+   candidate now), then re-measure m 1.3 / L0 20 over a topic change; an identity check that tolerates it.
+2. **Speculation**: the bench's serve metric is ms per step and misreads speculating sessions (a per-token
+   metric); drafts from other slots' finished replies (vLLM's suffix corpus); a grammar-aware variant.
+3. The unmeasured oracle bound for the tier policy (60.6% of selections with 13% of the records).
+4. Small: the comment "~130 us an expert" at `QX_DS_CHUNK_GRP_MAX` (~200); `qx-membw`'s copy-alone loop; the
+   `run.json` of a run on worktree binaries says a clean tree.
+
 ### Queue as of 2026-11-16, later (grouped kernels landed; every path measured at a hardware limit)
 1. Nothing open above the bar. Prompts are the bytes of the used experts outside VRAM over ~45 GB/s of copies (and
    the disk's 12 GB/s for the NVMe quarter); decode is the same memory bus per token; notebook 2026-11-16.

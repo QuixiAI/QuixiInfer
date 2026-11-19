@@ -2,6 +2,18 @@
 
 
 
+## Resume 2026-11-18: decode exactness relaxed by the user; prompt-lookup speculation and admission by prefix landed; a lossy routing knob kept opt-in
+- The user: "Relax exactness on decode"; no hardware can be added. Baseline unchanged, 18.475 (final gate 18.470).
+- **Speculation** (`worker_ds.rs`, `QX_DS_SPEC` default 15, 0 off): a sole decoder drafts from its slot's history;
+  exact (replies, a split replay of 1,664 rows, identity sessions). A file edit -29%, a quotation -27%. Off beside
+  other decoders (`QX_DS_SPEC_MULTI=0`). Tokens fed again after a rejection: `refeed`; decoders sit a step out
+  rather than make a width outside `WIDTHS` (5 aborts the sealed server).
+- **Admission** (`QX_DS_ADMIT_WINDOW` default 4): the waiting request whose prefix a free slot would reuse first.
+- **`QX_DS_ROUTE_RES=1.3 QX_DS_ROUTE_L0=20`** (lossy, off): decode256k -6% sustained at KL 0.010; replies then
+  differ run to run. Open halves in the backlog.
+- Binaries `~/qx-bins/chunk164` in `target/release`. Chain tools X108-X125 in `~/qx-chains` and
+  `perf/results/2026-11-18/x-spec/`, `x-route-res/`.
+
 ## Resume 2026-11-16, later: short chunks on the grouped kernels LANDED (under 256 rows -12 to -15%); baseline still 18.475
 - **Landed** (2a912f0; binaries `~/qx-bins/chunk156`, in `target/release`): in a chunk under 256 rows an expert with
   at most 64 rows runs the grouped CUDA-core kernels (`QX_DS_CHUNK_GRP_MAX`, 0 = as before). 192 rows 1,920 ->

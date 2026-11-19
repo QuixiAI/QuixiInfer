@@ -333,6 +333,21 @@ These are not our measurements. They are cautions with a source.
   window; round size and decay alone were within noise (basalt, `docs/configuration/adaptive.md`). Cadence is
   the lever, and ours is already per token.
 
+## Decode beyond one exact token a step (2026-11-18; notebook of that day)
+
+- **Prompt-lookup speculation is exact and pays for a sole decoder**: windows of 1 / 2 / 4 / 8 tokens cost 30.8 /
+  45.4 / 76.8 / 133.6 ms, so drafts taken from the slot's own history (the last 4 tokens seen before) and verified
+  in the step's window give a file edit 26.75 -> 18.89 s and a quotation 12.65 -> 9.28 s, nothing lost on prose.
+  Beside other decoders a draft row is a neighbour's loss (an edit 30.9 -> 25.4 s, the essay beside it 23.2 ->
+  29.4 s): off there (`QX_DS_SPEC_MULTI`).
+- **A lossy router buys 6%**: residents preferred on layers 20-39 by 1.3 (`QX_DS_ROUTE_RES=1.3 QX_DS_ROUTE_L0=20`)
+  -6.1% over 4,096 tokens at 245k, KL 0.010, top-1 96.4%, stable; the lower 20 layers cost 3x the KL; stronger
+  settings drift. Replies then differ run to run and the tier scores the biased picks: opt-in only.
+- **vLLM (34aac94f9c) has nothing else to give this engine**: its scheduler, graphs, MoE kernels and prefix cache
+  have counterparts here; its async scheduling hides host time we do not have. Admission by shared prefix was
+  ported (`QX_DS_ADMIT_WINDOW`). Not ported: suffix decoding's cross-request corpus, draft models (DSpark: a 4-row
+  window is 77 ms, so it needs 3+ accepted drafts a round and VRAM from the tier).
+
 ## Open: windows of 5 are not bit-identical to single steps (2026-11-06)
 
 `QX_DS_WINDOW=5` on route1k 128 gave 125 / 128 bit-identical rows against single steps, while widths 6 and 7 gave

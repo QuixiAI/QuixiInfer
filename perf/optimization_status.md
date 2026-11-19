@@ -5230,3 +5230,141 @@ Closed by decision (the queue of 2026-11-16):
 - **Three clients, decode at depth**: the profile of 2026-11-16 (X93) and the knob sweeps of 2026-11-15 stand.
 
 Raw: `perf/results/2026-11-16/x-nsys-chunk1024/`.
+
+## 2026-11-18: The user relaxed exactness on decode; residency-aware routing — KEPT as an opt-in knob, default off (decode256k -6% sustained at mean KL 0.010, top-1 96.4%)
+
+The user's instruction of 2026-11-18: "Relax exactness on decode"; no hardware can be added (the spare 32 GB DIMMs
+would make four on a two-channel board: no bandwidth, a lower DDR5 speed). Bound taken, the author's reading: the
+prompt chunks' (mean KL <= 0.03, top-1 >= 95% against the exact path).
+
+Lever: 38% of a decode256k step waits for experts outside VRAM (X93). `QX_DS_ROUTE_RES=m` (> 1): the router of
+single steps and windows of at most `QX_DS_ROUTE_RES_T` tokens (default 8; never a chunk's slabs, never a replay)
+scores an expert the VRAM tier holds as p * m + bias for the picks after the first `QX_DS_ROUTE_KEEP` (default 0);
+the weights stay the true probs over the picks. `QX_DS_ROUTE_L0` / `_L1`: the layers it applies to.
+
+Teacher-forced single steps from the 245,760-token state against the same binary's knob-off run (X109, X113;
+logits of every row; ms per token over the whole run):
+
+| setting | tokens | ms/token | mean KL | top-1 |
+|---|--:|--:|--:|--:|
+| off | 1,024 / 4,096 | 38.9-39.8 / 37.9 | 0 | 100% |
+| m 1.15, all layers | 1,024 | 34.8 | 0.0225 | 94.6% |
+| m 1.3, all layers | 1,024 | 32.8 | 0.0376 | 94.6% |
+| m 1.3, keep 3 | 1,024 | 32.3 | 0.0318 | 94.7% |
+| m 1.3, layers 0-19 | 1,024 | 34.6 | 0.0340 | 94.5% |
+| **m 1.3, layers 20-39** | 1,024 / 4,096 | 35.9 / **35.6 (-6.1%)** | 0.0114 / **0.0104** | 96.4% / **96.4%** |
+| m 1.6, layers 20-39 | 1,024 | 34.4 | 0.0206 | 94.3% |
+| m 3, layers 28-39 | 1,024 / 4,096 | 34.2 / 34.3 (-9.5%) | 0.0248 / 0.0288 | 95.6% / 95.2% |
+
+- The cost is in the lower 20 layers: the same multiplier there costs 3.0x the KL for 1.85x the misses removed
+  (10,873 RAM evaluations against 5,884).
+- Binaries: X109 a 7cd417a02d98, X109 b and c 546be574dfac (both before the `res_ok` fix below); the 4,096-token
+  rows (X113) ran the final engine, 126c35172bbd. Preflight of every chain: VM shut off.
+- m 1.3 on layers 20-39 is stable over 4,096 tokens (per 512: KL 0.007-0.013, top-1 95-98%). m 3 on 28-39 drifts
+  (KL 0.025 -> 0.039, top-1 97 -> 94%): rejected.
+- Gate with m 1.3, L0 20 (X110 a, chunk158): decode256k 35.4 / 35.1 (baseline 39.0), decode 28.7 (31.0), serve256k3 73.64
+  (80.84), score 17.315; not comparable to the scoreboard (lossy decode) and not promoted. The gain is larger
+  in the first tokens after a resume (-9.6% over 64) than sustained (-6% over 4,096).
+- Breaker (fresh context): (1) the knob reached the last slabs of exact chunks and replays through
+  `layer_ffn_pre`: fixed (`res_ok`); (2) with the knob on, temperature-0 replies differ run to run (the router
+  reads a table the driver writes asynchronously): the server identity check cannot pass, 8 of 8 replies differ
+  between two knob-on sessions; (3) the tier scores the biased picks, so an expert the true router wanted and a
+  resident displaced is never a promotion candidate (VRAM promotions -10%, RAM -18% at m 1.3 L0 20 over 4,096 tokens); (4) a prefix
+  reused in place keeps lossy rows while the same prefix recomputed as a prompt is exact. Knob off is bit-identical
+  by reading, by the server identity check (X111 a-1, a-3 on chunk158; x110-c on the final binaries) and by
+  ds-checks a, b, c on the final engine binary (X118, 126c35172bbd: pass). `dsv41.cu` (the build's flattened
+  source) compiles with nvcc for sm_86, sm_89, sm_120a (`x-route-res/nvcc-dsv41-archs.txt`: three exits 0).
+
+Decision: opt-in, not the default. -6% does not pay for losing the identity check that guards every other change,
+and (3) needs the true picks scored before it is trusted over a topic change. Recommended setting when wanted:
+`QX_DS_ROUTE_RES=1.3 QX_DS_ROUTE_L0=20`.
+
+Raw: `perf/results/2026-11-18/x-route-res/`, `x108-*`, `x110-a-203842`, `x111-a-*`.
+
+## 2026-11-18: vLLM's throughput mechanisms surveyed; prompt-lookup speculation — default on for a sole decoder (a file edit 26.8 -> 18.8 s, a quotation 12.7 -> 9.2 s, exact); admission by shared prefix — default on
+
+Survey (`~/git/vllm` at 34aac94f9c, fresh-context agent): of its mechanisms, the scheduler's decode-first token
+budget, the per-batch CUDA graphs, the expert-grouped MoE kernels and the prefix cache have their counterpart here
+(chunks beside decoders with a step gap, graph replay per width, the chunk kernels, slot prefix reuse with ring
+checkpoints); async scheduling and the GPU-resident batch state hide host time this engine does not have (0.13 ms a
+step). Ported: n-gram speculation (`spec_decode/ngram`), its batch-size-aware draft length, the per-request
+acceptance, and cache-aware admission (`scheduler.py:2796`).
+
+**Speculation** (`worker_ds.rs`; `QX_DS_SPEC=K`, default 15, 0 off; `QX_DS_SPEC_N` 4; `QX_DS_SPEC_COOL` 8;
+`QX_DS_SPEC_MULTI` 0; `QX_DS_SPEC_N_MULTI` 8). A decoder whose last 4 tokens occurred before in its slot feeds
+what followed them after its sample in the same window; the rows are sampled in turn while the samples equal the
+drafts. After a rejection the slot is rewound (the free ring path, checked beforehand) to the group boundary
+below and the token between is fed again. Draft length 2 -> 5 -> 11 -> 15 on full acceptance, the accepted count
+after a rejection; a request sits 8 steps out after none accepted and 16 when under half were lately. Not under
+a grammar, not in a step with prompt tokens, not within a group of the prompt's end.
+
+Window costs today (X111 b, route1k): 1 / 2 / 4 / 8 tokens 30.8 / 45.4 / 76.8 / 133.6 ms a step.
+
+| task (one client, temperature 0, 256k three-slot server) | off | K <= 7 | K <= 15 |
+|---|--:|--:|--:|
+| file edit, 695 tokens (X115) | 26.75 s | 19.63 | 18.75; final binary 18.89 (-29%) |
+| quotation, 333 tokens | 12.65 s | 9.44 | 9.16; final binary 9.28 (-27%) |
+| a reply that reasons before it edits, 500 tokens (X114) | 19.20 s | 18.86 | |
+| JSON list, 400 tokens (X114) | 14.67 s | 14.95 (+1.9%) | not measured |
+| essay, 300 tokens | 12.87 s | 13.00 (+1.0%) | not measured |
+
+(The server's "generated in" times; at the client the edit is 29.26 -> 21.42 s and the quotation 15.27 -> 11.93 s.
+The off, K <= 7 and K <= 15 columns ran chunk160, speculation before the later rules, one session each; "final
+binary" is X121 on chunk164.)
+
+Exactness: every reply byte-identical to speculation off (X114, X115, X120, X121); the server identity check
+identical with it on (X111 c-1, X110 b, c); a recorded speculating session replayed as single steps
+(`QX_DS_REPLAY_SPLIT=1`, X121): 212 forwards, 1,664 rows, 0 mismatching.
+
+Beside other decoders it does not pay, so it is off there by default: with 3 drafts allowed a file edit beside
+an essay went 30.9 -> 25.4 s and the essay 23.2 -> 29.4 s; two copy tasks beside an essay 22.9 -> 17.7-19.7 s and
+the essay 25.3 -> 27.3 s (X120, chunk163); serve256k3 80.0-80.5 -> 83.7-84.2 ms per token at 15 drafts (X111 c, X110
+b). A draft row costs a neighbour its share of a wider step.
+
+Breaker (fresh context): tokens fed again could bring a step to 5 rows (2 + 2 + 1 with three decoders), a width
+the sealed server never loaded: an abort. Fixed: decoders with such tokens sit a step out until the rows are a
+width of `WIDTHS`. At the defaults the path cannot run with three slots (the group is 2, one token fed again, and
+only a sole decoder speculates): it ran 24 times in a four-slot server with `QX_DS_SPEC_MULTI=3` (X124: three
+copy tasks and an essay, replies identical to speculation off, no panic, widths 1-12 of `WIDTHS`). Sampling,
+limits, stops, the checkpoint and the rewind path checked sound.
+
+Final gate (x110-c-222808, chunk164: quixiinfer 6b1d46132e72, qx-ds-check 126c35172bbd; VM off): decode256k 39.2 /
+38.8, prefill256k 2.0, serve256k3 80.78, decode 31.0, prefill128 10.5, identity identical, score 18.470 against
+18.475: not a promotion. `perf_diff.py gate` prints REGRESSION for serve256k1 (35.54 against 32.98): the session
+had 6 speculating steps (15 draft rows, 9 accepted), at most 0.2 s of 18.2; speculation-off sessions of the same
+evening read 34.69, 37.16, 37.05, and 23 sessions of 11-15 / 11-16 read 32.88-37.66 (the baseline's is the fast
+mode). The run's `run.json` says a clean tree: the binaries came from the worktree, whose diff is
+`x-spec/candidate.diff` (sha256 68298c1882c2). ds-checks a, b, c (X118): pass, attached by hand. decode256k's
+first repeat spent ~7 s once before its 64 tokens (174.5 ms a token over all 64 against 63-65): unexplained, outside
+the last-32 figure.
+
+Smoke and sampling (X125, chunk164, speculation on against off): a `json_object` request valid and identical; a
+stop string inside a copied span, 49 tokens, identical; a sampled copy task (temperature 1.3, seed 7) identical on
+and off and different from its greedy text; 393 of 428 drafts accepted. X122 (temperature 0.8) never left the
+greedy path and shows nothing about sampling. The split replay of X121 first panicked (the tool needs
+`QX_DS_CHUNK=8192` as the server has); the passing log is the re-run with it.
+
+**Admission** (`QX_DS_ADMIT_WINDOW`, default 4; 1: arrival order): among the first 4 waiting requests the one
+whose prefix a free slot would reuse (the admission's own value: the rings reach it, or 8,192+ tokens) goes
+first; the front request is passed over three times at most. On the final binary (X116 w4f): one request
+admitted out of order, 3,318 of 3,330 tokens reused, the batch 29.2 s, the second question 17.54 s, the short
+request 22.19 s, replies identical to arrival order. X116 (chunk161, before the value rule; two requests
+queued behind a busy document slot): the batch 32.4 -> 28.3 s, the second question on the document 25.1 -> 16.6 s
+(3,318 of 3,330 tokens reused), the short request passed over 19.6 -> 21.3 s; replies identical. Which request
+reuses a prefix decides which prompt runs in an f16 chunk: the existing prefix-reuse caveat, now also a matter of
+queue order.
+
+Second identity session and the short-context guard on the final binary (X111 d, e): serve256k identical,
+serve256k1 35.56, serve256k3 81.04; serve1 34.19, serve3 77.46; no panic.
+
+### Adjudication (fresh context, 2026-11-18)
+Routing knob: KEPT (opt-in, default off). Admission: LANDED. Speculation: HOLD until a smoke session (JSON mode,
+a stop string in a copied span, sampling that leaves the greedy path) and a second identity session on the final
+binary: both ran after the verdict (X125, X111 d, e above) and passed, so it lands on the adjudicator's stated
+terms. Gate and scores reproduced (18.470; 18.718 and 17.315 for the earlier candidates); like for like and the
+provenance chain verified; serve256k1's REGRESSION print judged not caused by the change (23 earlier sessions
+32.88-37.66). Eighteen text corrections, applied.
+
+Presuppositions attacked: 63 (decode must be exact), 64 (a decode step yields one token a request).
+
+Raw: `perf/results/2026-11-18/x-spec/`, `x111-b-1-212007`, `x111-c-*`, `x110-b-215006`, `x110-c-222808`.
