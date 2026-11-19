@@ -360,6 +360,17 @@ These are not our measurements. They are cautions with a source.
 - A VM's pid file under `/run/libvirt/qemu/` is readable by the service's user and exists before the guest touches
   memory: an earlier signal than any memory counter. A pid file can outlive its process: check `/proc/<pid>`.
 
+## Image input (2026-11-19; notebook of that day)
+
+- The model's image path is four rules on top of the text model: a position's embedding from the vision block,
+  the router's second bias (`exp_probs_b_vl`: it changes the picks at 1,452 of 1,600 position-layers), no Engram
+  contribution, dead to later n-grams. With ids above the vocabulary for image positions the last one is free
+  (the token map has no entry), and prefix reuse, rewind and speculation need no change.
+- A thread started from a pinned thread inherits its one CPU: the tower took 14 s where it takes 2 until its
+  pool reset its affinity.
+- The CPU tower (f32, matrixmultiply, 16 threads): 2-3 s at 1,500-2,300 patches, 19-24 s at 8,600-8,700; a
+  photograph above ~1.8 megapixels is always at the 1,024-position cap.
+
 ## Open: windows of 5 are not bit-identical to single steps (2026-11-06)
 
 `QX_DS_WINDOW=5` on route1k 128 gave 125 / 128 bit-identical rows against single steps, while widths 6 and 7 gave

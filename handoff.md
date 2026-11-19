@@ -8,6 +8,11 @@
   names the commit), key `VLLM_API_KEY` from `/etc/slimserve/affine-king.env`, `0.0.0.0:8000`, 256k context, 3 slots,
   MemoryMax 112G, `Restart=always`, enabled at boot. It holds the GPU: `sudo systemctl stop quixiinfer` before any
   benchmark or chain, `sudo systemctl start quixiinfer` after (the user allowed me both, 2026-11-19; say when).
+- **Image input** (2026-11-19, the user: "mandatory"): the service loads `~/models/DeepSeek-V4.1-Flash-1017-GGUF/
+  mmproj-F16.gguf` by itself (`--mmproj`; `crates/qx-vision`, CPU). Chat `image_url` parts as data: URLs. Checks:
+  `qx-ds-img-check` (image positions in the engine, numerically) and `qx-vision-check` + `tools/vision_ref.py`
+  (the tower). Resident 106.7 GB now, 16.5-17 GiB available beside it. A large photograph costs 19-24 s of CPU
+  encode: the tower on the GPU is the next step there (backlog).
 - **The win10 VM beside it** (the user's build machine, started now and then; never started or stopped by me): the
   unit sets `QX_DS_RAM_YIELD=12 QX_DS_YIELD_PATH=/run/libvirt/qemu/win10.pid`: while the pid file's process lives
   (or under 4 GiB are available) the coldest 12 GiB of the RAM tier are freed and read from NVMe (gate +5.4%,

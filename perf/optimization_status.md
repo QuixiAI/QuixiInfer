@@ -5658,3 +5658,121 @@ of numbers and claims stronger than the logs. Answered by X144 (ds-checks pass),
 and the corrections above. The verdict's own condition: commit before the production install.
 
 Raw: `perf/results/2026-11-19/x-ram-yield/`, `x110-f-122224`, `x110-g-123004`, `x110-h-123741`.
+
+## 2026-11-19: Image input (the model's vision tower) — LANDED (a feature, not a promotion; without images the scored cases and identity unchanged)
+
+Why: the user: "implement vision support ... mandatory". The model is image-text-to-text and ships its projector
+(`mmproj-F16.gguf`); the server dropped image parts silently and the model guessed.
+
+What, from the model's own reference (`inference/vision.py`, `image_processor.py`, `model.py`, `engram.py`;
+copies in `~/qx-ref-vision/`):
+- `crates/qx-vision`: the tower on the CPU in f32. Fitting as PIL's `ImageOps.pad` (Pillow's fixed-point bicubic,
+  grey 127), a 32-block ViT (width 1,024, RMSNorm, SwiGLU, 2D rotary positions), the aligner (3x3 unfold, two
+  linears with an erf GELU), the block `[START] ([IMAGE] x w [NEWLINE]) x h [END]`, at most 1,024 positions.
+- Engine: an image position is a token id `IMG_BASE + serial` (0x4000_0000 on). `image_ids` keeps the blocks' rows
+  in a host-mapped table (QX_DS_IMG_ROWS, 16,384 rows, 335 MB pinned; the least recently used block that nothing
+  names leaves, then those only idle slots' contexts name, whose slots are reset). At upload an id becomes bit 31
+  plus its table row. Kernels: `qx_dequant_*` decodes row 0 for such an id, `qx_ds_hc_init` takes the table row
+  as the embedding, `qx_ds_engram_gate` skips the position (gate 0), `qx_ds_route` takes `exp_probs_b_vl`. The
+  Engram's hash of later tokens sees ids outside its token map as dead already.
+- Server: image parts (data: URLs, Anthropic `image`) in template order; one placeholder token per image expanded
+  to its positions; the encode in a task of its own (one at a time, 16 unpinned threads, its result cached whether
+  or not the client waits; the last blocks kept by recency, 335 MB); the scheduler registers the blocks at intake,
+  before prefixes are compared. Bearer check before the body is read; body limit 96 MB; a projector of another
+  width refused at start. `--mmproj FILE` (default: `mmproj-F16.gguf` in or above the model's directory).
+
+Measured (VM off, the service stopped; raw in `perf/results/2026-11-19/x-vision/`). Final build chunk185
+(quixiinfer 0a8351be6436, qx-ds-check 81e0755692eb); earlier builds named where they are the evidence.
+- The tower against `tools/vision_ref.py` (NumPy + Pillow, written separately from the same reference): fitted
+  pixels byte-identical to Pillow on six PNGs (small, mid, tall, wide, exact multiple, RGBA; 200x150 to
+  3000x700); block values max |d| 1.5e-5 and 3.7e-5, row cosine 0.9999998 (194 and 206 rows; the two large images
+  were compared for pixels only). A JPEG: 83,177 bytes differ from Pillow's decode, by at most 4 levels.
+- Image positions in the engine, numerically (`qx-ds-img-check`, 12 text tokens + 40 block rows + 12 text tokens,
+  single steps with dumps): embedding = the block's row in every stream, bit for bit, 40 of 40; Engram gates all
+  zero at image positions (0 wrong of 80 position-layers) and at no text position-layer; router picks = the top 6
+  under `exp_probs_b_vl` at 1,600 of 1,600 image position-layers (the text bias would pick differently at 1,452)
+  and under `exp_probs_b` at 960 of 960 text ones; windows of 8 and one exact chunk give the single steps' logits
+  after the last token bit for bit.
+- Answers through the API (greedy, thinking off), all correct: solid red / blue / green; "ZEBRA 58213" read
+  exactly; 3 squares counted; two and three images named in order; a label read in a scene, as PNG and JPEG, and
+  in a 1,014-position and a 977-position image; an image asked again (1,028 of 1,030 tokens reused, 0.6 s), a
+  second turn (0.7 s) and the same streamed; an image request beside a decoding one; three image prompts at once
+  with cached blocks ("chunk steps 5 (1 of several slots)"); 3,273 tokens with the image at the start; windows
+  only (QX_DS_CHUNK_MIN=100000: red, the text, the 1,014-position image, 0 chunk steps); after evictions with a
+  600-row table (red, text, squares, green, blue, red again, text again: all right; a 1,014-position image and
+  four images over 600 rows refused with a 400).
+- Real pictures (X153, chunk185): five of Ubuntu's 3840-pixel wallpapers (836 KB to 3.6 MB, JPEG and PNG) each
+  described in a sentence that fits its file name (bluebells on a forest path, a red acer leaf, a coffee mug with
+  the Ubuntu logo, a raccoon illustration, a starry sky over the sea); a logo read as "Ubuntu"; from a rendered
+  invoice of eight lines the number, total and reference code exactly. Each large picture is fitted to 968-1,001
+  positions and took 21.9-26.9 s to encode while the adjudicator's own CPU checks ran beside it (19.3-23.5 s
+  otherwise): that, not 2 s, is what a large photograph costs. Gist-level answers: no real photograph was
+  tested for small text, charts or counting.
+- Server behaviour: 401 without the key (the check is a layer in front of the body's extraction: by the code;
+  the request carried a 58 KB image); a 12 MB noise image accepted and answered ("Random", 1,011 prompt tokens,
+  X154 main; on chunk183/184 it only passed the body limit, the 600-row table refused it);
+  nine distinct images twice: 9 encodes, then 0; a client giving up after 6 s three times on a new large image:
+  one encode, then the answer in 3.9 s; bad base64, an http URL, a non-image: 400 each.
+- Cost: encode 2.1-2.7 s for 184-218 positions, 19.3-23.5 s for 947-1,014 (16 threads beside the engine's
+  pool). An essay decoding beside a 19 s encode (947 positions): 22.2 tok/s against 28.3 alone. Resident
+  106.4-106.7 GB (peak 107.3-107.5, reached at start and not raised by any encode) against 104.5: the tower's f32
+  weights (1.9 GB) and the table. Available beside the service: 16.4-17.0 GiB (19.3 before).
+- Without images: gate x110-j-172148 on chunk185 18.351 against 18.475 (decode256k 39.1, 39.2; serve256k3
+  78.93; decode 31.2; prefill128 10.5; prefill256k 2.0), identity identical. `perf_diff.py gate` exits 1 on the
+  unscored serve256k1: 36.01 against 32.98 prints REGRESSION; the case read 33.2-37.2 over today's sessions on
+  every build (its two known levels). `run.json` records correctness "skipped": the ds-checks are attached by
+  hand. A second session on chunk185 (x111-v-1-180731): identical, serve256k1 35.86, serve256k3 81.17.
+  x110-i-162914 on chunk182 (the same kernels) 18.578, identical. ds-checks on chunk185 (X146, parts a, b, c; `ds-checks.log`): pass, each part the same text as the X86 run; the
+  image-position check on chunk185 (`img-check.log`): the figures above, ok.
+  The changed kernel files (`dsv41.cu`, `gemv.cu`) compile with `nvcc -cubin` for sm_86, sm_89 and sm_120a
+  (`nvcc-archs.txt`).
+- Reruns on chunk185 after the adjudicator's HOLD (X154): two and three images in one request; two turns and
+  the same streamed (1,006 and 992 tokens reused; turn 2 in 0.7 s); the three 400s; the 600-row table (red,
+  text, squares, green, blue, red again, text again: all right; 1,014 and 756 positions refused before anything
+  is displaced; red right after the refusals); and production's settings (the profile, the corpus on,
+  QX_DS_RAM_YIELD=12 with a pid path): an image answered with the part in, out (a cached image, a new one, and
+  a 1,014-position prefix reused) and back; resident 106.6 -> 94.6 -> 106.6 G, available 17.0 -> 28.7 -> 16.7.
+
+Breaker (fresh context, reading only, on the build before the fixes): no path found that corrupts results; every
+call site of the three changed kernels passes every word they read; no other reader of the token array. Its
+defects, all answered: idle contexts pinned the table (they give way now); abandoned requests piled up encodes
+(own task, cached); the cache was first-in-first-out of eight (by recency and size); bodies were parsed before
+the key was checked (a layer in front); a projector of another width crashed the scheduler (refused at start).
+Its tests: the numeric check (written: `qx-ds-img-check`), the window path, three truly at once, text after an
+image beyond the kept tail, eviction and re-registration: run, above.
+
+Not covered:
+- A deep rewind whose replay chunk crosses an image: the scheduler chose a fresh prefill both times it was
+  set up (X152 b, d: 0 reused). The replay uses the same per-row ids as the chunk the numeric check covers.
+- f16 prompt chunks on image rows are held to no measured bound (the KL bound was measured on text); the answers
+  above went through them. KV-only rows over an image: the 3,273-token prompt is the only case.
+- `qx-ds-replay` cannot replay a session with images (the trace holds ids, not blocks). The f32 CPU reference
+  (`qx-ref`) has no image path, so ds-checks do not see image positions; `qx-ds-img-check` is its own check.
+- The predictors and the prefetch use the text bias at image positions (order of expert staging, not results).
+- Image URLs are not fetched. Images above 20 MB or more than 16 per request are refused. A request that fails
+  at its k-th image has already displaced idle contexts for the earlier ones.
+- `tools/vision_ref.py` is by the same author from the same reference: it shows the Rust tower matches that
+  reading of `vision.py` and that mapping of the GGUF's tensors, not that the reading is right. The independent
+  evidence is behavioural (exact text from 8x23 and 44x22 grids, the invoice, the photographs). llama.cpp's
+  port (`tools/mtmd/clip.cpp`, built here as a library) was read but not run against it; torch is not installed,
+  so the reference itself was never run.
+- Fitting differs from Pillow for 16-bit PNG (Pillow clips, the `image` crate scales) and by up to 4 levels
+  for JPEG (the decoder); the effect on the block is not measured. EXIF orientation is not applied and alpha is
+  dropped (both as the reference does). HEIC, AVIF and TIFF are refused; an animated GIF gives its first frame.
+- Encodes are serial across all clients: a request with 16 photographs holds the tower for about 6 minutes.
+- What image traffic does to the expert tiers (image positions route under another bias) and to the speed of
+  text decode afterwards is not measured.
+- The vision threads are not kept off the engine's cores (the 22 against 28 tok/s above); the tower on the GPU
+  (the f16 GEMM kernel exists) is the way to seconds.
+
+### Adjudication (fresh context, 2026-11-19): HOLD, then lifted
+Scored gate, identity, ds-checks' binary, the chain-to-build mapping and every quoted reply reproduced; the tower
+compared again with `vision_ref.py` on one image (3.7e-5). HOLD for: an uncommitted tree with an untracked check;
+one identity session on the final server; five user-facing paths last run before the table and server rewrites;
+claims stronger than their logs (the title, the 12 MB upload, the 0.9 GB, the 44 KB body, the 23 s encode, the
+compile without a log) and gaps in "Not covered"; and a smoke under production's settings before the deploy.
+Answered by X154 (the five paths and production's settings with a hand-over), x111-v (identical), `nvcc-archs.txt`
+and the corrections above. Its cadence flag stands: the last four experiments attacked no presupposition; the
+next one must.
+
+Raw: `perf/results/2026-11-19/x-vision/`, `x110-i-162914`, `x110-j-172148`, `x111-v-1-180731`.

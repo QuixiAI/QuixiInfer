@@ -19,7 +19,7 @@ Environment=RUST_BACKTRACE=1
 # the driver's JIT cache: at its 1 GiB default the kernel modules evict each other (10-20 minute cold starts)
 Environment=CUDA_CACHE_MAXSIZE=4294967296
 # The benchmarked 256k configuration on a 128 GB box: 20 GiB VRAM budget, 95 GiB RAM tier (the process is about
-# 105 GB), three slots.
+# 107 GB with the vision tower), three slots.
 Environment=QX_DS_VRAM=20
 Environment=QX_DS_RAM=95
 Environment=QX_DS_PROMOS=32

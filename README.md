@@ -1,17 +1,17 @@
 # QuixiInfer
 
 QuixiInfer serves [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)
-at UD-IQ2_XXS (284 B parameters; six GGUF shards and a 282 GB pack) at the model's full 262,144-token context
+at UD-IQ2_XXS (labelled 748B-A16B in the GGUF: 748 B parameters, 16 B active per token; six GGUF shards and a
+282 GB pack; nearly half of the bytes are the Engram table at Q5_K, the routed experts are IQ1_S to IQ3_XXS by
+layer) at the model's full 262,144-token context
 from a single workstation: one RTX 5090 (32 GB), a 16-core CPU, 128 GB of RAM and an NVMe SSD. Its 15,360
 routed-expert records (about 9.5 MB each) live in three tiers: what the VRAM
 has left after the context and the slots (12.3 GiB, 1,275 records, at three 262k slots, plus 4.1 GiB lent from
 the slots' unused tails), a pinned RAM tier (95 GiB in production: 9,590 records), and the rest read from the
 pack on NVMe as routed. The tiers adapt to what requests route to. Several requests run at once over sequence
 slots; a request sharing a prefix with an earlier one continues from it; parked sequences resume bit-exactly;
-structured outputs are constrained by a grammar engine. The model itself takes images (the
-repository is tagged image-text-to-text and ships the vision projector as `mmproj-BF16.gguf` / `mmproj-F16.gguf`),
-but QuixiInfer does not load the projector: an `image_url` part of a message is dropped without an error and the
-model answers from the text alone.
+structured outputs are constrained by a grammar engine. Images are taken as the model was
+trained to take them ([Image input](#image-input)).
 
 It is written in Rust, with its own CUDA kernels, compiled at build time and launched through CubeCL. No ggml or
 llama.cpp code is linked. The server design comes from DeepInfer, DeepSeek's cluster engine, scaled down to one GPU
@@ -21,10 +21,10 @@ with CPU expert offload and an NVMe tier:
 - asynchronous scheduling;
 - prefix reuse;
 - exact speculative decoding;
-- structured outputs.
+- structured outputs;
+- image input (the model's vision tower).
 
-What it does not do (yet): image input (the model supports it, the engine does not), the Anthropic API, multiple
-GPUs.
+What it does not do (yet): fetching image URLs (images are sent inline), the Anthropic API, multiple GPUs.
 
 ## Where it fits
 
@@ -35,7 +35,7 @@ Several engines run this class of model, and each optimizes for something differ
 | **QuixiInfer** | A shared server on one workstation | One NVIDIA sm_120 GPU, Linux | Continuous batching, 3 slots of 262k each | Several users on one box at full context; decode that does not depend on scheduling |
 | **Basalt** | One user on one Blackwell workstation | NVIDIA sm_120, Linux; an optional second GPU as an expert tier | `--parallel 1..8`, context shared across slots | Single-stream decode speed (tuned packs, self-distilled drafter) |
 | **Strata** (Basalt's parent) | One user on a gaming PC | NVIDIA, AMD, Apple and Intel GPUs, 12 GB of VRAM and up; Windows, Linux, macOS | One request by default | Running on ordinary hardware; apps, APIs, installer |
-| **[colibri](https://github.com/JustVugg/colibri)** | Models far bigger than RAM, on any machine | CPU first; CUDA, Vulkan and Metal tiers | One request | Reach: experts streamed from NVMe, so 284B-1T models still run |
+| **[colibri](https://github.com/JustVugg/colibri)** | Models far bigger than RAM, on any machine | CPU first; CUDA, Vulkan and Metal tiers | One request | Reach: experts streamed from NVMe, so models far larger than RAM still run |
 | **DeepInfer** | DeepSeek's production cluster | SM100 GPUs, Ascend NPUs, 4-64 per deployment | Data and expert parallelism | DeepSeek-V4.1-Flash at data-center scale |
 | **llama.cpp** | General local inference | Almost anything | `--parallel` | Breadth of models and hardware. QuixiInfer uses it offline only, as a reference oracle (tokenizer, golden logits) |
 
@@ -101,8 +101,9 @@ Requirements:
   (sm_89) and the RTX 30 series (sm_86), see "Other GPUs" below;
 - CUDA 13 (`nvcc` at `/usr/local/cuda-13.3/bin`, or set `QX_NVCC`);
 - a recent stable Rust;
-- about 128 GB of RAM (the process is about 105 GB with a 95 GiB RAM tier);
-- the pack (282 GB) on an NVMe drive.
+- about 128 GB of RAM (the process is about 107 GB with a 95 GiB RAM tier and the vision tower);
+- the pack (282 GB) on an NVMe drive;
+- for image input, `mmproj-F16.gguf` from the same model repository.
 
 **1. Build.**
 
@@ -142,7 +143,7 @@ systemd-run --user --scope -p MemoryMax=112G -p MemorySwapMax=0 -- \
 ```
 
 
-That is the benchmarked and production configuration; the process is about 105 GB and is ready about 35 s
+That is the benchmarked and production configuration; the process is about 107 GB (105 without the vision tower) and is ready about 35 s
 after start. `--profile` ranks the experts the tiers are filled with at start (`golden/profile-dsv41.txt` comes
 from a routing trace of a mixed corpus and is the default when present); `--profile-out FILE` writes the live
 ranking after requests, and a start finding that file loads from it instead. `--slots` (2) sets how many
@@ -183,6 +184,43 @@ and each hand-over pauses requests for 0.5-1.7 s. Measured with a stand-in for t
 allocation), not yet with the VM itself; the journal's `ram tier:` lines record each hand-over.
 
 Stop the service before benchmarking: two engines cannot both hold the GPU and pin the experts.
+
+### Image input
+
+DeepSeek-V4.1-Flash is an image-text model; its vision tower ships with the GGUFs as `mmproj-F16.gguf` (971 MB;
+`--mmproj FILE`, or left beside or above the model's directory, where the server finds it). A chat message's
+`image_url` parts (as `data:` URLs: PNG, JPEG, WebP, GIF, BMP) and Anthropic-style `image` parts are fitted,
+encoded and placed in the prompt as the model's own code does it (`inference/image_processor.py`, `vision.py`):
+
+```sh
+curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$(base64 -w0 picture.png)"'"}},
+    {"type": "text", "text": "What is in this picture?"}]}],
+  "max_tokens": 200, "chat_template_kwargs": {"enable_thinking": false}}'
+```
+
+- **What an image costs.** It is fitted to a multiple of 14 pixels (small images are enlarged to about 544 x 544,
+  large ones reduced), and takes `rows x (columns + 1) + 2` positions of the context, a row and a column per 42
+  pixels: about 200 positions for a 640 x 480 picture, at most 1,024 (reached from about 1.8 megapixels: 1280 x 960 takes 738, 1440 x 1080 takes 938). The vision tower runs on the CPU, one image at a time: 2-3 s for a small picture,
+  19-24 s for a large photograph, and requests from all clients wait their turn; a decode running beside a large encode
+  measured 22 against 28 tok/s meanwhile. An image sent again is not encoded again (the last images' blocks are
+  kept, 335 MB at most), and a prompt that repeats an image and the text before it reuses that prefix like any
+  other (a second turn about a 977-position image: 0.7 s).
+- **In the language model** an image position takes its embedding from the vision block, the router's image
+  bias (`exp_probs_b_vl`), no Engram contribution, and is dead to the Engram's n-grams, as in the reference.
+  `qx-ds-img-check` verifies each of these numerically.
+- **Limits.** 16 images and 20 MB per image in one request; `QX_DS_IMG_ROWS` (16,384) image positions held at
+  once across the live contexts, 335 MB of pinned memory (the contexts of idle slots give theirs up first; a
+  request that cannot fit is refused with a 400). Image URLs are not fetched: send the image inline. As in the
+  model's own code, EXIF orientation is not applied (a phone's portrait photograph arrives sideways) and
+  transparency is dropped. HEIC, AVIF and TIFF are not decoded; an animated GIF gives its first frame. Started
+  with `--mmproj none`, or without the file, the server refuses requests with images.
+- **Checked against** a NumPy + Pillow reference of the tower (`tools/vision_ref.py`): the fitted pixels are
+  byte-identical to Pillow's for 8-bit PNG input, the block's values agree to 4e-5. A JPEG decodes up to 4
+  levels apart from Pillow's decoder, and a 16-bit PNG is scaled where Pillow clips. The reference script is
+  by the same hand as the tower: the independent evidence is that the model reads text, counts and describes
+  photographs correctly through it.
 
 ### Settings
 
@@ -226,6 +264,7 @@ Stop the service before benchmarking: two engines cannot both hold the GPU and p
 | `qx-quant`, `qx-pack` | Dequantizers, the GGUF reader, and the pack writer and verifier. |
 | `qx-ref` | The f32 CPU reference, which the engine is checked against. |
 | `qx-tok` | The tokenizer, which matches llama.cpp token for token. |
+| `qx-vision` | The vision tower on the CPU: image fitting (Pillow's bicubic, byte for byte), the ViT and the aligner, from the `mmproj` GGUF. |
 | `qx-serve` | The OpenAI-compatible server and its continuous-batching scheduler. |
 
 `kernels/` holds the CUDA sources. `tools/` holds:
@@ -247,6 +286,8 @@ assumptions tested so far) and `backlog.md`.
 | Tool | What it checks |
 |---|---|
 | `qx-ds-check` (`tools/ds-checks.sh`) | Nine checks: the f32 mode against the CPU reference (exact), the production numerics against it (KL, top-1), windows of 3, 8 and 64 against one-token steps (bit-identical, also with the tiers adapting), the tokenizer against llama.cpp, rewind and park/unpark against the straight pass, windows over several sequences, rewinds by a replay chunk and from checkpoints (all bit-identical). It also saves and resumes 256k states and dumps logits for `tools/logits_compare.py`. |
+| `qx-ds-img-check` | Image positions in the engine: the embedding is the vision block's row bit for bit, the Engram gates are zero, the router's picks are the top k under the image bias (and under the text bias elsewhere), and windows and an exact chunk over an image give the single steps' logits bit for bit. |
+| `qx-vision-check`, `tools/vision_ref.py` | The vision tower on one image, and a NumPy + Pillow reference to compare it with. |
 | `qx-tier-check` | The expert store: RAM places and NVMe reads against the source GGUF byte for byte; with `QX_TIER_ELASTIC=G`, every record through churn, release and restore of the elastic part. |
 | `qx-ds-replay` | Replays a recorded scheduler trace as single steps and compares every row's hash (the exactness check for speculation and scheduling changes). |
 

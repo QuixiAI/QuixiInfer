@@ -784,6 +784,20 @@ becomes a family.
 - The refill under load: promotions wait turn about; not measured on a loaded server.
 - Size of the part: 12 GiB leaves ~14 GiB beside a fully touched VM. 8 would cost less while out (not measured).
 
+### Queue 2026-11-19, after image input
+
+- **The vision tower on the GPU** (a photograph is 19-24 s on the CPU, serial across clients, and decode beside
+  it runs 22 against 28 tok/s): the f16 GEMM kernel exists; attention over 9k patches needs a kernel; VRAM for
+  the weights (1 GB in f16) must come from somewhere (lent like the chunk buffers, or loaded per encode).
+- Compare the tower with llama.cpp's port (`libmtmd`, `clip.cpp`) on a few images: the only independent
+  implementation on the box.
+- An image path in `qx-ref`, so ds-checks' f32 comparison covers image positions; images in the scheduler trace,
+  so `qx-ds-replay` can replay them.
+- A deep rewind across an image never happened in the tests (the scheduler preferred a fresh prefill).
+- Fetching image URLs (off by default, an allow-list); EXIF orientation as an option.
+- The image table in f16 (half the pinned memory); the predictors with the image bias.
+- The cadence flag: the next experiment must attack a presupposition.
+
 ## Parked
 - **Parking idle sequences in host memory** (work in progress, 2026-11-05). This is a serving capability: prefix
   reuse across more conversations than slots. It is not a speed change to the standard benchmark. Its
