@@ -8,8 +8,10 @@ has left after the context and the slots (12.3 GiB, 1,275 records, at three 262k
 the slots' unused tails), a pinned RAM tier (95 GiB in production: 9,590 records), and the rest read from the
 pack on NVMe as routed. The tiers adapt to what requests route to. Several requests run at once over sequence
 slots; a request sharing a prefix with an earlier one continues from it; parked sequences resume bit-exactly;
-structured outputs are constrained by a grammar engine. Image input is not supported: an
-`image_url` part of a message is dropped without an error and the model answers from the text alone.
+structured outputs are constrained by a grammar engine. The model itself takes images (the
+repository is tagged image-text-to-text and ships the vision projector as `mmproj-BF16.gguf` / `mmproj-F16.gguf`),
+but QuixiInfer does not load the projector: an `image_url` part of a message is dropped without an error and the
+model answers from the text alone.
 
 It is written in Rust, with its own CUDA kernels, compiled at build time and launched through CubeCL. No ggml or
 llama.cpp code is linked. The server design comes from DeepInfer, DeepSeek's cluster engine, scaled down to one GPU
@@ -21,7 +23,8 @@ with CPU expert offload and an NVMe tier:
 - exact speculative decoding;
 - structured outputs.
 
-What it does not do (yet): vision, the Anthropic API, multiple GPUs.
+What it does not do (yet): image input (the model supports it, the engine does not), the Anthropic API, multiple
+GPUs.
 
 ## Where it fits
 
@@ -249,7 +252,7 @@ assumptions tested so far) and `backlog.md`.
 
 ## License
 
-MIT ([LICENSE](LICENSE)). The model keeps its own license (DeepSeek's model license). `third_party/cubecl-cuda` is
+MIT ([LICENSE](LICENSE)). The model keeps its own license (MIT, per its model card). `third_party/cubecl-cuda` is
 a patched copy of the cubecl-cuda crate under its own license (MIT/Apache-2.0). QuixiInfer learns from DeepInfer,
 Strata, Basalt, colibri, Big-MoE-Small-Box and llama.cpp (see [docs/kernel-references.md](docs/kernel-references.md)),
 but it contains no code from them. The IQ lookup grids are ggml's data tables.
