@@ -175,7 +175,9 @@ serve_case() {
   # it is about 106 GB. 95 against 90 measured serve3 -5.4% and serve1 -5.0% (2026-11-06, outside the spreads):
   # the serving gap is residency. The tier is part of the recorded settings, so runs at different tiers refuse to
   # compare. The later env entry wins.
-  local srv=(env "${BASE[@]}" QX_DS_RAM="${SERVE_RAM}" QX_SCHED_STATS=1 "${EXTRA[@]}" $SERVER serve --model "$M" --pack "$PACK"
+  # (QX_DS_SPEC_CORPUS=0: the load generator's warm-up asks the measured prompts, and the corpus of finished replies
+  # would draft every measured reply from them; an experiment's own setting, after "--", overrides it)
+  local srv=(env "${BASE[@]}" QX_DS_RAM="${SERVE_RAM}" QX_SCHED_STATS=1 QX_DS_SPEC_CORPUS=0 "${EXTRA[@]}" $SERVER serve --model "$M" --pack "$PACK"
              --ctx "$ctx" --slots 3 --window "$SERVE_WINDOW" --host 127.0.0.1 --port "$PORT")
   cmds+=("${srv[*]} ; python3 tools/loadgen.py --url http://127.0.0.1:$PORT/v1 --levels ${SERVE_LEVELS:-1,3} --rounds 2 --max-tokens 256 --temperature 0 --warmup 6")
   "${srv[@]}" > "$slog" 2>&1 &

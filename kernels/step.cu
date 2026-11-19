@@ -177,6 +177,9 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
             u64* slots_all = info[17] ? reinterpret_cast<u64*>(info[17]) : nullptr;
             u64* slots_stg = info[18] ? reinterpret_cast<u64*>(info[18]) : nullptr;
             i32* all = reinterpret_cast<i32*>(mb + MB_ALL(E));
+            // [21] (when not 0): the experts the tier scores in place of the selected ones (residency-aware routing:
+            // the picks by the true score)
+            const i32* score_ids = info[21] ? reinterpret_cast<const i32*>(info[21]) : ids;
             for (u32 j = 0; j < A; ++j) {
                 u64 slot = *reinterpret_cast<const volatile u64*>(&table[ids[j]]);
                 bool staged = false;
@@ -202,7 +205,7 @@ extern "C" __global__ void qx_moe_post(const u64* info) {
                 slots[j] = slot;
                 if (slots_all) slots_all[j] = staged ? 1 : slot;
                 if (slots_stg) slots_stg[j] = 0;
-                all[j] = ids[j];
+                all[j] = score_ids[j];
                 if (slot == 0 && !staged) {
                     reinterpret_cast<i32*>(mb + MB_IDS)[n] = ids[j];
                     reinterpret_cast<i32*>(mb + MB_KIDX)[n] = (i32)j;

@@ -206,6 +206,8 @@ struct Scratch {
     logits_p: DeviceBuf,
     wts_p: DeviceBuf,
     ids: DeviceBuf,
+    /// Residency-aware routing: the picks by the true score, for the tier's scoring.
+    ids_true: DeviceBuf,
     wts: DeviceBuf,
     yk: DeviceBuf,
     ones_slots: DeviceBuf,
@@ -460,6 +462,9 @@ pub struct DsEngine<'a> {
     /// stores already hold the exact rows; the replay's early positions are not exact and must not overwrite or
     /// be read back from them) and launch eagerly (no graph has that kernel set).
     replaying: bool,
+    /// Whether the last `layer_ffn_pre` routed with the residency preference and wrote the true picks
+    /// (`QX_DS_ROUTE_TRUE=0`: the tier scores the biased picks, as before 2026-11-19).
+    route_true: std::cell::Cell<bool>,
     /// The stores' tails lent to the tier: the positions a slot keeps (0: nothing is lent) and the slots whose
     /// tails are lent now (`store_need`, `store_lend`).
     lend_keep: usize,
@@ -801,6 +806,13 @@ fn chunk_gemm() -> bool {
     *V.get_or_init(|| !std::env::var("QX_DS_PREFILL_EXACT").is_ok_and(|v| v == "1") && !std::env::var("QX_DS_CHUNK_GEMM").is_ok_and(|v| v == "0"))
 }
 
+/// Whether the tier scores the picks by the true score under `QX_DS_ROUTE_RES` (and takes those it does not hold as
+/// promotion candidates). `QX_DS_ROUTE_TRUE=0`: the selected ones, as before.
+pub(crate) fn route_true_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QX_DS_ROUTE_RES").ok().and_then(|v| v.parse::<f32>().ok()).is_some_and(|m| m > 1.0) && !std::env::var("QX_DS_ROUTE_TRUE").is_ok_and(|v| v == "0"))
+}
+
 /// The 4-byte units of `ChunkBufs::extra` for chunks of `rows` rows: the chunk-wide FFN rows and their f16 inputs
 /// and weights, one layer's attention-side dense weights as f16 with a slab's f16 inputs and outputs, and eight
 /// expert side streams' scratch (an estimate from the shapes, with slack; `cscratch` falls back to an allocation).
@@ -954,6 +966,7 @@ impl<'a> DsEngine<'a> {
             logits_p: buf(cfg.n_expert * tm),
             wts_p: buf(crate::mailbox::PRED_K * tm),
             ids: buf(cfg.n_expert_used * tm),
+            ids_true: buf(cfg.n_expert_used * tm),
             wts: buf(cfg.n_expert_used * tm),
             yk: buf(cfg.n_expert_used * E * tm),
             ones_slots: DeviceBuf::from_slice(&vec![1u64; cfg.n_expert_used * tm]),
@@ -1443,6 +1456,7 @@ impl<'a> DsEngine<'a> {
             chunk_side: Vec::new(),
             chunk_ord: 0,
             replaying: false,
+            route_true: std::cell::Cell::new(false),
             lend_keep: lend_keep_v,
             lent: vec![false; slots],
             lend_started: false,
@@ -1580,7 +1594,7 @@ impl<'a> DsEngine<'a> {
         self.rms(s.xpre_p.ptr, w.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l) as u64;
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0]);
         if prefetch_k() > 0 && !self.warm {
             // (never from a dry pass: its routing is not a real job's)
             // tell the driver: layer and tokens; the kernel adds a device-side counter so every prediction is
@@ -1605,7 +1619,7 @@ impl<'a> DsEngine<'a> {
         self.rms(s.xpre.ptr, w1.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l + 1) as u64;
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w1.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w1.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0]);
         if prefetch_k() > 0 && !self.warm && t <= 8 {
             // the prefetch on the cheap predictor: one norm and one router GEMV, a whole expert phase of lead
             if let Some(ab) = self.abufs.as_ref() {
@@ -3682,7 +3696,8 @@ impl<'a> DsEngine<'a> {
             Some(ab) if res_ok && res_mul > 1.0 && t <= res_t && l >= res_l0 && l < res_l1 => [ab.table_dev.ptr, (l * c.n_expert) as u64, bits(res_mul), res_keep],
             _ => [0, 0, 0, 0],
         };
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[self.s.logits_r.ptr, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, self.s.ids.ptr, self.s.wts.ptr, bits(c.w_scale), res[0], res[1], res[2], res[3]]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[self.s.logits_r.ptr, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, self.s.ids.ptr, self.s.wts.ptr, bits(c.w_scale), res[0], res[1], res[2], res[3], if res[0] != 0 && route_true_on() { self.s.ids_true.ptr } else { 0 }]);
+        self.route_true.set(res[0] != 0 && route_true_on());
     }
 
     /// The FFN's dense part for every row of a chunk at once (`QX_DS_CHUNK_GEMM=1`): the router logits (f32) and the
@@ -3717,7 +3732,7 @@ impl<'a> DsEngine<'a> {
         let pk = crate::mailbox::PRED_K;
         self.rms(s.xpre.ptr, w1.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, pk as u64, w1.router_bias.ptr, pb.ptr + (r0 * pk * 4) as u64, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, pk as u64, w1.router_bias.ptr, pb.ptr + (r0 * pk * 4) as u64, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0]);
     }
 
     fn chunk_ffn_alloc(&mut self, rows_max: usize) {
@@ -3738,7 +3753,7 @@ impl<'a> DsEngine<'a> {
         // (rows `ra` on: the chunk's rows from which this layer runs)
         let ku = (ra * c.n_expert_used * 4) as u64;
         w.g_ffn.run_blas_to(&self.gpu, cb.x.ptr + (ra * E * 4) as u64, rows, &[lg, g, u], x16, w16);
-        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr + ku, cb.wts.ptr + ku, bits(c.w_scale), 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr + ku, cb.wts.ptr + ku, bits(c.w_scale), 0, 0, 0, 0, 0]);
         self.k("qx_ds_silu_mul_clamp", 256, (((c.ff_exp * rows) as u32).div_ceil(256), 1, 1), &[g, u, h, (c.ff_exp * rows) as u64, bits(c.clamp_shexp[l])]);
         w.g_shd.run_blas_to(&self.gpu, h, rows, &[cb.shy.ptr + (ra * E * 4) as u64], x16, w16);
     }
@@ -3769,7 +3784,7 @@ impl<'a> DsEngine<'a> {
             let mb = d.shared.mb.dptr;
             let stage_share = if t >= ab.stage_wide_min { ab.stage_share } else if t >= 2 { ab.stage_share_narrow } else { ab.stage_share_decode };
             self.trace("qx_moe_post");
-            gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (tt, 1, 1), &[mb, ab.table_dev.ptr, (l * c.n_expert) as u64, self.s.ids.ptr, self.s.wts.ptr, self.s.x.ptr, ab.step.ptr, l as u64, k as u64, E as u64, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, t as u64 | ((self.warm as u64) << 32), ab.rtable_dev.ptr, ab.gpu_share, stage_share, ab.slots_all.ptr, ab.slots_stg.ptr, ab.stage_cap as u64, ab.prestaged.ptr]);
+            gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (tt, 1, 1), &[mb, ab.table_dev.ptr, (l * c.n_expert) as u64, self.s.ids.ptr, self.s.wts.ptr, self.s.x.ptr, ab.step.ptr, l as u64, k as u64, E as u64, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, t as u64 | ((self.warm as u64) << 32), ab.rtable_dev.ptr, ab.gpu_share, stage_share, ab.slots_all.ptr, ab.slots_stg.ptr, ab.stage_cap as u64, ab.prestaged.ptr, if self.route_true.get() { self.s.ids_true.ptr } else { 0 }]);
             self.trace_done();
             self.dsync("post");
             self.launch_resident(l, k, t, ab.slots.ptr, ab.xq.ptr, ab.xd.ptr, ab.gu.ptr, ab.gpu_out.ptr);

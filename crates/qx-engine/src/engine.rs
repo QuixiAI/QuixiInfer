@@ -1069,7 +1069,7 @@ impl<'a> Engine<'a> {
         self.gpu.run(MOE.kernel("qx_moe_route", CubeDim::new_1d(32)), (t as u32, 1, 1), &[s.router.ptr, c.n_expert as u64, k as u64, s.ids.ptr, s.wts.ptr, tab, base, rj as u64, rm as u64]);
         let (mb, words) = self.mailbox();
         // Hand the misses to the CPU first, so the pool works while the GPU computes the resident experts.
-        self.gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (t as u32, 1, 1), &[mb.dptr, tab, base, s.ids.ptr, s.wts.ptr, s.x.ptr, words, l as u64, k as u64, E as u64, s.slots.ptr, s.xq.ptr, s.xd.ptr, t as u64]);
+        self.gpu.run(STEP.kernel("qx_moe_post", CubeDim::new_1d(256)), (t as u32, 1, 1), &[mb.dptr, tab, base, s.ids.ptr, s.wts.ptr, s.x.ptr, words, l as u64, k as u64, E as u64, s.slots.ptr, s.xq.ptr, s.xd.ptr, t as u64, 0, 0, 0, 0, 0, 0, 0, 0]);
         let gb = le.gate_bytes() as u64;
         // the scale tail (NVFP4) sits after the down rows
         let tail = 2 * gb + le.down_bytes() as u64;

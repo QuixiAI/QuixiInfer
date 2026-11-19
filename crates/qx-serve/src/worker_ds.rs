@@ -123,20 +123,41 @@ struct Req<'a> {
     spec_rate: f32,
 }
 
-/// The continuation of the most recent earlier occurrence of the sequence's last `n` tokens (`hist` then `next`),
-/// at most `k` tokens, all of them known; empty when there is none.
-fn lookup_draft(hist: &[u32], next: u32, n: usize, k: usize) -> Vec<u32> {
-    if n < 2 || k == 0 || hist.len() < n {
-        return Vec::new();
+/// Drafts by suffix: the place in `seq` whose preceding tokens agree with the end of `suf` over the most tokens
+/// (at least `n`, at most 24 counted; the latest such place on a tie), and the up to `k` tokens that follow it
+/// there. `SEP` (between the replies of the corpus) never matches and ends a continuation. Returns the agreed
+/// length and the drafts; (0, empty) when there is none. The search stops with the best place so far after
+/// 200,000 token comparisons (a history that is one token repeated agrees almost everywhere).
+const SEP: u32 = u32::MAX;
+fn suffix_draft(seq: &[u32], suf: &[u32], n: usize, k: usize) -> (usize, Vec<u32>) {
+    let Some(&last) = suf.last() else { return (0, Vec::new()) };
+    let n = n.min(24);
+    if k == 0 || suf.len() < n || seq.len() < n + 1 {
+        return (0, Vec::new());
     }
-    let suf = &hist[hist.len() - (n - 1)..];
-    // e: the index in `hist` of an earlier copy of `next` whose n - 1 predecessors match too
-    for e in (n - 1..hist.len() - 1).rev() {
-        if hist[e] == next && hist[e + 1 - n..e] == *suf {
-            return hist[e + 1..hist.len().min(e + 1 + k)].to_vec();
+    let (mut best, mut at) = (0usize, 0usize);
+    let mut work = 0usize;
+    for e in (n - 1..seq.len() - 1).rev() {
+        if seq[e] != last || seq[e + 1] == SEP {
+            continue;
+        }
+        let m = (0..suf.len().min(24).min(e + 1)).take_while(|&j| seq[e - j] == suf[suf.len() - 1 - j]).count();
+        work += m + 1;
+        if work > 200_000 && m <= best {
+            break;
+        }
+        if m > best {
+            best = m;
+            at = e;
+            if m == suf.len().min(24) {
+                break;
+            }
         }
     }
-    Vec::new()
+    if best < n {
+        return (0, Vec::new());
+    }
+    (best, seq[at + 1..seq.len().min(at + 1 + k)].iter().copied().take_while(|&t| t != SEP).collect())
 }
 
 impl Req<'_> {
@@ -302,6 +323,16 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         // (and at most QX_DS_SPEC_MULTI drafts, default 0, none: the other decoders get one token from the step however
         // wide it is. Measured 2026-11-18 with 3: a file edit beside an essay 30.9 -> 25.4 s, the essay 23.2 -> 29.4 s)
         let spec_max_multi: usize = std::env::var("QX_DS_SPEC_MULTI").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(spec_max);
+        // Suffix decoding (vLLM's): the replies of finished requests, up to QX_DS_SPEC_CORPUS tokens of them (default
+        // 0, none; 262,144 is the size tried), are a second source of drafts. Opt-in: a full corpus on fresh text is
+        // unmeasured, and a reply's speed can tell a client that another request produced the same continuation. A draft is only ever a guess the model's own rows
+        // confirm, so no reply's content reaches another request; its speed can.
+        let corpus_max: usize = std::env::var("QX_DS_SPEC_CORPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        // (a place in another reply must agree over QX_DS_SPEC_N_CORPUS tokens, default 8: a full corpus of replies
+        // in one style agrees over 4 with almost anything)
+        let spec_n_corpus: usize = std::env::var("QX_DS_SPEC_N_CORPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let mut corpus: Vec<u32> = Vec::new();
+        let mut spec_corpus_steps = 0usize;
         let mut n_dec = 0usize;
         let mut spec_sat_out = 0usize;
         // (QX_DS_SPEC_COOL: steps a request sits out after a step with no draft accepted, default 8)
@@ -578,7 +609,20 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                     }
                     let mut hist = eng.tokens(r.slot).to_vec();
                     hist.extend(&r.refeed);
-                    wanted[ri] = lookup_draft(&hist, id, if n_dec > 1 { spec_n_multi } else { spec_n }, r.spec_k.min(if n_dec > 1 { spec_max_multi } else { spec_max }).min(left));
+                    // (the end of the sequence: the last 23 tokens and the sample)
+                    let mut suf = hist[hist.len().saturating_sub(23)..].to_vec();
+                    suf.push(id);
+                    let n = if n_dec > 1 { spec_n_multi } else { spec_n };
+                    let kk = r.spec_k.min(if n_dec > 1 { spec_max_multi } else { spec_max }).min(left);
+                    // its own slot's history, or the finished replies of every request where they agree longer
+                    let (m_own, own) = suffix_draft(&hist, &suf, n, kk);
+                    let (m_corp, corp) = if corpus.is_empty() { (0, Vec::new()) } else { suffix_draft(&corpus, &suf, n.max(spec_n_corpus), kk) };
+                    wanted[ri] = if m_corp > m_own && !corp.is_empty() {
+                        spec_corpus_steps += 1;
+                        corp
+                    } else {
+                        own
+                    };
                 }
                 let all: usize = wanted.iter().map(|w| w.len()).sum();
                 let mut give = WIDTHS.iter().copied().filter(|&w| w >= base && w <= base + all && w <= DS_TMAX).max().map_or(0, |w| w - base);
@@ -773,6 +817,19 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             while i < running.len() {
                 if running[i].finish.is_some() {
                     let r = running.remove(i);
+                    if spec_max > 0 && corpus_max > 0 {
+                        // the reply's tokens as the slot holds them (the last sample was never fed)
+                        let toks = eng.tokens(r.slot);
+                        let (a, b) = (r.job.prompt.len().min(toks.len()), (r.job.prompt.len() + r.n).min(toks.len()));
+                        if b > a + 8 {
+                            corpus.extend_from_slice(&toks[a..b]);
+                            corpus.push(SEP);
+                            if corpus.len() > corpus_max {
+                                let cut = corpus.len() - corpus_max;
+                                corpus.drain(..cut);
+                            }
+                        }
+                    }
                     r.done(stats, &eng.tier_stats().unwrap_or_default());
                     free.push(r.slot);
                 } else {
@@ -780,7 +837,7 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
                 }
             }
             if stats && (steps % 200 == 0 || running.is_empty()) {
-                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}, chunk steps {chunk_steps} ({multi_chunks} of several slots), prefix copies {prefix_copies}, speculation {spec_steps} steps: {spec_accepted} of {spec_drafted} drafts accepted, {spec_refed} tokens fed again ({spec_sat_out} decoders sat a step out), {admit_reordered} admitted out of order", running.len(), waiting.len(), width_hist);
+                eprintln!("sched: {steps} steps, {} running, {} waiting, window widths {:?}, KV-only windows {kv_only_windows}, chunk steps {chunk_steps} ({multi_chunks} of several slots), prefix copies {prefix_copies}, speculation {spec_steps} steps: {spec_accepted} of {spec_drafted} drafts accepted, {spec_refed} tokens fed again, {spec_corpus_steps} steps drafted from other replies ({spec_sat_out} decoders sat a step out), {admit_reordered} admitted out of order", running.len(), waiting.len(), width_hist);
                 if acc_steps > 0 {
                     let k = acc_steps as f64 / 1e3;
                     // the wall between forwards is everything outside the engine: host sampling, detokenizing,

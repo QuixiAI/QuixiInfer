@@ -775,6 +775,15 @@ impl Loop {
         for &e in &all {
             self.host.score[l * ne + e as usize] += 1.0;
         }
+        // (residency-aware routing: `all` is then the picks by the true score, and one the router passed over for
+        // a resident is a promotion candidate like a miss)
+        if super::route_true_on() {
+            for &e in &all {
+                if self.host.table[l * ne + e as usize] == 0 {
+                    self.missed.push(l * ne + e as usize);
+                }
+            }
+        }
         {
             // the speculative-prefetch premise: would the previous token's experts of this layer have guessed these?
             if self.last_sel.len() < self.host.layers.len() {

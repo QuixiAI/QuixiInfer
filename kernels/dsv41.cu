@@ -221,7 +221,8 @@ extern "C" __global__ void qx_ds_engram_gate(const u64* info) {
 /// [5] weights out (f32 T x k), [6] scale bits.
 /// Residency-aware routing (lossy, opt-in) when [7] != 0: the selection score of an expert the VRAM tier holds
 /// (table [7] at entry [8] + id, nonzero: resident) is p * [9] (f32 bits, > 1) + bias for the picks after the
-/// first [10], which go by the true score; the weights stay the true probs over the picks.
+/// first [10], which go by the true score; the weights stay the true probs over the picks. [11] (when not 0): the
+/// picks by the true score alone (i32 T x k), for the tier's scoring: what the model asked for, not what it got.
 extern "C" __global__ void qx_ds_route(const u64* info) {
     const u32 n = U(1), k = U(2), l = threadIdx.x, t = blockIdx.x;
     const float* lg = CF(0) + (u64)t * n;
@@ -274,6 +275,30 @@ extern "C" __global__ void qx_ds_route(const u64* info) {
     if (l < k) {
         reinterpret_cast<i32*>(info[4])[(u64)t * k + l] = myid;
         F(5)[(u64)t * k + l] = __fmul_rn(__fdiv_rn(mine, tot), __uint_as_float(U(6)));
+    }
+    if (table && info[11]) {
+        for (u32 i = 0; i < per; ++i) {
+            const u32 e = i * 32 + l;
+            s[i] = e < n ? p[i] + bias[e] : -3.402823466e38f;
+        }
+        i32 tid = 0;
+        for (u32 r = 0; r < k; ++r) {
+            float bv = -3.402823466e38f;
+            i32 bi = 0x7fffffff;
+            for (u32 i = 0; i < per; ++i) {
+                const i32 e = (i32)(i * 32 + l);
+                if (e < (i32)n && (s[i] > bv || (s[i] == bv && e < bi))) { bv = s[i]; bi = e; }
+            }
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const i32 oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            if (bi != 0x7fffffff && (u32)(bi % 32) == l) s[bi / 32] = -3.402823466e38f;
+            if (bi == 0x7fffffff) bi = 0;
+            if (l == r) tid = bi;
+        }
+        if (l < k) reinterpret_cast<i32*>(info[11])[(u64)t * k + l] = tid;
     }
 }
 
