@@ -226,6 +226,118 @@ impl Req<'_> {
 
 const ENGINE_THREAD: &str = "qx-ds-engine";
 
+/// MemAvailable of /proc/meminfo in bytes.
+fn mem_available() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let l = s.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    Some(l.split_whitespace().nth(1)?.parse::<u64>().ok()? * 1024)
+}
+
+/// Gives the RAM tier's elastic part (QX_DS_RAM_YIELD GiB, `DsEngine::ram_yield`) back to the host while something
+/// else needs the memory, and takes it again afterwards. Out when the path QX_DS_YIELD_PATH exists (a virtual
+/// machine's pid file: known before the guest touches its memory) or the host's available memory is under
+/// QX_DS_YIELD_LOW GiB (default 4); back when the path is gone and the available memory has stayed above the
+/// part's size plus QX_DS_YIELD_HIGH GiB (default 8) for QX_DS_YIELD_HOLD seconds (default 20). Replies are the
+/// same either way: the records that fall out are read from NVMe meanwhile.
+struct Yielder {
+    bytes: u64,
+    path: Option<std::path::PathBuf>,
+    low: u64,
+    high: u64,
+    hold: std::time::Duration,
+    out: bool,
+    checked: std::time::Instant,
+    roomy_since: Option<std::time::Instant>,
+    /// Records the last restore has yet to read back (reported once it reaches 0).
+    refilling: bool,
+    /// After a release: when it happened and what was available before, for the line that says what the host got.
+    released: Option<(std::time::Instant, u64)>,
+}
+
+impl Yielder {
+    fn new(eng: &DsEngine) -> Option<Self> {
+        let bytes = eng.ram_elastic() as u64;
+        if bytes == 0 {
+            return None;
+        }
+        let gib = |k: &str, d: f64| (std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d) * 1073741824.0) as u64;
+        let path = std::env::var("QX_DS_YIELD_PATH").ok().filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        let hold = std::time::Duration::from_secs_f64(std::env::var("QX_DS_YIELD_HOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0));
+        let low = gib("QX_DS_YIELD_LOW", 4.0);
+        // the part returns only into room that leaves the host well above the low mark (or it would go out again)
+        let high = gib("QX_DS_YIELD_HIGH", 8.0).max(low + (2 << 30));
+        // (a server started beside the path has the part out already)
+        let out = eng.ram_yield_out();
+        let me = Self { bytes, path, low, high, hold, out, checked: std::time::Instant::now(), roomy_since: None, refilling: false, released: None };
+        eprintln!(
+            "ram tier: {:.1} GiB go back to the host while {} or under {:.1} GiB are available, and return {:.0} s after",
+            bytes as f64 / 1073741824.0,
+            me.path.as_ref().map(|p| format!("{} exists", p.display())).unwrap_or_else(|| "(no QX_DS_YIELD_PATH)".into()),
+            me.low as f64 / 1073741824.0,
+            hold.as_secs_f64()
+        );
+        Some(me)
+    }
+
+    /// Between steps and while idle; looks at the host five times a second at most.
+    fn check(&mut self, eng: &mut DsEngine) {
+        if self.checked.elapsed() < std::time::Duration::from_millis(200) {
+            return;
+        }
+        self.checked = std::time::Instant::now();
+        let present = self.path.is_some() && qx_engine::dsv41::yield_path_alive();
+        let avail = mem_available().unwrap_or(u64::MAX);
+        let g = |b: u64| b as f64 / 1073741824.0;
+        if let Some((when, before)) = self.released {
+            if when.elapsed() >= std::time::Duration::from_secs(2) {
+                self.released = None;
+                // (the other side may have taken some of it already: a host that got none of it is the news; and a
+                // part taken again within the two seconds says nothing)
+                if !self.out {
+                } else if avail < before + self.bytes / 2 && !present {
+                    eprintln!("ram tier: WARNING: {:.1} GiB are available 2 s after the release, {:.1} before it", g(avail), g(before));
+                } else {
+                    eprintln!("ram tier: {:.1} GiB are available 2 s after the release ({:.1} before it)", g(avail), g(before));
+                }
+            }
+        }
+        if !self.out {
+            if self.refilling && eng.ram_yield_stats().2 == 0 {
+                self.refilling = false;
+                eprintln!("ram tier: every record that had gone to NVMe is back in RAM");
+            }
+            if present || avail < self.low {
+                let t0 = std::time::Instant::now();
+                self.out = eng.ram_yield(true);
+                let (dropped, moved, _) = eng.ram_yield_stats();
+                eprintln!(
+                    "ram tier: {:.1} GiB handed back to the host in {:.0} ms ({}; {:.1} GiB were available): {dropped} records now on NVMe, {moved} moved",
+                    g(self.bytes),
+                    1e3 * t0.elapsed().as_secs_f64(),
+                    if present { "the yield path appeared" } else { "available memory under the low mark" },
+                    g(avail)
+                );
+                self.roomy_since = None;
+                self.refilling = false;
+                self.released = Some((std::time::Instant::now(), avail));
+            }
+        } else if !present && avail > self.bytes + self.high {
+            let since = *self.roomy_since.get_or_insert(self.checked);
+            if since.elapsed() >= self.hold {
+                let t0 = std::time::Instant::now();
+                self.out = eng.ram_yield(false);
+                self.roomy_since = None;
+                if !self.out {
+                    self.refilling = true;
+                    eprintln!("ram tier: {:.1} GiB taken again in {:.0} ms ({:.1} GiB were available); {} records to read back", g(self.bytes), 1e3 * t0.elapsed().as_secs_f64(), g(avail), eng.ram_yield_stats().2);
+                }
+            }
+        } else {
+            self.roomy_since = None;
+        }
+    }
+}
+
 pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc::Sender<Job>> {
     let (tx, rx) = mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
@@ -372,12 +484,26 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
         let mut acc_wall = 0f64;
         let mut acc_steps = 0usize;
         let mut last_step_end: Option<std::time::Instant> = None;
+        let mut yielder = Yielder::new(&eng);
         loop {
             if running.is_empty() && waiting.is_empty() {
-                match rx.recv() {
-                    Ok(j) => waiting.push_back(j),
-                    Err(_) => return,
+                match &mut yielder {
+                    // idle: the host is still looked at
+                    Some(y) => loop {
+                        match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                            Ok(j) => break waiting.push_back(j),
+                            Err(mpsc::RecvTimeoutError::Timeout) => y.check(&mut eng),
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    },
+                    None => match rx.recv() {
+                        Ok(j) => waiting.push_back(j),
+                        Err(_) => return,
+                    },
                 }
+            }
+            if let Some(y) = &mut yielder {
+                y.check(&mut eng);
             }
             while let Ok(j) = rx.try_recv() {
                 waiting.push_back(j);

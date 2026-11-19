@@ -168,14 +168,27 @@ unsafe impl Sync for HostMapped {}
 
 impl HostMapped {
     pub fn new(bytes: usize) -> Self {
+        Self::try_new(bytes).expect("cuMemHostAlloc")
+    }
+
+    /// `new` that reports a failed allocation (the host has no memory to pin) instead of panicking.
+    pub fn try_new(bytes: usize) -> Option<Self> {
+        Self::try_new_opt(bytes, true)
+    }
+
+    /// `try_new`, with the zero fill left out when `zero` is false (for memory the caller overwrites before
+    /// anything reads it: the fill of 12 GiB is a second).
+    pub fn try_new_opt(bytes: usize, zero: bool) -> Option<Self> {
         bind();
         let bytes = bytes.max(4096);
         unsafe {
-            let ptr = result::malloc_host(bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE).expect("cuMemHostAlloc") as *mut u8;
-            std::ptr::write_bytes(ptr, 0, bytes);
+            let ptr = result::malloc_host(bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE).ok()? as *mut u8;
+            if zero {
+                std::ptr::write_bytes(ptr, 0, bytes);
+            }
             let mut dptr: sys::CUdeviceptr = 0;
             sys::cuMemHostGetDevicePointer_v2(&mut dptr, ptr as *mut _, 0).result().expect("cuMemHostGetDevicePointer");
-            Self { ptr, dptr, bytes }
+            Some(Self { ptr, dptr, bytes })
         }
     }
 

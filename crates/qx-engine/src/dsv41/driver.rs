@@ -26,6 +26,17 @@ pub struct Shared {
     pub lend_want: AtomicU64,
     pub lend_req: AtomicU64,
     pub lend_ack: AtomicU64,
+    /// The RAM tier's elastic part (`yield_check`): wanted out or not, the request counter, the driver's
+    /// acknowledgement, whether it is out now, and the records still to be read back after a restore.
+    pub yield_want: AtomicBool,
+    pub yield_req: AtomicU64,
+    pub yield_ack: AtomicU64,
+    pub yield_out: AtomicBool,
+    pub yield_left: AtomicU64,
+    pub yield_bytes: AtomicU64,
+    /// What the last release did: records that fell to NVMe, records moved between arenas.
+    pub yield_dropped: AtomicU64,
+    pub yield_moved: AtomicU64,
     pub vram_hits: AtomicU64,
     pub ram_hits: AtomicU64,
     pub nvme_misses: AtomicU64,
@@ -211,6 +222,14 @@ impl Driver {
             lend_want: AtomicU64::new(0),
             lend_req: AtomicU64::new(0),
             lend_ack: AtomicU64::new(0),
+            yield_want: AtomicBool::new(false),
+            yield_req: AtomicU64::new(0),
+            yield_ack: AtomicU64::new(0),
+            yield_out: AtomicBool::new(host.store.elastic_out()),
+            yield_left: AtomicU64::new(host.store.elastic_owed.len() as u64),
+            yield_bytes: AtomicU64::new(host.store.elastic_bytes() as u64),
+            yield_dropped: AtomicU64::new(0),
+            yield_moved: AtomicU64::new(0),
             vram_hits: Default::default(),
             ram_hits: Default::default(),
             nvme_misses: Default::default(),
@@ -364,6 +383,11 @@ struct Loop {
     pre_inflight: Vec<usize>,
     pre_live: [Vec<(usize, u64)>; 2],
     pre_free: [Vec<u64>; 2],
+    /// The records the RAM tier's elastic part gave up (coldest first): read back, hottest first, once it is
+    /// restored (`promote_one`).
+    restore: Vec<usize>,
+    /// Whether the refill had the last turn (it alternates with the adaptive promotions).
+    restore_turn: bool,
 }
 
 impl Loop {
@@ -1149,6 +1173,61 @@ impl Loop {
     /// record there leaves the table (host and device), the free and quarantined slots there leave their lists, and
     /// the acknowledgement is written after the device table words landed, so the engine may write the store rows.
     /// A slot lending them again: its carved slots return to the free lists, empty.
+    /// The RAM tier's elastic part, on the engine's request (`Engine::ram_yield`, made between windows: nothing of
+    /// the engine's is in flight). Out: every copy that reads or writes a RAM place is waited for, the promotion
+    /// reads land, the quarantined places go back, then the store keeps the hottest records in its first arenas
+    /// and frees the elastic ones; the GPU's table of RAM addresses follows before the acknowledgement. Back: the
+    /// arenas are allocated again and the records that fell out are read back by `promote_one`.
+    fn yield_check(&mut self, sh: &Shared) {
+        let req = sh.yield_req.load(Ordering::Acquire);
+        if req == sh.yield_ack.load(Ordering::Acquire) {
+            return;
+        }
+        let want = sh.yield_want.load(Ordering::Acquire);
+        let out = self.host.store.elastic_out();
+        if self.host.store.elastic_bytes() > 0 && want != out {
+            if want {
+                self.chunk_settle();
+                self.finish_copies(sh, true);
+                unsafe {
+                    for &st in self.stage_streams.iter().chain([&self.stream, &self.pre_stream]) {
+                        cudarc::driver::result::stream::synchronize(st).expect("yield: copies");
+                    }
+                }
+                while self.host.store.promotions_pending() > 0 {
+                    for g in self.host.store.promote_poll().expect("promotion reads") {
+                        let a = self.host.store.ram_device_addr(g);
+                        self.write_rentry(g, a);
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                for (_, c, p) in std::mem::take(&mut self.ram_quarantine) {
+                    self.host.store.free_place(c, p);
+                }
+                let (dropped, moved) = self.host.store.elastic_release(&self.host.score);
+                for &g in &dropped {
+                    self.write_rentry(g, 0);
+                }
+                for &g in &moved {
+                    let a = self.host.store.ram_device_addr(g);
+                    self.write_rentry(g, a);
+                }
+                unsafe { cudarc::driver::result::stream::synchronize(self.stream).expect("yield: table words") };
+                sh.yield_dropped.store(dropped.len() as u64, Ordering::Relaxed);
+                sh.yield_moved.store(moved.len() as u64, Ordering::Relaxed);
+                // whatever an earlier restore had not read back yet is colder than what fell out now
+                let mut list = std::mem::take(&mut self.restore);
+                list.extend(dropped);
+                self.restore = list;
+            } else if !self.host.store.elastic_restore() {
+                eprintln!("ram tier: the host cannot pin the elastic part again yet");
+            }
+            sh.yield_out.store(self.host.store.elastic_out(), Ordering::Release);
+            sh.yield_left.store(self.restore.len() as u64, Ordering::Relaxed);
+        }
+        sh.yield_ack.store(req, Ordering::Release);
+    }
+
     fn lend_check(&mut self, sh: &Shared) {
         let req = sh.lend_req.load(Ordering::Acquire);
         if req == sh.lend_ack.load(Ordering::Acquire) {
@@ -1427,6 +1506,19 @@ impl Loop {
             let a = self.host.store.ram_device_addr(g);
             self.write_rentry(g, a);
         }
+        // after a restore of the elastic part: the records it gave up come back into its free places, hottest
+        // first, turn about with the adaptive promotions (which alone would bring back only what is asked for again)
+        self.restore_turn = !self.restore_turn || self.pending_ram.is_empty();
+        if self.restore_turn && !self.restore.is_empty() && !self.host.store.elastic_out() && self.host.store.promotions_pending() < 4 {
+            while let Some(g) = self.restore.pop() {
+                let c = self.host.layer_class[g / self.host.n_expert];
+                if self.host.store.place[g] == 0 && self.host.store.free_places()[c] > 0 && self.host.store.promote_submit(g).expect("promote") {
+                    sh.yield_left.store(self.restore.len() as u64, Ordering::Relaxed);
+                    return true;
+                }
+            }
+            sh.yield_left.store(0, Ordering::Relaxed);
+        }
         if self.pending_ram.is_empty() || self.host.store.promotions_pending() >= 4 {
             return false;
         }
@@ -1579,7 +1671,8 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
     let stage_events: Vec<cudarc::driver::sys::CUevent> = (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect();
     let mk_events = || -> Vec<cudarc::driver::sys::CUevent> { (0..n_stage_streams).map(|_| cudarc::driver::result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING).expect("stage event")).collect() };
     let chunk_events = std::array::from_fn(|_| mk_events());
-    let mut lp = Loop { lend_on: 0, host, pool, shared: Some(sh.clone()), chunk_events, chunk_events_pending: [false; 8], chunk_batch_no: 0, chunk_staged: false, chunk_ram: Default::default(), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), wb: Vec::new(), d2h: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()] };
+    let mut lp = Loop { lend_on: 0, host, pool, shared: Some(sh.clone()), chunk_events, chunk_events_pending: [false; 8], chunk_batch_no: 0, chunk_staged: false, chunk_ram: Default::default(), ring_next: 0, ring_user: Vec::new(), stream, words: HostMapped::new(1 << 20), word_next: 0, missed: Vec::new(), last_sel: Vec::new(), quarantine: Default::default(), ticks: 0, promoted_tokens: 0, copy_event, inflight: Vec::new(), flex_on: false, flex_slots: Vec::new(), flex_evicted: Vec::new(), pending_ram: Vec::new(), wb: Vec::new(), d2h: Vec::new(), ram_quarantine: Default::default(), stage_streams, stage_events, stg_words: stage_ready_by_words(), last_serve_end: None, pref_k: crate::dsv41::prefetch_k(), pref_cap: std::env::var("QX_DS_PREFETCH_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2), pref_last: 0, pre_stream, pre_event, pre_busy: false, pre_inflight: Vec::new(), pre_live: [Vec::new(), Vec::new()], pre_free: [Vec::new(), Vec::new()], restore: Vec::new(), restore_turn: false };
+    lp.restore = std::mem::take(&mut lp.host.store.elastic_owed);
     for par in 0..2 {
         lp.pre_free[par] = (0..lp.host.pre_slots).map(|i| lp.host.pred_stage_base + ((par * lp.host.pre_slots + i) * lp.host.rec_max) as u64).collect();
     }
@@ -1613,6 +1706,7 @@ fn run(sh: Arc<Shared>, host: Host, cpus: Vec<usize>, ready: std::sync::mpsc::Se
         let mut worked = false;
         lp.flex_check(&sh);
         lp.lend_check(&sh);
+        lp.yield_check(&sh);
         if lp.prefetch_check(&sh) {
             worked = true;
         }

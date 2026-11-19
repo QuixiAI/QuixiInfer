@@ -533,6 +533,20 @@ fn static_name(s: String) -> &'static str {
 /// `W slot pos`, `F kv slot:tok,...`, `C slot kv tok,...`, `L` for a chunk release), each forward followed by `H` and
 /// one FNV-1a hash per returned logits row. `qx-ds-replay` re-executes such a file and compares the hashes: a server
 /// run's exact schedule, replayed deterministically (2026-11-09, for the late-token flip under three streams).
+/// Whether the host asks for the RAM tier's elastic part through QX_DS_YIELD_PATH: the path exists and, when it
+/// holds a process id (a virtual machine's pid file), that process is alive (a stale pid file asks for nothing).
+pub fn yield_path_alive() -> bool {
+    let Some(p) = std::env::var_os("QX_DS_YIELD_PATH").filter(|v| !v.is_empty()) else { return false };
+    match std::fs::read_to_string(&p) {
+        Ok(s) => match s.trim().parse::<u32>() {
+            Ok(pid) => std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            Err(_) => true,
+        },
+        // unreadable but there
+        Err(_) => std::path::Path::new(&p).exists(),
+    }
+}
+
 pub fn sched_trace_on() -> bool {
     sched_trace_file().is_some()
 }
@@ -1249,7 +1263,14 @@ impl<'a> DsEngine<'a> {
                 let flex = if flex_bytes > 0 && arena_bytes >= flex_bytes { Some(flex_bytes) } else { None };
                 let arena = DeviceBuf::new(arena_bytes);
                 let flex = flex.map(|fb| (arena.ptr + (arena_bytes - fb) as u64, fb));
-                let mut store = crate::tiers::ExpertStore::build(&pack, cfg.n_layer, &order, &in_vram, (ram_gib * 1073741824.0) as usize, 64)?;
+                // QX_DS_RAM_YIELD=G: the coldest G GiB of the RAM tier can be handed back to the host (`ram_yield`)
+                let elastic = std::env::var("QX_DS_RAM_YIELD").ok().and_then(|v| v.parse::<f64>().ok()).filter(|&g| g > 0.0).map(|g| (g.min(ram_gib / 2.0) * 1073741824.0) as usize).unwrap_or(0);
+                // (a server started while the host already needs the memory leaves that part out from the start)
+                let start_out = elastic > 0 && yield_path_alive();
+                let mut store = crate::tiers::ExpertStore::build_elastic(&pack, cfg.n_layer, &order, &in_vram, (ram_gib * 1073741824.0) as usize, 64, elastic, start_out)?;
+                if store.elastic_bytes() > 0 {
+                    eprintln!("expert store: the coldest {:.1} GiB of the budget can be handed back to the host (QX_DS_RAM_YIELD){}", store.elastic_bytes() as f64 / 1073741824.0, if start_out { "; left out from the start: the yield path exists" } else { "" });
+                }
                 let t0 = std::time::Instant::now();
                 let mut table = vec![0u64; cfg.n_layer * n_expert];
                 let mut holder = std::collections::HashMap::new();
@@ -3299,6 +3320,41 @@ impl<'a> DsEngine<'a> {
                 self.store_lend(sl);
             }
         }
+    }
+
+    /// Bytes of the RAM tier that `ram_yield` can hand back to the host (0: none, QX_DS_RAM_YIELD unset).
+    pub fn ram_elastic(&self) -> usize {
+        self.driver.as_ref().map(|d| d.shared.yield_bytes.load(std::sync::atomic::Ordering::Relaxed) as usize).unwrap_or(0)
+    }
+
+    /// Hands the RAM tier's elastic part back to the host (`out`) or takes it again; call between steps. The
+    /// records that fall out are served from NVMe meanwhile and read back after the restore, so replies are the
+    /// same either way. Returns whether the part is out now (a restore the host has no memory for leaves it out).
+    pub fn ram_yield(&mut self, out: bool) -> bool {
+        let Some(d) = self.driver.as_ref() else { return false };
+        let sh = d.shared.clone();
+        // nothing of this engine's may be in flight out of places the driver is about to free
+        self.gpu.sync();
+        sh.yield_want.store(out, std::sync::atomic::Ordering::Release);
+        let req = sh.yield_req.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        let t0 = std::time::Instant::now();
+        while sh.yield_ack.load(std::sync::atomic::Ordering::Acquire) < req {
+            assert!(t0.elapsed().as_secs() < 120, "the driver did not answer the RAM tier's yield request");
+            std::thread::yield_now();
+        }
+        sh.yield_out.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether the RAM tier's elastic part is out now.
+    pub fn ram_yield_out(&self) -> bool {
+        self.driver.as_ref().is_some_and(|d| d.shared.yield_out.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// After `ram_yield`: (records that fell to NVMe, records moved, records still to be read back).
+    pub fn ram_yield_stats(&self) -> (u64, u64, u64) {
+        let Some(d) = self.driver.as_ref() else { return (0, 0, 0) };
+        let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        (g(&d.shared.yield_dropped), g(&d.shared.yield_moved), g(&d.shared.yield_left))
     }
 
     fn lend_set(&mut self, slot: usize, on: bool) {

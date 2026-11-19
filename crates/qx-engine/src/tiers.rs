@@ -7,6 +7,11 @@
 //! ring of staging places of the class, so the CPU pool computes them from pinned memory like any other record;
 //! `promote` reads a record into a place of its own, `evict` frees one. The caller (the driver thread) owns the
 //! store; nothing here is shared between threads.
+//!
+//! The elastic part (`build_elastic`, QX_DS_RAM_YIELD): the coldest records of the budget get their places in a
+//! second arena per class, which `elastic_release` hands back to the operating system (the hottest records move
+//! into the first arena, the coldest fall to NVMe) and `elastic_restore` allocates again. A host that needs the
+//! memory for a while (a virtual machine) then costs NVMe reads for that while and nothing after.
 use anyhow::{anyhow, bail, Result};
 use io_uring::{opcode, types, IoUring};
 use qx_gpu::mem::HostMapped;
@@ -27,6 +32,11 @@ struct Class {
     stage: Vec<usize>,
     stage_next: usize,
     places: usize,
+    /// Places in `arena` that hold records (the rest of it is the staging places).
+    n_base: usize,
+    /// The elastic arena (None: released, or the class has none) and its places.
+    ext: Option<HostMapped>,
+    ext_n: usize,
 }
 
 pub struct Stats {
@@ -52,6 +62,8 @@ pub struct ExpertStore {
     /// flight: a record counts as in RAM only once its read completed.
     pring: IoUring,
     pending: Vec<(usize, usize)>,
+    /// The records a store built with its elastic part out did not read (coldest first).
+    pub elastic_owed: Vec<usize>,
     pub stats: Stats,
 }
 
@@ -59,6 +71,14 @@ impl ExpertStore {
     /// Builds the RAM tier: places for the hottest experts of `order` that `skip` does not exclude (those in VRAM),
     /// `budget` bytes in all, plus `stage` staging places per class; fills them from the pack.
     pub fn build(pack: &PackInfo, n_layer: usize, order: &[(usize, usize)], skip: &[bool], budget: usize, stage: usize) -> Result<Self> {
+        Self::build_elastic(pack, n_layer, order, skip, budget, stage, 0, false)
+    }
+
+    /// `build` with the coldest `elastic` bytes of the budget in arenas of their own (see the module's head).
+    /// `out`: the store starts with that part released (the host needs the memory already): its records are not
+    /// read, and `elastic_owed` lists them for the caller to bring in after `elastic_restore`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_elastic(pack: &PackInfo, n_layer: usize, order: &[(usize, usize)], skip: &[bool], budget: usize, stage: usize, elastic: usize, out: bool) -> Result<Self> {
         let ne = pack.experts.n_expert;
         if pack.experts.record.len() != n_layer {
             bail!("the pack has {} expert layers, the model {n_layer}", pack.experts.record.len());
@@ -90,21 +110,45 @@ impl ExpertStore {
             per_class[layer_class[l]] += 1;
             used += b;
         }
+        // the elastic part: the ranking's tail, per class
+        let mut ext_n = vec![0usize; sizes.len()];
+        let mut acc = 0usize;
+        for &(l, _) in take.iter().rev() {
+            let b = sizes[layer_class[l]];
+            if acc + b > elastic {
+                break;
+            }
+            acc += b;
+            ext_n[layer_class[l]] += 1;
+        }
         let mut classes: Vec<Class> = sizes
             .iter()
             .zip(&per_class)
-            .map(|(&bytes, &n)| {
-                let places = n + stage;
-                let arena = HostMapped::new((places * bytes).max(PAGE));
+            .zip(&ext_n)
+            .map(|((&bytes, &n), &xn)| {
+                let n_base = n - xn;
+                let arena = HostMapped::new(((n_base + stage) * bytes).max(PAGE));
                 let base = arena.ptr as usize;
-                let stage_places: Vec<usize> = (n..places).map(|i| base + i * bytes).collect();
-                Class { bytes, arena, free: (0..n).map(|i| base + i * bytes).collect(), stage: stage_places, stage_next: 0, places }
+                let stage_places: Vec<usize> = (n_base..n_base + stage).map(|i| base + i * bytes).collect();
+                let ext = (xn > 0 && !out).then(|| HostMapped::new(xn * bytes));
+                // the free list is popped from its end: the first arena's places (in the order a store without an
+                // elastic part has always had) go to the ranking's head, the elastic arena's to its tail
+                let mut free: Vec<usize> = ext.iter().flat_map(|x| (0..xn).rev().map(move |i| x.ptr as usize + i * bytes)).collect();
+                free.extend((0..n_base).map(|i| base + i * bytes));
+                Class { bytes, arena, free, stage: stage_places, stage_next: 0, places: n + stage, n_base, ext, ext_n: xn }
             })
             .collect();
         let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&pack.path)?;
         let ring = IoUring::new(QUEUE as u32)?;
         let pring = IoUring::new(QUEUE as u32)?;
-        let mut me = Self { pack: pack.clone(), n_layer, n_expert: ne, classes: Vec::new(), layer_class, place: vec![0; n_layer * ne], holder: Default::default(), file, ring, pring, pending: Vec::new(), stats: Stats { ram_hits: 0, nvme_reads: 0, nvme_bytes: 0, promotions: 0 } };
+        // a store that starts with the elastic part out owes the ranking's tail (coldest first)
+        let mut owed: Vec<usize> = Vec::new();
+        if out {
+            let tail: usize = ext_n.iter().sum();
+            owed = take.split_off(take.len() - tail).into_iter().rev().map(|(l, e)| l * ne + e).collect();
+            used -= acc;
+        }
+        let mut me = Self { pack: pack.clone(), n_layer, n_expert: ne, classes: Vec::new(), layer_class, place: vec![0; n_layer * ne], holder: Default::default(), file, ring, pring, pending: Vec::new(), elastic_owed: owed, stats: Stats { ram_hits: 0, nvme_reads: 0, nvme_bytes: 0, promotions: 0 } };
         // assign places, then fill them in file order with large parallel reads
         let mut fills: Vec<(usize, usize)> = Vec::new(); // (g, place)
         for &(l, e) in &take {
@@ -414,8 +458,100 @@ impl ExpertStore {
             if h >= base && h < base + c.arena.bytes {
                 return c.arena.dptr + (h - base) as u64;
             }
+            if let Some(x) = &c.ext {
+                let base = x.ptr as usize;
+                if h >= base && h < base + x.bytes {
+                    return x.dptr + (h - base) as u64;
+                }
+            }
         }
         panic!("not a store address");
+    }
+
+    /// Bytes of the elastic part (0: the store was built without one), released or not.
+    pub fn elastic_bytes(&self) -> usize {
+        self.classes.iter().map(|c| c.ext_n * c.bytes).sum()
+    }
+
+    /// Whether the elastic arenas are released.
+    pub fn elastic_out(&self) -> bool {
+        self.classes.iter().any(|c| c.ext_n > 0 && c.ext.is_none())
+    }
+
+    /// Hands the elastic arenas back to the operating system. Per class the records that fit the first arena stay,
+    /// the hottest by `score`: those of them in the elastic arena are copied into the places the coldest leave.
+    /// Returns (the records that lost their place, coldest first; the records that moved). The caller guarantees
+    /// that nothing reads or writes a place meanwhile: no promotion read in flight, no copy queued out of or into
+    /// a place, every place it took out with `evict_deferred` returned, and no window running.
+    pub fn elastic_release(&mut self, score: &[f64]) -> (Vec<usize>, Vec<usize>) {
+        assert!(self.pending.is_empty(), "elastic_release with promotion reads in flight");
+        let ne = self.n_expert;
+        let (mut dropped, mut moved) = (Vec::new(), Vec::new());
+        let mut copies: Vec<(usize, usize, usize)> = Vec::new(); // (from, to, bytes)
+        for c in 0..self.classes.len() {
+            let Some((lo, hi)) = self.classes[c].ext.as_ref().map(|x| (x.ptr as usize, x.ptr as usize + x.bytes)) else { continue };
+            let in_ext = |p: usize| p >= lo && p < hi;
+            let mut recs: Vec<usize> = self.holder.values().copied().filter(|&g| self.layer_class[g / ne] == c).collect();
+            recs.sort_by(|&a, &b| score[a].partial_cmp(&score[b]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+            let n_drop = recs.len().saturating_sub(self.classes[c].n_base);
+            let mut avail: Vec<usize> = self.classes[c].free.drain(..).filter(|&p| !in_ext(p)).collect();
+            for &g in &recs[..n_drop] {
+                let p = self.place[g];
+                self.place[g] = 0;
+                self.holder.remove(&p);
+                if !in_ext(p) {
+                    avail.push(p);
+                }
+                dropped.push(g);
+            }
+            for &g in &recs[n_drop..] {
+                let p = self.place[g];
+                if in_ext(p) {
+                    let np = avail.pop().expect("a place in the first arena for every record that stays");
+                    copies.push((p, np, self.classes[c].bytes));
+                    self.holder.remove(&p);
+                    self.place[g] = np;
+                    self.holder.insert(np, g);
+                    moved.push(g);
+                }
+            }
+            self.classes[c].free = avail;
+        }
+        {
+            use rayon::prelude::*;
+            copies.par_iter().for_each(|&(from, to, n)| unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, n) });
+        }
+        for c in self.classes.iter_mut() {
+            c.ext = None;
+        }
+        // coldest first over all classes
+        dropped.sort_by(|&a, &b| score[a].partial_cmp(&score[b]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+        (dropped, moved)
+    }
+
+    /// Allocates the elastic arenas again (their places free). False, with nothing changed, when the host cannot
+    /// pin the memory.
+    pub fn elastic_restore(&mut self) -> bool {
+        let mut got: Vec<(usize, HostMapped)> = Vec::new();
+        for (i, c) in self.classes.iter().enumerate() {
+            if c.ext_n > 0 && c.ext.is_none() {
+                // not zeroed: a place is read (`in_ram`, the GPU's table) only once its record's read completed
+                match HostMapped::try_new_opt(c.ext_n * c.bytes, false) {
+                    Some(x) => got.push((i, x)),
+                    None => return false,
+                }
+            }
+        }
+        for (i, x) in got {
+            let c = &mut self.classes[i];
+            let (base, bytes) = (x.ptr as usize, c.bytes);
+            // under the first arena's free places (the list is popped from its end)
+            let mut free: Vec<usize> = (0..c.ext_n).map(|k| base + k * bytes).collect();
+            free.append(&mut c.free);
+            c.free = free;
+            c.ext = Some(x);
+        }
+        true
     }
 }
 

@@ -29,10 +29,6 @@ fn main() -> anyhow::Result<()> {
         _ => (0..n_layer).flat_map(|l| (0..ne).map(move |e| (l, e))).collect(),
     };
     let skip = vec![false; n_layer * ne];
-    let mut store = ExpertStore::build(&pack, n_layer, &order, &skip, budget, 64)?;
-    let places = store.places();
-    println!("classes: {:?} (record bytes, places)", places);
-
     // byte checks against the source
     let check = |store: &ExpertStore, g: usize, rec: *const u8| -> bool {
         let (l, e) = (g / ne, g % ne);
@@ -43,6 +39,68 @@ fn main() -> anyhow::Result<()> {
         r[..gb] == src.data(gt)[e * gb..(e + 1) * gb] && r[gb..2 * gb] == src.data(ut)[e * gb..(e + 1) * gb] && r[2 * gb..2 * gb + db] == src.data(dt)[e * db..(e + 1) * db]
     };
     let mut s = 0x1234_5678_9abc_def1u64;
+    // QX_TIER_ELASTIC=G: the elastic part (G GiB of the budget) through churn, release and restore, every record
+    // in RAM checked byte for byte after each; then a store built with the part out
+    if let Some(gib) = std::env::var("QX_TIER_ELASTIC").ok().and_then(|v| v.parse::<f64>().ok()) {
+        use rayon::prelude::*;
+        let elastic = (gib * 1073741824.0) as usize;
+        let all = n_layer * ne;
+        let verify = |store: &ExpertStore, what: &str| -> usize {
+            let held: Vec<usize> = (0..all).filter(|&g| store.in_ram(g)).collect();
+            let mut places: Vec<usize> = held.iter().map(|&g| store.place[g]).collect();
+            places.sort();
+            let n = places.len();
+            places.dedup();
+            assert_eq!(n, places.len(), "{what}: two records share a place");
+            let free: usize = store.free_places().iter().sum();
+            let bad = held.par_iter().filter(|&&g| !check(store, g, store.place[g] as *const u8)).count();
+            println!("{what}: {} records in RAM, {free} free places, mismatches {bad}", held.len());
+            assert_eq!(bad, 0, "{what}: byte mismatches");
+            held.len()
+        };
+        let mut store = ExpertStore::build_elastic(&pack, n_layer, &order, &skip, budget, 64, elastic, false)?;
+        println!("elastic part: {:.2} GiB", store.elastic_bytes() as f64 / 1073741824.0);
+        let n0 = verify(&store, "built");
+        for round in 0..3 {
+            // churn: records leave and others take their places, in both arenas
+            let ram: Vec<usize> = (0..all).filter(|&g| store.in_ram(g)).collect();
+            for _ in 0..600 {
+                store.evict(ram[rng(&mut s) as usize % ram.len()]);
+            }
+            let nvme: Vec<usize> = (0..all).filter(|&g| !store.in_ram(g)).collect();
+            let cands: Vec<usize> = (0..3000).map(|_| nvme[rng(&mut s) as usize % nvme.len()]).collect();
+            store.promote(&cands)?;
+            let n1 = verify(&store, &format!("round {round} after churn"));
+            let score: Vec<f64> = (0..all).map(|_| (rng(&mut s) % 1000) as f64).collect();
+            let t0 = std::time::Instant::now();
+            let (dropped, moved) = store.elastic_release(&score);
+            println!("round {round}: released in {:.0} ms: {} dropped, {} moved", 1e3 * t0.elapsed().as_secs_f64(), dropped.len(), moved.len());
+            assert!(store.elastic_out() && dropped.iter().all(|&g| !store.in_ram(g)));
+            // every record that stays is at least as hot as every record of its class that left
+            let n2 = verify(&store, &format!("round {round} released"));
+            assert_eq!(n2 + dropped.len(), n1);
+            let t0 = std::time::Instant::now();
+            assert!(store.elastic_restore() && !store.elastic_out());
+            println!("round {round}: restored in {:.0} ms", 1e3 * t0.elapsed().as_secs_f64());
+            let skipped = store.promote(&dropped)?;
+            assert!(skipped.is_empty(), "a dropped record found no place after the restore");
+            assert_eq!(verify(&store, &format!("round {round} refilled")), n1);
+        }
+        drop(store);
+        let mut store = ExpertStore::build_elastic(&pack, n_layer, &order, &skip, budget, 64, elastic, true)?;
+        let owed = std::mem::take(&mut store.elastic_owed);
+        assert!(store.elastic_out());
+        let n3 = verify(&store, "built with the part out");
+        assert_eq!(n3 + owed.len(), n0);
+        assert!(store.elastic_restore());
+        assert!(store.promote(&owed)?.is_empty());
+        assert_eq!(verify(&store, "then restored and refilled"), n0);
+        println!("ok");
+        return Ok(());
+    }
+    let mut store = ExpertStore::build(&pack, n_layer, &order, &skip, budget, 64)?;
+    let places = store.places();
+    println!("classes: {:?} (record bytes, places)", places);
     let ram: Vec<usize> = (0..n_layer * ne).filter(|&g| store.in_ram(g)).collect();
     let nvme: Vec<usize> = (0..n_layer * ne).filter(|&g| !store.in_ram(g)).collect();
     println!("{} records in RAM, {} on NVMe", ram.len(), nvme.len());
