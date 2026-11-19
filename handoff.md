@@ -3,10 +3,11 @@
 
 
 ## Resume 2026-11-19, later: the DeepSeek engine is deployed as a service; speculation's record kept per kind of draft
-- **Production**: `systemctl --user status quixiinfer-deepseek` (unit in `~/.config/systemd/user/`, binary
-  `~/qx-prod/bin/quixiinfer` from 182c58f, key in `~/qx-prod/api-key.env`, `0.0.0.0:8000`, 256k context, 3 slots,
-  linger on). It holds the GPU: `systemctl --user stop quixiinfer-deepseek` before any benchmark or chain, start it
-  after. The system unit `quixiinfer.service` (Qwen, same port, enabled at boot) conflicts with it and needs sudo.
+- **Production**: the system unit `quixiinfer.service` runs DeepSeek since 2026-11-19 (it ran Qwen before; that unit
+  is kept beside it as `quixiinfer.service.qwen-2026-11-19.bak`): binary `~/qx-prod/bin/quixiinfer` (`~/qx-prod/BUILD`
+  names the commit), key `VLLM_API_KEY` from `/etc/slimserve/affine-king.env`, `0.0.0.0:8000`, 256k context, 3 slots,
+  MemoryMax 112G, `Restart=always`, enabled at boot. It holds the GPU: `sudo systemctl stop quixiinfer` before any
+  benchmark or chain, `sudo systemctl start quixiinfer` after. The earlier user unit `quixiinfer-deepseek` is retired.
 - Speculation: four kinds of draft with their own record (`SpecSrc`); a first-time JSON list at parity; a list with
   another reply's values under other keys +3 to +4% (backlog).
 
