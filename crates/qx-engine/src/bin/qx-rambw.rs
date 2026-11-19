@@ -49,21 +49,28 @@ unsafe fn read_span_avx2(p: *const u8, n: usize, prefetch: usize) -> u64 {
     let mut o = 0;
     while o + 64 <= n {
         if prefetch > 0 {
-            _mm_prefetch::<_MM_HINT_T0>(p.add(o + prefetch) as *const i8);
+            // SAFETY: the prefetch hint touches a cache line but never faults.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(p.add(o + prefetch) as *const i8) };
         }
-        a = _mm256_xor_si256(a, _mm256_loadu_si256(p.add(o) as *const __m256i));
-        b = _mm256_xor_si256(b, _mm256_loadu_si256(p.add(o + 32) as *const __m256i));
+        // SAFETY: `o + 64 <= n` keeps both 32-byte loads inside the span.
+        unsafe {
+            a = _mm256_xor_si256(a, _mm256_loadu_si256(p.add(o) as *const __m256i));
+            b = _mm256_xor_si256(b, _mm256_loadu_si256(p.add(o + 32) as *const __m256i));
+        }
         o += 64;
     }
     let mut t = [0u64; 4];
-    _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, _mm256_xor_si256(a, b));
+    // SAFETY: `t` is 32 bytes and `t.as_mut_ptr()` points at its start.
+    unsafe { _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, _mm256_xor_si256(a, b)) };
     let mut acc = t[0].wrapping_add(t[1]).wrapping_add(t[2]).wrapping_add(t[3]);
     while o + 8 <= n {
-        acc = acc.wrapping_add((p.add(o) as *const u64).read_unaligned());
+        // SAFETY: `o + 8 <= n` keeps the read inside the span; the load is unaligned.
+        acc = acc.wrapping_add(unsafe { (p.add(o) as *const u64).read_unaligned() });
         o += 8;
     }
     while o < n {
-        acc = acc.wrapping_add(*p.add(o) as u64);
+        // SAFETY: `o < n` keeps the byte read inside the span.
+        acc = acc.wrapping_add(unsafe { *p.add(o) } as u64);
         o += 1;
     }
     acc
@@ -75,13 +82,16 @@ unsafe fn read_span_plain(p: *const u8, n: usize, prefetch: usize) -> u64 {
     let mut o = 0;
     while o + 8 <= n {
         if prefetch > 0 {
-            _mm_prefetch::<_MM_HINT_T0>(p.add(o + prefetch) as *const i8);
+            // SAFETY: the prefetch hint touches a cache line but never faults.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(p.add(o + prefetch) as *const i8) };
         }
-        acc = acc.wrapping_add((p.add(o) as *const u64).read_unaligned());
+        // SAFETY: `o + 8 <= n` keeps the read inside the span; the load is unaligned.
+        acc = acc.wrapping_add(unsafe { (p.add(o) as *const u64).read_unaligned() });
         o += 8;
     }
     while o < n {
-        acc = acc.wrapping_add(*p.add(o) as u64);
+        // SAFETY: `o < n` keeps the byte read inside the span.
+        acc = acc.wrapping_add(unsafe { *p.add(o) } as u64);
         o += 1;
     }
     acc
@@ -90,11 +100,14 @@ unsafe fn read_span_plain(p: *const u8, n: usize, prefetch: usize) -> u64 {
 /// The best read the CPU can do, so the probe does not SIGILL on a machine without AVX-512.
 unsafe fn read_span(p: *const u8, n: usize, prefetch: usize) -> u64 {
     if is_x86_feature_detected!("avx512f") {
-        read_span_avx512(p, n, prefetch)
+        // SAFETY: detected above; `p[..n]` is the caller's contract.
+        unsafe { read_span_avx512(p, n, prefetch) }
     } else if is_x86_feature_detected!("avx2") {
-        read_span_avx2(p, n, prefetch)
+        // SAFETY: detected above; `p[..n]` is the caller's contract.
+        unsafe { read_span_avx2(p, n, prefetch) }
     } else {
-        read_span_plain(p, n, prefetch)
+        // SAFETY: `p[..n]` is the caller's contract.
+        unsafe { read_span_plain(p, n, prefetch) }
     }
 }
 
