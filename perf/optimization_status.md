@@ -5934,3 +5934,156 @@ Gate, ds-checks' binary, the image checks and tree-equals-measured reproduced. H
 (x111-w: identical), base counters cited from the new run, and the preflight; corrected above.
 
 Raw: `perf/results/2026-11-20/x-image-prefill/`, `perf/results/2026-11-19/x110-p-224212`, `x111-w-1-231746`.
+
+## 2026-11-20: Prompt chunks that leave out NVMe experts few rows ask for (`QX_DS_CHUNK_RES`) — opt-in, LANDED off by default; the "NVMe floor" premise corrected
+
+The entry above named the lever: "the NVMe floor of every prompt chunk (about 2.0 of 2.5 s for 1,000 rows)". That
+figure was the driver lane's time in NVMe reads. Measured here, it is not what the chunk waits for.
+
+**Where a 1,000-row chunk goes** (X171 d, a screening build of the experiment, `qx-ds-check` 8acb751fffdb; VRAM
+20, RAM 95, warm-up, a fresh process's tiers; text A = the start of `route16k.tokens`; the routing probes below are
+measurements, not settings; the last row used that build's `QX_DS_CHUNK_RES_TIER=0`, which the final code spells
+`QX_DS_CHUNK_RES_MIN=1000000 QX_DS_CHUNK_RES_MIN_NVME=1000000`):
+
+| routing | chunk | distinct experts a layer |
+|---|--:|---|
+| exact kernels (`QX_DS_PREFILL_EXACT=1`) | 3,618 ms | |
+| default (f16) | 2,465 ms | 252; the true routing uses 7,200 RAM and 1,890 NVMe-only records |
+| no NVMe-only expert | 1,811 ms | 211 |
+| no expert outside VRAM (KL 0.44) | 1,211 ms | 35; "sync on the slab passes" 1,088 ms |
+
+So about 1.2 s is the dense work of the slab passes (1.2 ms a row, the rate of a 16k prompt), about 0.6 s the RAM
+records' copies and about 0.65 s the NVMe reads: the disk is a quarter of the chunk, not four fifths. A 96-row
+chunk: 1,153 ms, 447 ms with VRAM experts only. "Well under a second" for 1,000 rows was never there to get.
+
+**The knob.** `QX_DS_CHUNK_RES=m` (> 1; `1e6`: hard): on the chunk-wide f16 path a layer routes twice. An
+NVMe-only expert that the true routing gives fewer than `QX_DS_CHUNK_RES_MIN_NVME` rows per 1,024 rows of the layer
+(default 8; `QX_DS_CHUNK_RES_MIN` for RAM experts, default 1: all stay) is marked down in the second routing and
+its rows go to their next experts; the weights stay the true probs over the picks. The prefetch job holds such
+experts back until the routing is known (`ChunkJob.hold`), and an expert it fetched on its prediction stays
+listed. Only layers of at least `QX_DS_CHUNK_RES_ROWS` rows (512) whose prefetch had a prediction (chunks up to
+`QX_DS_CHUNK_PRED_MAX`, 2,048 rows) or that posted no prefetch job at all (nothing is read blind then), never a
+replay. `qx_ds_route` takes the mark-down as info[9] under 1.
+
+**Screening (earlier builds of the experiment: `qx-ds-check` b968bdc6ef30, c971be9fc621, 8acb751fffdb,
+2bd92c506f50, 952efae44f7d; one text each, 129-257 rows after the chunk; KL and top-1 against the exact kernels):**
+- The decode knob's form (listed experts' p times m) at m = 100 moved 6.97% of the selections: it reorders the
+  residents among themselves too. Replaced by marking the unlisted down (0.82% for the same experts).
+- The prefetch read the dropped experts anyway (NVMe reads 2,888 -> 2,176 for 1,888 experts dropped): the hold.
+  With it, no NVMe at all: 2,465 -> 1,811 ms.
+- Chunks under 256 rows (the per-slab exact path, residents only): 96 rows, 1,153 ms -> 987 (no NVMe, KL 0.048,
+  top-1 92.2%), 947 (m 1.5 on everything outside VRAM, KL 0.049), 672 (m 3, KL 0.19). All outside the bound:
+  that path was taken out again.
+- 1,000 rows of text B (wiki), where f16 alone reads KL 0.0169, top-1 92.2%: no NVMe 1,791 ms, KL 0.0270, 89.5%;
+  RAM experts under 4 or 8 rows dropped as well 1,595 / 1,465 ms, KL 0.033 / 0.042; `KEEP=1` and m = 4 no
+  better (KL 0.033, 0.043). No NVMe over four texts: -25 to -27%, mean KL 0.019, top-1 93.4%.
+- Dropping only the NVMe experts under 8 rows: -17 to -20% for about half of that loss (KL +0.0034 against
+  +0.0071 over the four texts; 1.4-1.7% of selections moved against 2.7-5.1%): the setting kept.
+- 320 rows with a fixed 8-row threshold: KL 0.0187 -> 0.0344; scaled to the layer's rows: -9% for KL 0.0287
+  (one row of 1.79): a poor trade, hence the 512-row minimum. 4,000 rows: -2% (no prediction, every read is
+  blind): the knob is inert there.
+
+**The final build** (chunk198, `qx-ds-check` 16d19f8a1a22, `quixiinfer` b6ac8d858fdc; X171 j; `QX_DS_CHUNK_RES=1e6`,
+the other knobs at their defaults; 1,000-row chunk, then 256 exact single steps; 257 rows a text):
+
+| text | chunk off -> on | mean KL off -> on | top-1 off -> on | selections moved |
+|---|---|---|---|--:|
+| A (route16k, start) | 2,483 -> 1,993 ms (-19.7%) | 0.0072 -> 0.0098 | 96.1 -> 96.1% | 1.14% |
+| B (wiki256k at 30,000) | 2,362 -> 1,942 (-17.8%) | 0.0169 -> 0.0226 | 92.2 -> 93.0% | 0.99% |
+| C (the mix text) | 2,509 -> 2,016 (-19.6%) | 0.0150 -> 0.0163 | 94.6 -> 94.9% | 1.05% |
+| D (route16k at 8,000) | 2,490 -> 2,081 (-16.4%) | 0.0094 -> 0.0155 | 96.5 -> 96.9% | 1.03% |
+| mean | -18.4% | 0.0121 -> 0.0161 | 94.85 -> 95.2% | |
+
+Top-1 says nothing either way (about 1.4 points of standard error a text); the KL shift is the signal: +0.004 on
+the f16 path's 0.012, inside the bound of 0.03 on every text. The other half of the bound (top-1 >= 95%) is not
+met on texts B and C with the knob (93.0, 94.9%) **nor without it** (92.2, 94.6%; the default path's four-text
+mean is 94.85%, where the 2026-11-11 scoreboard row gave 95.1% as its lowest sample): an open item on the
+default f16 path, in the backlog. 320 rows and 4,000 rows with the knob: the same time and KL 0.0000 against the
+knob-off run of the same build (j3, j4: 65 rows each).
+
+The edges of the range on the same build (X171 k; one text each, 257 rows):
+
+| rows | chunk off -> on | mean KL off -> on | top-1 off -> on |
+|--:|---|---|---|
+| 512 (text D) | 1,960 -> 1,764 ms (-10.0%) | 0.0092 -> 0.0095 | 95.7 -> 98.1% |
+| 2,000 (text C) | 3,262 -> 2,759 ms (-15.4%) | 0.0122 -> 0.0187 | 94.9 -> 91.8% |
+
+**Server** (X170: the production unit's engine settings and three slots, but `QX_DS_PREFIX=0
+QX_DS_SPEC_CORPUS=0`; each arm its own start; the final build's pair ran on, then off (`res8b`, `offb`, chunk198's
+`quixiinfer` b6ac8d858fdc by `x173-all.sh`: the arms log no hash); same photograph against same photograph, chunk
+times from the server log):
+
+| | off | on |
+|---|---|---|
+| a session's first four photographs (987 positions) | 2,427-2,647 ms | 1,919-1,987 ms (-21 to -25%) |
+| the five after them (one repeated, four rotated) | 2,146-2,300 | 1,898-1,991 (-12 to -13%) |
+| text of 1,019 / 913 tokens | 2,652 / 2,442 | 2,116 / 2,015 (-20%, -17.5%) |
+| chunks under 512 rows (207, 252) | 1,863, 1,922 | 1,859, 1,923 |
+| request, a first photograph | 3.9-4.3 s | 3.3-3.6 s |
+
+A screen before it on chunk197 (`quixiinfer` ec919560973a, before the breaker's fixes; off, then on) read the
+same to 3%: first four 2,452-2,703 -> 1,911-1,973, the five after 2,178-2,303 -> 1,879-1,985. The answers: the
+invoice's fields, "ZEBRA 58213" and the label unchanged (those chunks are under 512 rows). Under the knob three of
+the four first photographs' descriptions and the 1,019-token text's summary open in other words ("The main subject
+of the photograph is a vibrant red" against "A vibrant red Japanese maple leaf"; "sitting in the" against
+"sitting on the"; the night sky "filled with the Milky Way" against "over a calm ocean", and the picture shows
+both; "The text chronicles" against "The gold dollar, auth"). The logs keep only the first 21-52 characters, so
+no more than that can be said from them. The driver lane, a first photograph: NVMe records staged 2,423 ->
+1,536, time in reads 2,014 -> 1,267 ms; 0.7-1.2% of selections moved.
+
+**Breaker (fresh context, reading only), and what was done:** (4) experts were marked down after their read was
+submitted (480-1,000 records a chunk read and discarded): the ones the prefetch took on its prediction now stay
+listed (selections moved 1.4-1.7% -> 1.0-1.1% for the same times); (5) above 2,048 rows every read is blind and
+the knob was pure loss: such layers are skipped; (6) the thresholds scaled by the chunk's rows, not the layer's
+(a trimmed replay's top layers: 32 of 255 rows): per layer now; (7) replay chunks rerouted: excluded; (8) with
+fewer listed experts than picks the unlisted would go by id: the second routing is skipped then; (9) the tier
+scored the biased picks: a marked-down expert is now scored by the rows it lost; (10) the result depends on the
+tiers' state and on the other prompts of a multi-slot chunk: stated in the code and the README; (12) the 320-row
+arm over the bound: the 512-row minimum; (13) the server gain claimed from the first four photographs only: both
+rows are in the table above and the reversed order was run; (1, 2) no HEAD-against-candidate comparison: X172
+below. Checked and clean by its reading: the route call's 14 words, the logits buffer, the second sync (no new
+kernel), the rebuilt lists.
+
+**Knob off is the previous build, bit for bit** (X172 b, chunk192's `qx-ds-check` 1150d1f06c5c against
+16d19f8a1a22, logits dumps compared with `cmp`): a 1,000-row chunk and 32 steps identical; a 4,000-row chunk and
+32 steps identical (33 rows each: the chunk's last row and the steps); 96 single steps under `QX_DS_ROUTE_RES=2`
+with promotions off identical (old against old, old against new; the log does not show that the route knob bit,
+only that the two builds agree under it). `dsv41.cu` (the build's flattened source) compiles with nvcc 13.3 for
+sm_86, sm_89, sm_120a with the build's own flags (three exits 0, cubins of 625,144 / 625,016 / 835,968 bytes, `x-chunk-res/nvcc-dsv41-archs.txt`).
+ds-checks a, b, c on 16d19f8a1a22 (X173): pass by `check_ds_log.py`, each part the same text as X149; the
+image-position check ok on the final build's checker (X174, `qx-ds-img-check` d32981b98768; X173's ran the
+previous build's by a copied script). Gate x110-r-051204: 18.517 against 18.475 (+0.2%; decode256k 39.2, 38.9; serve256k3
+81.30; serve256k1 35.22, which prints REGRESSION against 32.98 as on every recent gate; decode 31.0; prefill128
+10.5; prefill256k 2.0), identity identical; preflight VM shut off, pressure 0.00, no build tools, bins
+16d19f8a1a22 b6ac8d858fdc. The gate before it, x110-q-043705, read 18.675 with decode256k 41.3, 39.2 (the
+first repeat's pool time 1,622 ms against 1,461): attributed to an image resize the author ran on the CPU as it
+started (the fault that voided x110-m; there is no independent trace of it, and 41.3 is also inside the slow band
+of 2026-11-10); same binaries; it is kept, not counted. Identity
+sessions x111-x-1 (knob off) and x111-x-2 (`QX_DS_CHUNK_RES=1e6`): identical both; the gate's prompts are 42-46
+tokens, so the second says nothing about the prompts the knob reaches.
+
+Decision: opt-in, off by default, as the decode knob is. It is inside the KL half of the bound on every text
+(the top-1 half is not met on two of four texts with or without it, see above) and worth 10% at 512 rows, 16-20%
+at 1,000 and 15% at 2,000 in `qx-ds-check`, 12-25% on a photograph's 987 positions in the server; but with it the
+same prompt can give different rows at another time or beside another prompt (the tiers' state decides which
+experts are dropped), so the identity check would no longer hold for such prompts. Recommended setting where
+wanted: `QX_DS_CHUNK_RES=1e6`.
+
+Not covered: KL on image rows (no tool dumps logits after an image chunk; the photographs' answers were read, and
+only their first words logged); a tier that has adapted over hours (the server arms are minutes; the scoring of
+marked-down experts has no measurement); multi-slot chunks under the knob; rewinds, replays, ring checkpoints and
+prefix reuse under the knob (ds-checks run with it off, the server arms with `QX_DS_PREFIX=0`; a replay is never
+rerouted, so a rewind over a rerouted chunk does not reproduce its rows); chunks that do not start at position 0;
+rows of the chunk itself (the KL is of the last row and the 256 steps after it, which are consecutive positions
+of one continuation a text, four texts); `QX_DS_CHUNK_RES_MIN`, `_KEEP` and finite m only screened on one text;
+prompts between 2,048 and 4,096 rows other than 4,000; the first gate's disturbance (above) is the author's own
+account.
+
+### Adjudication (fresh context, 2026-11-20): HOLD, then lifted
+The final table, the knob-off bit identity, the gate arithmetic, ds-checks, the tree against the binaries and
+the code against this entry reproduced. HOLD for: the image check on the final build's checker (X174: ok); the
+512- and 2,000-row edges on the final build (X171 k, above; the range restated); the server table on one build,
+same photograph against same photograph (-27% had come from the earlier build); the top-1 half of the bound
+stated; five wrong or loose figures and the "Not covered" list. All corrected above.
+
+Raw: `perf/results/2026-11-20/x-chunk-res/`.

@@ -132,6 +132,9 @@ pub struct ChunkJob {
     /// The predicted rows from which a pick is staged before the routing is known (the picks under it wait for the
     /// routing).
     pub pred_t: f32,
+    /// The predicted rows from which an expert in RAM (`.0`) or on NVMe only (`.1`) is staged before the routing is
+    /// known: `pred_t` both, or under `QX_DS_CHUNK_RES` the rows that make its fetch worth it, if more.
+    pub hold: (f32, f32),
     /// Per expert of `experts`: its selection count, for the scores (empty: no scoring).
     pub counts: Vec<u32>,
     /// Further (expert, count) pairs to score without copying (the prefetched experts the routing used).
@@ -474,7 +477,7 @@ impl Loop {
             // With a prediction: the experts predicted with rows (a score of `pred_t` or more) first, the
             // others behind them. The staging loop holds the others back until the routing is known: a record
             // staged blind sits in the link's queue ahead of the used ones.
-            let (hi, lo): (Vec<usize>, Vec<usize>) = if job.pred.is_empty() { (cand, Vec::new()) } else { cand.into_iter().partition(|&e| pr(e) >= job.pred_t) };
+            let (hi, lo): (Vec<usize>, Vec<usize>) = if job.pred.is_empty() { (cand, Vec::new()) } else { cand.into_iter().partition(|&e| pr(e) >= if tier(&self.host, l * ne + e) == 0 { job.hold.1 } else { job.hold.0 }) };
             let mut cand = Vec::with_capacity(hi.len() + lo.len());
             if !job.pred.is_empty() {
                 gate_from = hi.len();

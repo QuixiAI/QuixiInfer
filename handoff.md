@@ -2,6 +2,21 @@
 
 
 
+## Resume 2026-11-20: image input, the vision tower on the GPU and `detail: "low"` landed; the chunk routing knob landed opt-in
+- **Image prompts** (`README.md`, "Image input"): `--mmproj`, the tower on the GPU (`vision_gpu.rs`), image
+  positions as token ids from `IMG_BASE`; checks `qx-ds-img-check`, `qx-vision-gpu-check`, `tools/vision_ref.py`.
+- **A 1,000-row prompt chunk (a photograph is 987 positions) is 2.5 s: about 1.2 s the slab passes' dense work,
+  0.6 s RAM copies, 0.65 s NVMe reads** (X171; the earlier "2.0 s of NVMe wait" was the driver lane's time, not
+  the chunk's). `QX_DS_CHUNK_RES=1e6` (lossy, off by default) leaves out the NVMe experts under 8 rows per 1,024
+  of a 512-2,048-row chunk: -16 to -20% in `qx-ds-check`, photographs in the server 2.4-2.6 -> 1.9-2.0 s (2.1-2.3 -> 1.9-2.0 once it has seen a few), mean KL
+  0.0121 -> 0.0161 against the exact kernels. Knob off is bit-identical to the build before it. Replies of such
+  prompts then depend on the tiers' state, so the identity check cannot cover them: opt-in.
+- **Next**: the dense work of a mid-size chunk (what a 128-row slab pass does for 3.8 ms); see the backlog's
+  queue of 2026-11-20, later.
+- **Scripts**: `~/qx-chains/chain-x171.sh TAG TEXT ROWS TAIL "ENV"...` (a chunk and the steps after it under each
+  environment, KL against the first), `chain-x172.sh` (dumps of two binaries compared with `cmp`),
+  `chain-x170.sh TAG BINDIR [ENV]` (the server with photographs).
+
 ## Resume 2026-11-19, later: the DeepSeek engine is deployed as a service; speculation's record kept per kind of draft
 - **Production**: the system unit `quixiinfer.service` runs DeepSeek since 2026-11-19 (it ran Qwen before; that unit
   is kept beside it as `quixiinfer.service.qwen-2026-11-19.bak`): binary `~/qx-prod/bin/quixiinfer` (`~/qx-prod/BUILD`

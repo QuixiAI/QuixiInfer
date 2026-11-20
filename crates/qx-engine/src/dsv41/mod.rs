@@ -522,6 +522,12 @@ pub struct DsEngine<'a> {
     /// Whether the last `layer_ffn_pre` routed with the residency preference and wrote the true picks
     /// (`QX_DS_ROUTE_TRUE=0`: the tier scores the biased picks, as before 2026-11-19).
     route_true: std::cell::Cell<bool>,
+    /// `QX_DS_CHUNK_RES`: the chunk layer's availability table on the device (u64 per expert, nonzero: in VRAM, or
+    /// wanted by enough rows to be worth its fetch), and the counters of the last chunk (experts outside VRAM with
+    /// too few rows under the true routing, those still used, selections moved, selections, the true routing's
+    /// experts in RAM and on NVMe only).
+    chunk_res_tab: Option<DeviceBuf>,
+    pub chunk_res_stat: [u64; 6],
     /// The stores' tails lent to the tier: the positions a slot keeps (0: nothing is lent) and the slots whose
     /// tails are lent now (`store_need`, `store_lend`).
     lend_keep: usize,
@@ -1543,6 +1549,8 @@ impl<'a> DsEngine<'a> {
             chunk_ord: 0,
             replaying: false,
             route_true: std::cell::Cell::new(false),
+            chunk_res_tab: None,
+            chunk_res_stat: [0; 6],
             lend_keep: lend_keep_v,
             lent: vec![false; slots],
             lend_started: false,
@@ -2872,7 +2880,32 @@ impl<'a> DsEngine<'a> {
         let mut pred_kept: Vec<f32> = Vec::new();
         // per K in (k, 12), per tier class (all, not in VRAM, NVMe): experts used, predicted, both
         let mut pred_stat = [[[0u64; 3]; 3]; 2];
+        // QX_DS_CHUNK_RES (lossy; the chunk-wide f16 path only, which is KL-bounded already): a prompt chunk routes
+        // twice. An expert outside VRAM that the true routing gives fewer than QX_DS_CHUNK_RES_MIN rows (in RAM) or
+        // QX_DS_CHUNK_RES_MIN_NVME rows (on NVMe only) per 1,024 rows of the chunk (rounded up; 1: every used
+        // expert stays) is not worth its fetch: the second routing marks it down
+        // (its score p / m + bias, m = QX_DS_CHUNK_RES; 1e6 or more: picked only when the others run out) and its
+        // rows go to their next experts; the weights stay the true probs over the picks. A row's first
+        // QX_DS_CHUNK_RES_KEEP picks go by the true score. QX_DS_CHUNK_RES=1: off (the true routing).
+        // Only layers of at least QX_DS_CHUNK_RES_ROWS rows (default 512) whose prefetch went out with a
+        // prediction (up to QX_DS_CHUNK_PRED_MAX rows: without one every record is fetched before the routing is
+        // known), and never a replay. An expert the prefetch fetched on its prediction stays; a marked-down one
+        // is still scored by the rows it was asked for. The result depends on what the tiers hold at that moment
+        // and on the other prompts in the chunk: the same prompt can give slightly different rows at another time.
+        static CRES: std::sync::OnceLock<(f32, usize, usize, u64, usize)> = std::sync::OnceLock::new();
+        let (cres_mul, cres_min_k, cres_min_nvme_k, cres_keep, cres_rows) = *CRES.get_or_init(|| {
+            let ev = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+            (ev("QX_DS_CHUNK_RES", 1.0) as f32, (ev("QX_DS_CHUNK_RES_MIN", 1.0) as usize).min(1 << 20), (ev("QX_DS_CHUNK_RES_MIN_NVME", 8.0) as usize).min(1 << 20), ev("QX_DS_CHUNK_RES_KEEP", 0.0) as u64, ev("QX_DS_CHUNK_RES_ROWS", 512.0) as usize)
+        });
+        let cres_on = cres_mul > 1.0 && chunk_ffn_wide && !self.replaying;
+        // (per layer: whether it applies, the thresholds in the layer's rows, the prediction its prefetch went out with)
+        let mut cres_pred: Vec<f32> = Vec::new();
+        if cres_on && self.chunk_res_tab.is_none() {
+            self.chunk_res_tab = Some(DeviceBuf::new(ne * 8));
+        }
+        self.chunk_res_stat = [0; 6];
         for l in 0..n_layers_run {
+            let cres_args = [self.chunk_res_tab.as_ref().map_or(0, |b| b.ptr), 0, bits(if cres_mul >= 1e6 { -1e30 } else { 1.0 / cres_mul }), cres_keep];
             if chunk_ffn_wide {
                 // this layer's attention-side dense groups as f16, once for the chunk (cuBLAS GEMMs per slab from them)
                 let base = self.blas_bufs.as_ref().unwrap().0.ptr;
@@ -2909,10 +2942,16 @@ impl<'a> DsEngine<'a> {
             let n_act = rows - ra;
             pred_cur = std::mem::take(&mut pred_score);
             let prefetch = if prefetch_on && n_ring > 0 && !(kv_only && l == kv_last) { n_ring } else { 0 };
+            let cres = cres_on && n_act >= cres_rows && (prefetch == 0 || !pred_cur.is_empty());
+            let (cres_min, cres_min_nvme) = ((cres_min_k * n_act).div_ceil(1024).max(1), (cres_min_nvme_k * n_act).div_ceil(1024).max(1));
+            cres_pred.clear();
+            if cres && prefetch > 0 {
+                cres_pred.extend_from_slice(&pred_cur);
+            }
             if prefetch > 0 {
                 let cb = self.chunk.as_ref().unwrap();
                 *d.chunk_pick.lock().unwrap() = None;
-                d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: Vec::new(), prefetch, pred: { if pred_mode >= 2 { pred_kept = pred_cur.clone(); } std::mem::take(&mut pred_cur) }, pred_t, counts: Vec::new(), extra_scores: Vec::new(), slots_dev: cb.slots_tbl[l % 2].ptr, generation, ord0: ord0_pre });
+                d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: Vec::new(), prefetch, pred: { if pred_mode >= 2 { pred_kept = pred_cur.clone(); } std::mem::take(&mut pred_cur) }, pred_t, hold: if cres { (pred_t.max(cres_min as f32), pred_t.max(cres_min_nvme as f32)) } else { (pred_t, pred_t) }, counts: Vec::new(), extra_scores: Vec::new(), slots_dev: cb.slots_tbl[l % 2].ptr, generation, ord0: ord0_pre });
                 self.chunk_ord += prefetch as u64;
             }
             for si in 0..n_slabs {
@@ -2971,7 +3010,41 @@ impl<'a> DsEngine<'a> {
             self.gpu.sync();
             t_sync += ts.elapsed().as_secs_f64();
             let tm = std::time::Instant::now();
-            let ids: Vec<i32> = cb.ids.download_at::<i32>(ra * k * 4, n_act * k);
+            let mut ids: Vec<i32> = cb.ids.download_at::<i32>(ra * k * 4, n_act * k);
+            let mut cres_lost: Vec<(u32, u32)> = Vec::new();
+            if cres {
+                // the second routing: the experts outside VRAM that too few rows asked for give way
+                let mut cnt = vec![0u32; ne];
+                for &e in &ids {
+                    cnt[e as usize] += 1;
+                }
+                let tier = |e: usize| d.tier_of[l * ne + e].load(std::sync::atomic::Ordering::Relaxed);
+                // (listed: enough rows for its tier, or fetched already on the prefetch's prediction)
+                let thr = |e: usize| [0, cres_min, cres_min_nvme][tier(e) as usize];
+                let tab: Vec<u64> = (0..ne).map(|e| (cnt[e] as usize >= thr(e) || cres_pred.get(e).is_some_and(|&p| p >= pred_t.max(thr(e) as f32))) as u64).collect();
+                // (fewer listed experts than a row picks: the unlisted would be picked by id, not by score)
+                let nv0 = if tab.iter().filter(|&&v| v != 0).count() < k { 0 } else { (0..ne).filter(|&e| cnt[e] > 0 && tab[e] == 0).count() };
+                self.chunk_res_stat[4] += (0..ne).filter(|&e| cnt[e] > 0 && tier(e) == 1).count() as u64;
+                self.chunk_res_stat[5] += (0..ne).filter(|&e| cnt[e] > 0 && tier(e) == 2).count() as u64;
+                self.chunk_res_stat[0] += nv0 as u64;
+                self.chunk_res_stat[3] += ids.len() as u64;
+                if nv0 > 0 {
+                    self.chunk_res_tab.as_ref().unwrap().upload(&tab);
+                    self.chunk_route(l, ra, n_act, cres_args);
+                    self.gpu.sync();
+                    ids = cb.ids.download_at::<i32>(ra * k * 4, n_act * k);
+                    let mut cnt2 = vec![0u32; ne];
+                    for &e in &ids {
+                        cnt2[e as usize] += 1;
+                    }
+                    self.chunk_res_stat[1] += (0..ne).filter(|&e| cnt2[e] > 0 && tab[e] == 0).count() as u64;
+                    self.chunk_res_stat[2] += (0..ne).map(|e| cnt[e].saturating_sub(cnt2[e]) as u64).sum::<u64>();
+                    // the tier scores what the model asked for: the rows a marked-down expert lost
+                    cres_lost = (0..ne).filter(|&e| tab[e] == 0 && cnt[e] > cnt2[e]).map(|e| (e as u32, cnt[e] - cnt2[e])).collect();
+                } else {
+                    self.chunk_res_stat[1] += nv0 as u64;
+                }
+            }
             let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
             for (a, &e) in ids.iter().enumerate() {
                 lists[e as usize].push(a as u32);
@@ -3066,9 +3139,10 @@ impl<'a> DsEngine<'a> {
                 sel.extend_from_slice(&lists[e]);
             }
             cb.sel.upload(&sel);
-            let extra_scores: Vec<(u32, u32)> = picked.iter().filter(|&&e| !lists[e as usize].is_empty()).map(|&e| (e, lists[e as usize].len() as u32)).collect();
+            let mut extra_scores: Vec<(u32, u32)> = picked.iter().filter(|&&e| !lists[e as usize].is_empty()).map(|&e| (e, lists[e as usize].len() as u32)).collect();
             let n_pick_used = extra_scores.len();
-            d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: rest.iter().map(|&e| e as u32).collect(), prefetch: 0, pred: Vec::new(), pred_t: 0.0, counts: rest.iter().map(|&e| lists[e].len() as u32).collect(), extra_scores, slots_dev: cb.slots_tbl[l % 2].ptr, generation, ord0: ord0_rest });
+            extra_scores.append(&mut cres_lost);
+            d.chunk_jobs.lock().unwrap().push_back(crate::dsv41::driver::ChunkJob { layer: l, experts: rest.iter().map(|&e| e as u32).collect(), prefetch: 0, pred: Vec::new(), pred_t: 0.0, hold: (0.0, 0.0), counts: rest.iter().map(|&e| lists[e].len() as u32).collect(), extra_scores, slots_dev: cb.slots_tbl[l % 2].ptr, generation, ord0: ord0_rest });
             let ex = &self.layers[l].experts;
             let gb = ff * ex.gate_row_bytes;
             // the expert formats differ per layer (the UD quant mixes them): the kernel variants per layer
@@ -3264,6 +3338,10 @@ impl<'a> DsEngine<'a> {
                 }
             }
             t_post += tp.elapsed().as_secs_f64();
+        }
+        if cres_on && self.chunk_res_stat[3] > 0 && std::env::var("QX_DS_VERBOSE").is_ok() {
+            let s = self.chunk_res_stat;
+            eprintln!("chunk routing (QX_DS_CHUNK_RES): experts not worth their fetch {} -> {} used, {} of {} selections moved ({:.2}%); the true routing's experts in RAM {}, on NVMe only {}", s[0], s[1], s[2], s[3], 100.0 * s[2] as f64 / s[3] as f64, s[4], s[5]);
         }
         // (the Engram thread writes the chunk's host rows: it ends before the buffers change hands)
         if let Some((h, _)) = engram_job.take() {
@@ -3990,6 +4068,15 @@ impl<'a> DsEngine<'a> {
         }
     }
 
+    /// The selections of a chunk's rows from `ra` on out of the chunk-wide router logits (`chunk_ffn` wrote them);
+    /// `res`: the residency-aware routing's table, entry, multiplier and kept picks (all 0: the true routing).
+    fn chunk_route(&self, l: usize, ra: usize, rows: usize, res: [u64; 4]) {
+        let lg = self.chunk_ffn_bufs.as_ref().unwrap().1[0].ptr;
+        let (c, w, cb) = (&self.cfg, &self.layers[l], self.chunk.as_ref().unwrap());
+        let ku = (ra * c.n_expert_used * 4) as u64;
+        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr + ku, cb.wts.ptr + ku, bits(c.w_scale), res[0], res[1], res[2], res[3], 0, w.router_bias_vl.as_ref().map_or(0, |b| b.ptr), cb.tok.ptr + (ra * 4) as u64]);
+    }
+
     fn chunk_ffn(&mut self, l: usize, ra: usize, rows: usize, rows_max: usize) {
         self.chunk_ffn_alloc(rows_max);
         let [lg, g, u, h, x16, w16] = { let (_, b) = self.chunk_ffn_bufs.as_ref().unwrap(); [b[0].ptr, b[1].ptr, b[2].ptr, b[3].ptr, b[4].ptr, b[5].ptr] };
@@ -3997,9 +4084,8 @@ impl<'a> DsEngine<'a> {
         let w = &self.layers[l];
         let cb = self.chunk.as_ref().unwrap();
         // (rows `ra` on: the chunk's rows from which this layer runs)
-        let ku = (ra * c.n_expert_used * 4) as u64;
         w.g_ffn.run_blas_to(&self.gpu, cb.x.ptr + (ra * E * 4) as u64, rows, &[lg, g, u], x16, w16);
-        self.k("qx_ds_route", 32, (rows as u32, 1, 1), &[lg, c.n_expert as u64, c.n_expert_used as u64, w.router_bias.ptr, cb.ids.ptr + ku, cb.wts.ptr + ku, bits(c.w_scale), 0, 0, 0, 0, 0, w.router_bias_vl.as_ref().map_or(0, |b| b.ptr), cb.tok.ptr + (ra * 4) as u64]);
+        self.chunk_route(l, ra, rows, [0; 4]);
         self.k("qx_ds_silu_mul_clamp", 256, (((c.ff_exp * rows) as u32).div_ceil(256), 1, 1), &[g, u, h, (c.ff_exp * rows) as u64, bits(c.clamp_shexp[l])]);
         w.g_shd.run_blas_to(&self.gpu, h, rows, &[cb.shy.ptr + (ra * E * 4) as u64], x16, w16);
     }

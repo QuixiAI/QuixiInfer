@@ -231,9 +231,9 @@ extern "C" __global__ void qx_ds_engram_gate(const u64* info) {
 /// weights = probs / (sum of the k + 1e-20) * scale. Lane l holds experts l, l+32, ... One block of 32 threads per
 /// token. info: [0] logits (T x n), [1] n (<= 1024), [2] k (<= 32), [3] bias (n), [4] ids out (i32 T x k),
 /// [5] weights out (f32 T x k), [6] scale bits.
-/// Residency-aware routing (lossy, opt-in) when [7] != 0: the selection score of an expert the VRAM tier holds
+/// Residency-aware routing (lossy, opt-in) when [7] != 0: the selection score of an expert the table lists
 /// (table [7] at entry [8] + id, nonzero: resident) is p * [9] (f32 bits, > 1) + bias for the picks after the
-/// first [10], which go by the true score; the weights stay the true probs over the picks. [11] (when not 0): the
+/// first [10], which go by the true score ([9] under 1: the unlisted experts are marked down instead, see below); the weights stay the true probs over the picks. [11] (when not 0): the
 /// picks by the true score alone (i32 T x k), for the tier's scoring: what the model asked for, not what it got.
 /// [12] (0: none) the bias of image positions (the reference's `bias_vl`), taken by the tokens whose device id
 /// in [13] (u32 per token) has bit 31 set.
@@ -251,7 +251,10 @@ extern "C" __global__ void qx_ds_route(const u64* info) {
             const float x = lg[e];
             p[i] = sqrtf(x > 20.f ? x : log1pf(expf(x)));
             s[i] = p[i] + bias[e];
-            s2[i] = table && *reinterpret_cast<const volatile u64*>(&table[e]) != 0 ? p[i] * res_mul + bias[e] : s[i];
+            const bool av = table && *reinterpret_cast<const volatile u64*>(&table[e]) != 0;
+            // [9] >= 1: the listed experts' p times it; in [0, 1): the unlisted experts' p times it; < 0: added to
+            // the unlisted experts' score (-1e30: they are picked only when the listed ones run out)
+            s2[i] = !table ? s[i] : res_mul >= 1.f ? (av ? p[i] * res_mul + bias[e] : s[i]) : av ? s[i] : res_mul >= 0.f ? p[i] * res_mul + bias[e] : s[i] + res_mul;
         } else {
             p[i] = 0.f;
             s[i] = s2[i] = -3.402823466e38f;

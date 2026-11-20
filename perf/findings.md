@@ -343,6 +343,20 @@ These are not our measurements. They are cautions with a source.
 - **A lossy router buys 6%**: residents preferred on layers 20-39 by 1.3 (`QX_DS_ROUTE_RES=1.3 QX_DS_ROUTE_L0=20`)
   -6.1% over 4,096 tokens at 245k, KL 0.010, top-1 96.4%, stable; the lower 20 layers cost 3x the KL; stronger
   settings drift. Replies then differ run to run and the tier scores the biased picks: opt-in only.
+- **A 1,000-row prompt chunk is half dense work, a quarter RAM copies, a quarter disk (2026-11-20, X171).** 2,465
+  ms by default; 1,811 with no NVMe-only expert; 1,211 with VRAM experts only (probes through the routing). The
+  driver lane's "2.0 s in NVMe reads" is not what the chunk waits for. A 96-row chunk: 1,153 ms, 447 with VRAM
+  experts only.
+- **Leaving out the NVMe experts few rows ask for buys 16-20% of such a chunk for KL +0.004**
+  (`QX_DS_CHUNK_RES=1e6`: under 8 rows per 1,024; four texts, mean KL 0.0121 -> 0.0161 against the exact
+  kernels; 512 rows -10%, 2,000 rows -15%; server photographs -12 to -25%). Every stronger form costs in
+  proportion (no NVMe at all: -26%, KL +0.007; RAM experts too: -33 to -38%, KL +0.005 to +0.026), chunks under
+  512 rows lose more than they gain (96 rows: KL 0.05-0.19)
+  and chunks over 2,048 rows gain nothing (their prefetch is blind). The result depends on the tiers' state:
+  opt-in.
+- **The default f16 chunk path reads top-1 92.2-96.5% on these four texts (mean 94.85%, KL 0.007-0.017)**
+  against the exact kernels, 257 rows a text after a 1,000-row chunk (X171 j): under the 95% of the bound on two
+  of four, where 2026-11-11 gave 95.1% as its lowest sample. Not rerun on more rows.
 - **vLLM (34aac94f9c) has nothing else to give this engine**: its scheduler, graphs, MoE kernels and prefix cache
   have counterparts here; its async scheduling hides host time we do not have. Admission by shared prefix was
   ported (`QX_DS_ADMIT_WINDOW`). Not ported: suffix decoding's cross-request corpus, draft models (DSpark: a 4-row

@@ -806,6 +806,21 @@ becomes a family.
   image prompts. Attacks "a prompt's routing is the model's".
 - Separate the predictors' image bias from the Engram skip (`QX_DS_IMG_ENGRAM=1` on the new build).
 
+### Queue 2026-11-20, later (the chunk routing knob landed opt-in; the premise above was wrong)
+
+- The first item above is done and its figure corrected: of a 1,000-row chunk's 2.5 s about 1.2 s is the slab
+  passes' dense work, 0.6 s the RAM records' copies and 0.65 s the NVMe reads. `QX_DS_CHUNK_RES=1e6` drops the
+  NVMe experts under 8 rows per 1,024: -16 to -20% (qx-ds-check, 1,000 rows), -12 to -25% (server photographs),
+  KL +0.004.
+- **The dense work of a mid-size chunk** is now the largest part (1.2 ms a row at 1,000 rows, 320 slab passes of
+  ~3.8 ms): what in a 128-row slab pass takes 3.8 ms on the card (nsys over a 1,000-row chunk with VRAM experts
+  only, `QX_DS_CHUNK_RES=1e6 QX_DS_CHUNK_RES_MIN=1000000 QX_DS_CHUNK_RES_MIN_NVME=1000000` as the probe).
+- A prediction for chunks over 2,048 rows (`QX_DS_CHUNK_PRED_MAX`) would let the knob hold reads back there too.
+- KL after an image chunk: a logits dump in `qx-ds-img-check` (the knob's accuracy on image rows is unmeasured).
+- Whether the tiers still adapt to a workload when its rare experts are dropped (hours, not minutes).
+- **The default f16 chunk path's top-1 against exact: 94.85% over four texts (92.2% on the wiki text)**, under
+  the bound's 95%: measure it on 1,024+ rows a text and several chunk sizes before spending more of the bound.
+
 ## Parked
 - **Parking idle sequences in host memory** (work in progress, 2026-11-05). This is a serving capability: prefix
   reuse across more conversations than slots. It is not a speed change to the standard benchmark. Its

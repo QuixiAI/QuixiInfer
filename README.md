@@ -211,9 +211,14 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
   977-position image: 0.7 s).
 - **`detail: "low"`** on an `image_url` part caps that image at 256 positions (`QX_VISION_LOW_TOKENS`;
   `QX_VISION_MAX_TOKENS` caps every image): a photograph request took 2.7 s against 4.5 s, and large type was
-  still read; small text will not be. The prompt work of an image is the same as of that many text tokens, and
-  for both it is mostly the wait for experts outside RAM (about 2.0 s of a 1,000-position chunk's 2.5 s), which
-  falls little with fewer positions (207 positions: 1.8 s).
+  still read; small text will not be. The prompt work of an image is the same as of that many text tokens: of a
+  1,000-position chunk's 2.5 s about half is the layers' own work and half is fetching experts from RAM and
+  disk, and it falls little with fewer positions (207 positions: 1.8 s).
+- **`QX_DS_CHUNK_RES=1e6`** (lossy, off by default) leaves out the disk-only experts that few positions ask for:
+  a photograph's prompt work went from 2.4-2.6 s to 1.9-2.0 s (2.1-2.3 to 1.9-2.0 s once the server had seen a
+  few photographs), a request from about 4 s to about 3.5 s; the descriptions opened in other words for three
+  of four photographs. See
+  the settings table for what it costs.
 - **The tower on the GPU** (`crates/qx-engine/src/vision_gpu.rs`, `kernels/vision.cu`) uses the engine's f16
   tensor-core product on a low-priority stream of its own, with 325 MB of device memory out of what the engine
   leaves free (the expert tier gives up nothing; the weights are streamed from pinned host memory layer by
@@ -250,6 +255,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
 | `QX_DS_SPEC`, `QX_DS_SPEC_CORPUS` | Draft length cap for speculation (15; `0` off) and the tokens of other requests' finished replies kept to draft from (262144; `0` off). |
 | `QX_DS_ADMIT_WINDOW` | Among this many waiting requests (4), the one sharing the longest prefix with a free slot is admitted first; the front request is passed over three times at most. |
 | `QX_DS_ROUTE_RES=m`, `QX_DS_ROUTE_L0` | Lossy and off by default: the router's score of experts already in VRAM is multiplied by `m` from layer `L0` up. `1.3` from layer 20 measured 5-6% off decode at 256k for KL 0.010 and 96.4% top-1; replies then depend on what is resident. |
+| `QX_DS_CHUNK_RES=m`, `QX_DS_CHUNK_RES_MIN_NVME`, `QX_DS_CHUNK_RES_ROWS` | Lossy and off by default (`1e6` to turn on): a prompt chunk of 512 (`_ROWS`) to 2,048 rows does not fetch the disk-only experts that fewer than 8 (`_MIN_NVME`) rows per 1,024 ask for; those rows go to their next experts. Measured 16-20% off a 1,000-token prompt's prefill (10% at 512 tokens, 15% at 2,000) and 12-25% off a photograph's for a mean KL of 0.016 against 0.012 without it (four texts, against the exact kernels). The same prompt can then give slightly different replies at another time or beside another request. |
 | `QX_DS_RAM_YIELD`, `QX_DS_YIELD_PATH`, `QX_DS_YIELD_LOW`, `QX_DS_YIELD_HIGH`, `QX_DS_YIELD_HOLD` | GiB of the RAM tier that can be handed back to the host (off when unset), the path whose live process asks for it, the available-memory mark below which it goes anyway (4 GiB), the room above its own size needed before it returns (8 GiB) and for how long (20 s). |
 | `QX_DS_STAGE_SHARE`, `QX_DS_STAGE_SHARE_DECODE` | Of 8: how many of the RAM-resident missing experts the GPU takes by DMA staging in windows (8) and in single decode steps (3). |
 | `QX_DS_VRAM`, `QX_DS_RAM` | The tiers in GiB (`--vram-gib` 21, `--ram-gib` 100; the VRAM figure is a cap, the context and slots come first). |
