@@ -5776,3 +5776,94 @@ and the corrections above. Its cadence flag stands: the last four experiments at
 next one must.
 
 Raw: `perf/results/2026-11-19/x-vision/`, `x110-i-162914`, `x110-j-172148`, `x111-v-1-180731`.
+
+## 2026-11-19: The vision tower on the GPU — LANDED (a large photograph's encode 19-24 s -> 0.5 s; without images the scored cases and identity unchanged)
+
+Why: the user: "we need to optimize it". The CPU tower took 2-3 s for a small picture and 19-24 s for a photograph,
+one image at a time across all clients, on threads that share the engine's cores.
+
+What: `crates/qx-engine/src/vision_gpu.rs` (`GpuTower`) and `kernels/vision.cu`. The matrix products are the
+engine's `qx_gemm16` (f16 operands, f32 accumulation); per block of query rows the attention is three launches for
+all 16 heads (scores as 16 groups, a softmax, the probabilities' product with the values in K slices summed by
+`qx_gemm16_sum`); norms, the rotary rotation, SwiGLU, the unfold and the GELU are small kernels. The tower has a
+host thread and a low-priority stream of its own; its info words go through a ring of its own, copied once per
+batch of launches. Weights stay in pinned host memory and are streamed into a 26 MB staging area layer by layer.
+325 MB of device memory, allocated after the engine's warm-up out of what it leaves free (1.21 GiB), refused if
+less than 512 MB would remain (`QX_VISION_HEADROOM_MIB`); the expert tier gives up nothing. Probabilities are
+stored in f16 times 4,096 (most are below f16's normal range otherwise). The CPU tower stays as the fallback
+(no room, `QX_VISION=cpu`, a block with a value that is not finite, a driver error); its 1.9 GB of f32 weights are
+now read only if it is used.
+
+Measured (VM off, the service stopped; raw in `perf/results/2026-11-19/x-vision-gpu/`). Final build chunk191
+(quixiinfer def2c5bcefdf, qx-ds-check 8f1603b13033).
+- Encode alone (`qx-vision-gpu-check`, `gpu-check.txt`): 0.058-0.059 s for 189-206 positions, 0.48-0.51 s for
+  968-1,014 (CPU tower beside it: 2.2-2.7 s and 22.0-23.1 s). The tool's pass bound was loosened after the first
+  measurement, from a row cosine above 0.999 to above 0.97 with a mean difference under 1%: its "ok" is against
+  a bound set knowing the numbers. Two runs give the same bits on all five images.
+- Against the CPU tower: mean |d| / mean |x| 0.02%, 0.33%, 0.24%, 0.21%, 0.12%; lowest row cosine 1.000000,
+  0.998369, 0.980934 (tall.png), 0.994541, 0.999715. `tools/vision_ref.py` with `VISION_REF_F16=1` (the same
+  rounding points in NumPy) on mid.png: lowest rows 63, 201, 137 at 0.99809, 0.99946, 0.99969; the GPU tower's
+  lowest row there is 0.998369. The largest activation fed to a product in that run: 804.5 (f16 holds 65,504).
+  The 0.981 of tall.png was not reproduced in NumPy (not run).
+- In the server (X160 c, prefix reuse off so every prompt is prefilled anew): every image question of the CPU
+  tower's tests answered with the same content (not always the same words: the squares came back as "3" on
+  chunk191 and as a sentence on chunk190, so the tower's bits changed between the two builds) (colours, "ZEBRA 58213", 3 squares, three images, the 1,014- and
+  977-position labels, the invoice's three fields, the logo, five photographs). 56 encodes, all on the GPU; in
+  the server a large image encodes in 0.50-0.65 s. A request with a photograph answers in 3.7-4.2 s (25.6-31.4 s
+  before), one with a small picture in 1.9-2.7 s (3.9-4.8 s). Thirty new small images one after another: 42.9 s.
+- The engine beside the tower: a 12.5k-token text prompt, prefilled anew, gives the same reply alone and while six
+  requests with new large images run (13.9 s alone, 27.2 s beside them: those six also prefill 1,000 positions
+  each). An essay decodes at 28.3 tok/s alone and 9.1 beside six image requests in a row; beside one (X161
+  prod2) 22.2 against 25.3: per second the cost to a neighbour is what it was with the CPU tower (22.2 against
+  28.3), but for about 3 s instead of 21.
+- Beside the engine's windows with prompt chunks off (X162 a; `x162-a.server-full.log`): one lazy graph capture
+  and 77 KV-only windows fell inside the traffic of ten new 1,014-position images (the other 14 captures are the
+  warm-up's, before the tower exists; nothing shows the one overlapped an encode in time): ten codes read exactly, no panic,
+  no encode given up, GPU memory 31,267-31,281 MiB throughout.
+- Production's settings with a RAM-tier hand-over (X161 prod2): images answered with the part in, out and back;
+  resident 105.7 -> 93.7 -> 105.7 G (was 106.6-106.7 with the CPU tower's weights loaded), GPU 31,269-31,283 MiB,
+  18.1 GiB available beside the service (16.4-17.0 before). `QX_VISION=cpu` (X161 cpu2, chunk191): the CPU tower
+  answers as before (3.3 s encode). `QX_VISION_HEADROOM_MIB=2000` (X163, chunk191): the tower is refused at start
+  ("would have 909 MB free"), nothing stays allocated (GPU 30,943 MiB) and the CPU tower answers.
+- Without images: gate x110-n-220838 on chunk191: 18.447 against 18.475 (decode256k 38.9, 39.0; serve256k3
+  80.58; decode 31.0; prefill128 10.5; prefill256k 2.0), identity identical. The unscored serve256k1 reads 37.43
+  against 32.98 and prints REGRESSION (gate exit 1); it is just above the 33.2-37.2 the case has shown today on
+  every build. `run.json` records correctness "skipped": ds-checks attached by hand (X148, 8f1603b13033: pass,
+  each part the same text as X86) with `qx-ds-img-check` (ok). x110-k-193406 on chunk190: 18.355, identical.
+  x110-m-202015 (20.145) is void: the NumPy experiment ran on the CPU beside it.
+- `kernels/vision.cu` compiles with `nvcc -cubin` for sm_86, sm_89 and sm_120a (`nvcc-archs.txt`).
+
+Breaker (fresh context, reading only, on chunk190): no layout or offset defect. Its points and the answers:
+the info ring wrapped inside one encode (39,626 launches against 32,768 slots; the large images passed on
+timing): now 11,532 launches for the largest image tried (`profile-tall.txt`; the breaker's 39,626 is its own count of
+  the old code) in a ring of 65,536 that restarts with each encode, asserted; calls that CUDA
+forbids beside another thread's graph capture (stream synchronize, pageable copies): every transfer is pinned and
+the end is an event polled, and X162 ran it with one lazy capture in the traffic (the rule holds by construction, with that one instance); headroom unchecked: checked; no finiteness check
+on the server path: added, with the CPU tower behind it; a panic poisoned the tower for good: errors return and a
+poisoned lock is taken over; a warm-up over 300 s chose the CPU tower silently: it waits; leaks and missing type
+checks in `new`: everything is read and checked before the first allocation. Its "identical beside six encodes"
+objection (the second prompt had been reused, not prefilled): rerun with reuse off, above.
+
+Not covered:
+- The GPU tower differs from the CPU tower (rows down to cosine 0.981). f16 rounding is shown to account for it
+  on mid.png only; for tall.png's 0.981 it is the attribution, not shown. No accuracy benchmark on either tower.
+- No fresh-context reading of chunk191's layout (the block size, buffers serving two purposes, the aligner in
+  parts, the pinned buffers changed after the breaker read chunk190): its evidence is numerical, the five images
+  and the server's answers. The non-finite fallback, the driver-error return and the poisoned-lock take-over
+  have never run.
+- serve256k1 read 35.87 and 37.43 on the two GPU-tower builds: the upper half of the case's range, one sample each.
+- sm_86 / sm_89: compiled, never run (and `qx_gemm16` needs tensor cores those cards have, but nothing here ran
+  on them).
+- Image traffic still slows text clients: the image's 1,000 prompt positions and the tower share the GPU and the
+  context with decode (9.1 against 28.3 tok/s under back-to-back image requests). Not attacked here.
+- A deep rewind across an image, f16 prompt chunks on image rows, the tiers under image traffic: as before.
+- 891-901 MB of device memory stay free with the tower; the engine's lazy allocations fitted in every run here
+  (14 MiB of growth at most), but that is these runs.
+
+### Adjudication (fresh context, 2026-11-19): LANDED
+Gate (18.447), identity (two sessions on the final server), the ds-checks' binary, the preflight and the voiding
+of x110-m reproduced. Corrections applied above (one lazy capture, not 15; request times before; the loosened
+bound; what rests on which build); the CPU switch and the headroom refusal run on chunk191 at its suggestion.
+The cadence flag stands: the next experiment must attack a presupposition.
+
+Raw: `perf/results/2026-11-19/x-vision-gpu/`, `x110-n-220838`, `x110-k-193406`.

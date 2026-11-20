@@ -786,9 +786,9 @@ becomes a family.
 
 ### Queue 2026-11-19, after image input
 
-- **The vision tower on the GPU** (a photograph is 19-24 s on the CPU, serial across clients, and decode beside
-  it runs 22 against 28 tok/s): the f16 GEMM kernel exists; attention over 9k patches needs a kernel; VRAM for
-  the weights (1 GB in f16) must come from somewhere (lent like the chunk buffers, or loaded per encode).
+- The vision tower is on the GPU (2026-11-19, 0.5 s a photograph). Left: image requests slow text decode
+  (9 against 28 tok/s under back-to-back photographs: the 1,000 prompt positions per image); the f16 deviation
+  on tall.png (0.981) not reproduced in NumPy; a fresh reading of chunk191's layout; the error paths never run.
 - Compare the tower with llama.cpp's port (`libmtmd`, `clip.cpp`) on a few images: the only independent
   implementation on the box.
 - An image path in `qx-ref`, so ds-checks' f32 comparison covers image positions; images in the scheduler trace,

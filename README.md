@@ -101,7 +101,7 @@ Requirements:
   (sm_89) and the RTX 30 series (sm_86), see "Other GPUs" below;
 - CUDA 13 (`nvcc` at `/usr/local/cuda-13.3/bin`, or set `QX_NVCC`);
 - a recent stable Rust;
-- about 128 GB of RAM (the process is about 107 GB with a 95 GiB RAM tier and the vision tower);
+- about 128 GB of RAM (the process is about 106 GB with a 95 GiB RAM tier and the vision tower);
 - the pack (282 GB) on an NVMe drive;
 - for image input, `mmproj-F16.gguf` from the same model repository.
 
@@ -143,7 +143,7 @@ systemd-run --user --scope -p MemoryMax=112G -p MemorySwapMax=0 -- \
 ```
 
 
-That is the benchmarked and production configuration; the process is about 107 GB (105 without the vision tower) and is ready about 35 s
+That is the benchmarked and production configuration; the process is about 106 GB (105 without the vision tower) and is ready about 35 s
 after start. `--profile` ranks the experts the tiers are filled with at start (`golden/profile-dsv41.txt` comes
 from a routing trace of a mixed corpus and is the default when present); `--profile-out FILE` writes the live
 ranking after requests, and a start finding that file loads from it instead. `--slots` (2) sets how many
@@ -202,11 +202,23 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
 
 - **What an image costs.** It is fitted to a multiple of 14 pixels (small images are enlarged to about 544 x 544,
   large ones reduced), and takes `rows x (columns + 1) + 2` positions of the context, a row and a column per 42
-  pixels: about 200 positions for a 640 x 480 picture, at most 1,024 (reached from about 1.8 megapixels: 1280 x 960 takes 738, 1440 x 1080 takes 938). The vision tower runs on the CPU, one image at a time: 2-3 s for a small picture,
-  19-24 s for a large photograph, and requests from all clients wait their turn; a decode running beside a large encode
-  measured 22 against 28 tok/s meanwhile. An image sent again is not encoded again (the last images' blocks are
-  kept, 335 MB at most), and a prompt that repeats an image and the text before it reuses that prefix like any
-  other (a second turn about a 977-position image: 0.7 s).
+  pixels: about 200 positions for a 640 x 480 picture, at most 1,024 (reached from about 1.8 megapixels: 1280 x 960
+  takes 738, 1440 x 1080 takes 938). The vision tower runs on the GPU beside the engine: 0.06 s for a small
+  picture, 0.5 s for a large photograph (0.5-0.65 s while the engine is busy). A request with one photograph
+  answers in about 4 s, nearly all of it the prompt's 1,000 positions; one with a small picture in about 2 s.
+  An image sent again is not encoded again (the last images' blocks are kept, 335 MB at most), and a prompt that
+  repeats an image and the text before it reuses that prefix like any other (a second turn about a
+  977-position image: 0.7 s).
+- **The tower on the GPU** (`crates/qx-engine/src/vision_gpu.rs`, `kernels/vision.cu`) uses the engine's f16
+  tensor-core product on a low-priority stream of its own, with 325 MB of device memory out of what the engine
+  leaves free (the expert tier gives up nothing; the weights are streamed from pinned host memory layer by
+  layer). Its activations are f16 where the CPU tower's are f32: against the CPU tower the block differs by 0.02-0.33% on average, the lowest row cosine on
+  five images 0.981. A NumPy run with the same rounding reproduces the deviation on the one image tried, a
+  small one (the same three lowest rows, 0.9981 against 0.9984); for the 0.981 it is the likely cause, not shown.
+  Image requests still slow text clients while they run: a reply decoded at 22 against 25 tok/s beside one
+  photograph request, 9 against 28 beside six in a row (the image's 1,000 prompt positions share the GPU). If the device
+  cannot spare the memory beside 512 MB of headroom (`QX_VISION_HEADROOM_MIB`), or with `QX_VISION=cpu`, the CPU
+  tower runs instead (2-3 s for a small picture, 19-24 s for a large photograph, exact f32).
 - **In the language model** an image position takes its embedding from the vision block, the router's image
   bias (`exp_probs_b_vl`), no Engram contribution, and is dead to the Engram's n-grams, as in the reference.
   `qx-ds-img-check` verifies each of these numerically.
@@ -287,7 +299,8 @@ assumptions tested so far) and `backlog.md`.
 |---|---|
 | `qx-ds-check` (`tools/ds-checks.sh`) | Nine checks: the f32 mode against the CPU reference (exact), the production numerics against it (KL, top-1), windows of 3, 8 and 64 against one-token steps (bit-identical, also with the tiers adapting), the tokenizer against llama.cpp, rewind and park/unpark against the straight pass, windows over several sequences, rewinds by a replay chunk and from checkpoints (all bit-identical). It also saves and resumes 256k states and dumps logits for `tools/logits_compare.py`. |
 | `qx-ds-img-check` | Image positions in the engine: the embedding is the vision block's row bit for bit, the Engram gates are zero, the router's picks are the top k under the image bias (and under the text bias elsewhere), and windows and an exact chunk over an image give the single steps' logits bit for bit. |
-| `qx-vision-check`, `tools/vision_ref.py` | The vision tower on one image, and a NumPy + Pillow reference to compare it with. |
+| `qx-vision-check`, `tools/vision_ref.py` | The CPU vision tower on one image, and a NumPy + Pillow reference to compare it with (`VISION_REF_F16=1`: with the GPU tower's f16 rounding). |
+| `qx-vision-gpu-check` | The GPU vision tower against the CPU one on given images: times, the blocks' difference, and that two runs give the same bits. |
 | `qx-tier-check` | The expert store: RAM places and NVMe reads against the source GGUF byte for byte; with `QX_TIER_ELASTIC=G`, every record through churn, release and restore of the elastic part. |
 | `qx-ds-replay` | Replays a recorded scheduler trace as single steps and compares every row's hash (the exactness check for speculation and scheduling changes). |
 

@@ -11,8 +11,9 @@
 - **Image input** (2026-11-19, the user: "mandatory"): the service loads `~/models/DeepSeek-V4.1-Flash-1017-GGUF/
   mmproj-F16.gguf` by itself (`--mmproj`; `crates/qx-vision`, CPU). Chat `image_url` parts as data: URLs. Checks:
   `qx-ds-img-check` (image positions in the engine, numerically) and `qx-vision-check` + `tools/vision_ref.py`
-  (the tower). Resident 106.7 GB now, 16.5-17 GiB available beside it. A large photograph costs 19-24 s of CPU
-  encode: the tower on the GPU is the next step there (backlog).
+  (the tower). Resident 105.7-106.1 GB, 18 GiB available beside it. The tower runs on the GPU since the evening
+  (`vision_gpu.rs`, 325 MB of device memory, 0.5 s a photograph; `QX_VISION=cpu` for the CPU tower; check:
+  `qx-vision-gpu-check`).
 - **The win10 VM beside it** (the user's build machine, started now and then; never started or stopped by me): the
   unit sets `QX_DS_RAM_YIELD=12 QX_DS_YIELD_PATH=/run/libvirt/qemu/win10.pid`: while the pid file's process lives
   (or under 4 GiB are available) the coldest 12 GiB of the RAM tier are freed and read from NVMe (gate +5.4%,
