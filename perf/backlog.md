@@ -798,6 +798,14 @@ becomes a family.
 - The image table in f16 (half the pinned memory); the predictors with the image bias.
 - The cadence flag: the next experiment must attack a presupposition.
 
+### Queue 2026-11-20, after the image-prefill measurement
+
+- **Prompt chunks routed with a preference for experts in RAM or VRAM** (the long shot the adjudicators ask for):
+  a 1,000-row chunk waits ~2.0 of its 2.5 s for ~2,400 records from NVMe, text and images alike; a 207-row one
+  still 1.1 s. Lossy: hold to KL <= 0.03, top-1 >= 95% against exact routing, teacher-forced on text and on
+  image prompts. Attacks "a prompt's routing is the model's".
+- Separate the predictors' image bias from the Engram skip (`QX_DS_IMG_ENGRAM=1` on the new build).
+
 ## Parked
 - **Parking idle sequences in host memory** (work in progress, 2026-11-05). This is a serving capability: prefix
   reuse across more conversations than slots. It is not a speed change to the standard benchmark. Its

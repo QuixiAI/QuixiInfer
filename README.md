@@ -209,6 +209,11 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
   An image sent again is not encoded again (the last images' blocks are kept, 335 MB at most), and a prompt that
   repeats an image and the text before it reuses that prefix like any other (a second turn about a
   977-position image: 0.7 s).
+- **`detail: "low"`** on an `image_url` part caps that image at 256 positions (`QX_VISION_LOW_TOKENS`;
+  `QX_VISION_MAX_TOKENS` caps every image): a photograph request took 2.7 s against 4.5 s, and large type was
+  still read; small text will not be. The prompt work of an image is the same as of that many text tokens, and
+  for both it is mostly the wait for experts outside RAM (about 2.0 s of a 1,000-position chunk's 2.5 s), which
+  falls little with fewer positions (207 positions: 1.8 s).
 - **The tower on the GPU** (`crates/qx-engine/src/vision_gpu.rs`, `kernels/vision.cu`) uses the engine's f16
   tensor-core product on a low-priority stream of its own, with 325 MB of device memory out of what the engine
   leaves free (the expert tier gives up nothing; the weights are streamed from pinned host memory layer by

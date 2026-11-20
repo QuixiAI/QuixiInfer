@@ -5867,3 +5867,70 @@ bound; what rests on which build); the CPU switch and the headroom refusal run o
 The cadence flag stands: the next experiment must attack a presupposition.
 
 Raw: `perf/results/2026-11-19/x-vision-gpu/`, `x110-n-220838`, `x110-k-193406`.
+
+## 2026-11-20: Prefill with an image — measured: it costs what text costs and is NVMe-bound; Engram reads skipped at image positions, the predictors under the image bias, `detail: "low"` — LANDED (small: a photograph's chunk -5%; a low-detail photograph request 4.5 -> 2.7 s)
+
+Why: the user asked for ways to speed up prefill with vision input and to try the list (the measurement, the
+Engram skip, image-aware tiers, the predictors' bias, `detail: "low"`).
+
+Measured first (X170 base, chunk191, prefix reuse off, QX_DS_VERBOSE; `x170-base.server.txt`): a photograph's 987
+positions are one chunk of 2,591-2,780 ms; a text prompt of 913-1,019 tokens 2,434-2,677 ms. Of the driver's
+~2.5 s per chunk about 2.0 s is waiting for NVMe reads: 2,375-2,576 records staged from NVMe and 5,670-5,769 from
+RAM for a photograph (2,283-2,549 and 7,258-7,505 for the text), 213-225 distinct experts per layer against
+258-271. A 207-position image is still 1,834 ms (1,330 records from NVMe). Engram: 75-82 ms of a photograph's
+chunk. So image prefill is not worse than text prefill, the tiers are not image-blind in any way that shows
+(the first photograph asked again after seven other requests reads 2,025 records from NVMe against 2,451: the
+tiers adapt, -17%; -20% on the new build), and
+the floor is the experts outside RAM, for text and images alike.
+
+What:
+- The Engram rows of image positions are not read (`gather_engram`, `gather_engram_start`; zeros instead): the gate
+  kernel returns before it would use them. `QX_DS_IMG_ENGRAM=1` reads them as before.
+- The three predictors pass the image bias and the token array to `qx_ds_route`.
+- `image_url.detail: "low"` caps an image at 256 positions (`QX_VISION_LOW_TOKENS`; `QX_VISION_MAX_TOKENS` caps
+  every image), by the reference's own resize rule with a smaller maximum (`Vision::plan_cap`).
+
+Result (X170 new, chunk192: quixiinfer 68ca14dcdcf7, qx-ds-check 1150d1f06c5c; one run of each build, base first):
+- The four photographs' chunks 2,639 / 2,756 / 2,780 / 2,591 -> 2,517 / 2,624 / 2,650 / 2,426 ms (-4.6%, -4.8%,
+  -4.7%, -6.4%), engram 75-82 -> 0 ms; the same reply openings (the logs keep the first ~52 characters) and token counts on both builds; full
+  replies were not stored. The text prompts
+  2,677 -> 2,659 and 2,434 -> 2,436. The gain (122-165 ms) is more than the engram wait reported (75-82 ms): the
+  rest is the predictors' bias, fewer reads beside the expert stream, or order; not separated.
+- `detail: "low"`: a photograph at 252 positions, chunk 1,908 ms, request 2.7 s against 4.5 s; the invoice's three
+  fields, "ZEBRA 58213" and the tall image's label still read exactly at 207-249 positions.
+- An essay beside four photograph requests in a row: 10.9 tok/s (10.5 before), the four in 15.9 s (16.7). The
+  essay alone read 26.3 tok/s against 29.8 on the base run: the new run had four more requests before it; the
+  gate's decode cases are level.
+- Exactness: `qx-ds-img-check` with 240 image rows (264 rows: the threaded gatherer, a mixed chunk) with the skip
+  on and off: windows of 8 and the exact chunk bit-identical to single steps, ok both ways
+  (`img-check-264-knob0.log`, `-knob1.log`); the 64-row check ok; ds-checks on 1150d1f06c5c (X149): pass, each
+  part the same text as X86.
+- Gate x110-p-224212: 18.488 against 18.475 (decode256k 39.1, 39.2; serve256k3 80.71; decode 31.0; prefill128
+  10.6; prefill256k 2.0), identity identical; the unscored serve256k1 35.70 prints REGRESSION against 32.98
+  (its known range). `run.json` has correctness "skipped"; the checks are attached by hand. Preflight: VM shut
+  off, swap 1,345 MiB used, pressure 0.00, no build tools, bins 1150d1f06c5c 68ca14dcdcf7 (X170 itself had none).
+  A second session (x111-w-1-231746): identical, serve256k1 34.82, serve256k3 80.19.
+
+Breaker (fresh context, reading only): no blocking defect; change 1 exact by the code (the only readers of the
+rows are the copy, the per-row product and the gate, which returns first), change 2 in bounds at all three sites,
+change 3 cannot panic the server (a Python port of `plan_cap` over caps 16-1,024 and sizes to 30,000: no assert,
+no zero size). Its coverage hole (the threaded gatherer with image rows had no bit-level test) is the 264-row
+check above.
+
+Not covered: the photograph times are one run each, in a fixed order; a photograph chunk as one part of a
+multi-slot chunk; `detail: "low"` on real small text (the tests above are large type); what the gain's 47-83 ms
+beyond the engram wait is; the predictors' bias has no test or measurement of its own; the essay alone at 26.3
+against 29.8 tok/s was not rerun (the earlier requests are a guess at its cause; the gate's decode cases are
+level); `QX_VISION_MAX_TOKENS` / `QX_VISION_LOW_TOKENS` other than their defaults; the two 264-row logs do not
+record which had the knob.
+
+The lever this leaves: the NVMe floor of every prompt chunk (about 2.0 of 2.5 s for 1,000 rows). Routing prompt
+chunks with a preference for experts already in RAM or VRAM (as `QX_DS_ROUTE_RES` does for decode) would attack
+it for text and images at once; lossy, to be held to the prefill bound (KL <= 0.03, top-1 >= 95%). Not started.
+It would also answer the adjudicators' cadence flag (presupposition: a prompt's routing is the model's).
+
+### Adjudication (fresh context, 2026-11-20): HOLD, then lifted
+Gate, ds-checks' binary, the image checks and tree-equals-measured reproduced. HOLD for a second identity session
+(x111-w: identical), base counters cited from the new run, and the preflight; corrected above.
+
+Raw: `perf/results/2026-11-20/x-image-prefill/`, `perf/results/2026-11-19/x110-p-224212`, `x111-w-1-231746`.
