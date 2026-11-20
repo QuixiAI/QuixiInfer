@@ -185,6 +185,13 @@ impl Vision {
     /// `plan_image_grid` of the reference: the pixel size (height, width) an image of `width` x `height` is
     /// fitted to.
     pub fn plan(&self, width: usize, height: usize) -> (usize, usize) {
+        self.plan_cap(width, height, self.max_tokens)
+    }
+
+    /// `plan` with the block capped at `cap` positions (16 to `max_tokens`) instead of the model's 1,024: a
+    /// smaller image for the language model, by the reference's own resize rule.
+    pub fn plan_cap(&self, width: usize, height: usize, cap: usize) -> (usize, usize) {
+        let max_tokens = cap.clamp(16, self.max_tokens);
         let (p, r) = (self.patch, self.merge);
         let (mut w, mut h) = (width, height);
         if w * h > 0 && w * h < self.min_pixels {
@@ -194,24 +201,24 @@ impl Vision {
         }
         let (mut bw, mut bh) = (w.div_ceil(p) * p, h.div_ceil(p) * p);
         let tokens = |bh: usize, bw: usize| { let (gh, gw) = self.llm_grid(bh, bw); Self::block_tokens(gh, gw) };
-        if tokens(bh, bw) > self.max_tokens {
+        if tokens(bh, bw) > max_tokens {
             // solve_resize_ratio: the largest size of the same aspect whose block fits
             let ratio = h as f64 / w as f64;
-            let max_w = ((self.max_tokens - 2) as f64 / ratio + 0.25).sqrt() - 0.5;
+            let max_w = ((max_tokens - 2) as f64 / ratio + 0.25).sqrt() - 0.5;
             let max_h = max_w * ratio;
             let cell = p * r;
             if max_w < 1.0 {
-                bh = (self.max_tokens - 2) / 2 * cell;
+                bh = (max_tokens - 2) / 2 * cell;
                 bw = cell;
             } else if max_h < 1.0 {
                 bh = cell;
-                bw = (self.max_tokens - 3) * cell;
+                bw = (max_tokens - 3) * cell;
             } else {
                 let beta = (max_w.floor() * cell as f64 / w as f64).min(max_h.floor() * cell as f64 / h as f64);
                 bh = (h as f64 * beta / p as f64).floor() as usize * p;
                 bw = (w as f64 * beta / p as f64).floor() as usize * p;
             }
-            assert!(tokens(bh, bw) <= self.max_tokens);
+            assert!(tokens(bh, bw) <= max_tokens);
         }
         (bh, bw)
     }
@@ -219,17 +226,26 @@ impl Vision {
     /// Decodes an image file (PNG, JPEG, WebP, GIF, BMP) and fits it: PIL's `convert("RGB")`, then
     /// `ImageOps.pad(image, (w, h), color=(127, 127, 127))`.
     pub fn preprocess(&self, bytes: &[u8]) -> Result<Fitted> {
+        self.preprocess_cap(bytes, self.max_tokens)
+    }
+
+    /// `preprocess` with the block capped at `cap` positions (`plan_cap`).
+    pub fn preprocess_cap(&self, bytes: &[u8], cap: usize) -> Result<Fitted> {
         let img = image::load_from_memory(bytes).map_err(|e| anyhow!("cannot decode the image: {e}"))?.to_rgb8();
         let (w, h) = (img.width() as usize, img.height() as usize);
         if w == 0 || h == 0 {
             bail!("empty image");
         }
-        self.fit(img.as_raw(), w, h)
+        self.fit_cap(img.as_raw(), w, h, cap)
     }
 
     /// `preprocess` from RGB bytes.
     pub fn fit(&self, rgb: &[u8], w: usize, h: usize) -> Result<Fitted> {
-        let (bh, bw) = self.plan(w, h);
+        self.fit_cap(rgb, w, h, self.max_tokens)
+    }
+
+    pub fn fit_cap(&self, rgb: &[u8], w: usize, h: usize, cap: usize) -> Result<Fitted> {
+        let (bh, bw) = self.plan_cap(w, h, cap);
         if bh == 0 || bw == 0 {
             bail!("an image of {w}x{h} pixels is too thin to fit");
         }

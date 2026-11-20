@@ -604,6 +604,12 @@ pub fn yield_path_alive() -> bool {
     }
 }
 
+/// `QX_DS_IMG_ENGRAM=1`: the Engram rows of image positions are read as before 2026-11-20 (they are never used).
+fn img_engram() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QX_DS_IMG_ENGRAM").is_ok_and(|v| v == "1"))
+}
+
 pub fn sched_trace_on() -> bool {
     sched_trace_file().is_some()
 }
@@ -1674,7 +1680,7 @@ impl<'a> DsEngine<'a> {
         self.rms(s.xpre_p.ptr, w.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l) as u64;
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0, w.router_bias_vl.as_ref().map_or(0, |b| b.ptr), self.s.tok.ptr]);
         if prefetch_k() > 0 && !self.warm {
             // (never from a dry pass: its routing is not a real job's)
             // tell the driver: layer and tokens; the kernel adds a device-side counter so every prediction is
@@ -1699,7 +1705,7 @@ impl<'a> DsEngine<'a> {
         self.rms(s.xpre.ptr, w1.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
         let dst = d.shared.mb.dptr + crate::mailbox::mb_pred(E, l + 1) as u64;
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w1.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, crate::mailbox::PRED_K as u64, w1.router_bias.ptr, dst, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0, w1.router_bias_vl.as_ref().map_or(0, |b| b.ptr), self.s.tok.ptr]);
         if prefetch_k() > 0 && !self.warm && t <= 8 {
             // the prefetch on the cheap predictor: one norm and one router GEMV, a whole expert phase of lead
             if let Some(ab) = self.abufs.as_ref() {
@@ -2244,8 +2250,14 @@ impl<'a> DsEngine<'a> {
         let rb = pack.ple.row_bytes as usize;
         // (file offset, float offset in dst), engram layer by engram layer
         let mut jobs: Vec<(u64, usize)> = Vec::with_capacity(n_layers * t * c.engram_cols());
+        let skip_img = !img_engram();
         for ei in 0..n_layers {
             for n in 0..t {
+                if skip_img && toks[n].1 >= IMG_BASE {
+                    // (no Engram contribution at an image position: nothing to read; zeros for the product)
+                    dst.slice::<f32>((ei * stride + n) * n_e * 4, n_e).fill(0.0);
+                    continue;
+                }
                 for (j, r) in c.engram_rows(ei, &self.st.tokens[toks[n].0], positions[n] as usize).into_iter().enumerate() {
                     jobs.push((pack.ple_row(r), (ei * stride + n) * n_e + j * ed));
                 }
@@ -2312,6 +2324,8 @@ impl<'a> DsEngine<'a> {
                 });
                 done2.fetch_add(1, std::sync::atomic::Ordering::Release);
             }
+            // (a chunk of image positions alone has no rows to read)
+            done2.store(n_layers, std::sync::atomic::Ordering::Release);
         }).expect("engram thread");
         Some((h, done))
     }
@@ -2322,7 +2336,9 @@ impl<'a> DsEngine<'a> {
         let ed = c.engram_dim;
         let n_e = c.engram_cols() * ed;
         let te = std::time::Instant::now();
-        let all_rows: Vec<Vec<u64>> = (0..c.engram_layers.len()).flat_map(|ei| (0..t).map(move |n| (ei, n))).map(|(ei, n)| c.engram_rows(ei, &self.st.tokens[toks[n].0], positions[n] as usize)).collect();
+        // (an image position gets no Engram contribution, `qx_ds_engram_gate`: its rows are not read; QX_DS_IMG_ENGRAM=1 reads them as before)
+        let skip_img = !img_engram();
+        let all_rows: Vec<Vec<u64>> = (0..c.engram_layers.len()).flat_map(|ei| (0..t).map(move |n| (ei, n))).map(|(ei, n)| if skip_img && toks[n].1 >= IMG_BASE { Vec::new() } else { c.engram_rows(ei, &self.st.tokens[toks[n].0], positions[n] as usize) }).collect();
         if let (Some((f, pack)), Some(ring)) = (&self.engram_pack, &self.engram_ring) {
             use io_uring::{opcode, types};
             use std::os::fd::AsRawFd;
@@ -2349,6 +2365,9 @@ impl<'a> DsEngine<'a> {
             for (ri, rows) in all_rows.iter().enumerate() {
                 let (ei, n) = (ri / t, ri % t);
                 let dst = dst.slice::<f32>((ei * stride + n) * n_e * 4, n_e);
+                if rows.is_empty() {
+                    dst.fill(0.0);
+                }
                 for j in 0..rows.len() {
                     qx_pack::dequant(ty, &raw[i * rb..(i + 1) * rb], &mut dst[j * ed..(j + 1) * ed]);
                     i += 1;
@@ -2358,6 +2377,9 @@ impl<'a> DsEngine<'a> {
             for (ri, rows) in all_rows.iter().enumerate() {
                 let (ei, n) = (ri / t, ri % t);
                 let dst = dst.slice::<f32>((ei * stride + n) * n_e * 4, n_e);
+                if rows.is_empty() {
+                    dst.fill(0.0);
+                }
                 for (j, &r) in rows.iter().enumerate() {
                     self.engram_row(r, &mut dst[j * ed..(j + 1) * ed]);
                 }
@@ -3956,7 +3978,7 @@ impl<'a> DsEngine<'a> {
         let pk = crate::mailbox::PRED_K;
         self.rms(s.xpre.ptr, w1.ffn_norm.ptr, s.xp.ptr, E, t);
         self.mgt(&w1.g_route, s.xp.ptr, E, t, "route_pred");
-        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, pk as u64, w1.router_bias.ptr, pb.ptr + (r0 * pk * 4) as u64, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0, 0, 0]);
+        self.k("qx_ds_route", 32, (t as u32, 1, 1), &[s.logits_p.ptr, c.n_expert as u64, pk as u64, w1.router_bias.ptr, pb.ptr + (r0 * pk * 4) as u64, s.wts_p.ptr, bits(c.w_scale), 0, 0, 0, 0, 0, w1.router_bias_vl.as_ref().map_or(0, |b| b.ptr), self.s.tok.ptr]);
     }
 
     fn chunk_ffn_alloc(&mut self, rows_max: usize) {

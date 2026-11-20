@@ -85,14 +85,30 @@ fn image_bytes(part: &Value) -> std::result::Result<Vec<u8>, String> {
     Err("this server does not fetch image URLs: send the image inline as a data: URL (data:image/png;base64,...)".into())
 }
 
+/// The most positions an image part may take: OpenAI's `image_url.detail`. "low" caps it at QX_VISION_LOW_TOKENS
+/// (256: about a quarter of a photograph's prompt work, fine detail such as small text is lost); anything else
+/// at QX_VISION_MAX_TOKENS (the model's 1,024).
+fn image_cap(part: &Value) -> usize {
+    static CAPS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let (max, low) = *CAPS.get_or_init(|| {
+        let e = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d).clamp(16, 1024);
+        let max = e("QX_VISION_MAX_TOKENS", 1024);
+        (max, e("QX_VISION_LOW_TOKENS", 256).min(max))
+    });
+    match part.pointer("/image_url/detail").or_else(|| part.get("detail")).and_then(|v| v.as_str()) {
+        Some("low") => low,
+        _ => max,
+    }
+}
+
 /// The image parts of the messages in the order the chat template writes their placeholders: message by message,
 /// part by part, the parts of a tool result in place.
-fn collect_images(messages: &Value, out: &mut Vec<Vec<u8>>) -> std::result::Result<(), String> {
-    fn parts(content: &Value, out: &mut Vec<Vec<u8>>) -> std::result::Result<(), String> {
+fn collect_images(messages: &Value, out: &mut Vec<(Vec<u8>, usize)>) -> std::result::Result<(), String> {
+    fn parts(content: &Value, out: &mut Vec<(Vec<u8>, usize)>) -> std::result::Result<(), String> {
         let Some(arr) = content.as_array() else { return Ok(()) };
         for p in arr {
             match p.get("type").and_then(|v| v.as_str()) {
-                Some("image") | Some("image_url") => out.push(image_bytes(p)?),
+                Some("image") | Some("image_url") => out.push((image_bytes(p)?, image_cap(p))),
                 Some("tool_result") => {
                     if let Some(c) = p.get("content") {
                         parts(c, out)?;
@@ -128,7 +144,7 @@ fn cached_block(app: &App, key: u64) -> Option<Arc<Vec<f32>>> {
 /// The block of one image (rows of the model's embedding width), from the cache or the vision tower. The encode
 /// runs in a task of its own, one at a time, and its result goes to the cache whether or not the request that
 /// asked is still there (a client that gives up and asks again finds it instead of starting another encode).
-async fn image_block(app: &Arc<App>, bytes: Vec<u8>) -> std::result::Result<(u64, Arc<Vec<f32>>), String> {
+async fn image_block(app: &Arc<App>, bytes: Vec<u8>, cap: usize) -> std::result::Result<(u64, Arc<Vec<f32>>), String> {
     use std::hash::{Hash, Hasher};
     let vision = app.vision.clone().ok_or("this server was started without the vision projector (--mmproj): it cannot take images")?;
     if bytes.len() > IMAGE_MAX_BYTES {
@@ -136,6 +152,7 @@ async fn image_block(app: &Arc<App>, bytes: Vec<u8>) -> std::result::Result<(u64
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
+    cap.hash(&mut h);
     let key = h.finish();
     if let Some(r) = cached_block(app, key) {
         return Ok((key, r));
@@ -151,7 +168,7 @@ async fn image_block(app: &Arc<App>, bytes: Vec<u8>) -> std::result::Result<(u64
         let gpu = app.vis_gpu.clone();
         let (rows, gh, gw, w, h, how) = tokio::task::spawn_blocking(move || -> std::result::Result<_, String> {
             pool.install(|| {
-                let im = vision.preprocess(&bytes).map_err(|e| format!("{e:#}"))?;
+                let im = vision.preprocess_cap(&bytes, cap).map_err(|e| format!("{e:#}"))?;
                 // the GPU tower; the CPU one when there is none or it refuses the image
                 if let Some(g) = &gpu {
                     match g.encode(&vision, &im) {
@@ -469,8 +486,8 @@ async fn chat_completions(State(app): State<Arc<App>>, h: HeaderMap, Json(body):
             return err(StatusCode::BAD_REQUEST, format!("{} images in one request (at most {IMAGES_MAX})", image_files.len()));
         }
         let mut blocks = Vec::new();
-        for bytes in image_files {
-            match image_block(&app, bytes).await {
+        for (bytes, cap) in image_files {
+            match image_block(&app, bytes, cap).await {
                 Ok(b) => blocks.push(b),
                 Err(e) => return err(StatusCode::BAD_REQUEST, e),
             }
