@@ -42,6 +42,17 @@ pub struct Vision {
     theta: f32,
     pub min_pixels: usize,
     pub max_tokens: usize,
+    layers: usize,
+    start: Vec<f32>,
+    end: Vec<f32>,
+    newline: Vec<f32>,
+    /// The file, and the CPU tower's weights from it (f32, 1.9 GB), read at the first `encode`: a server whose
+    /// tower runs on the GPU never needs them.
+    path: std::path::PathBuf,
+    w: std::sync::OnceLock<Weights>,
+}
+
+struct Weights {
     patch_w: Vec<f32>,
     patch_b: Vec<f32>,
     blocks: Vec<Block>,
@@ -50,9 +61,6 @@ pub struct Vision {
     mm1_b: Vec<f32>,
     mm2_w: Vec<f32>,
     mm2_b: Vec<f32>,
-    start: Vec<f32>,
-    end: Vec<f32>,
-    newline: Vec<f32>,
 }
 
 /// A fitted image: `h` x `w` pixels (multiples of the patch size), RGB bytes.
@@ -122,26 +130,46 @@ impl Vision {
         let min_pixels = u("clip.vision.image_min_pixels")?;
         let eps = g.get("clip.vision.attention.layer_norm_epsilon").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
         let f = |n: &str| tensor_f32(&g, n).map(|t| t.0);
-        let mut blocks = Vec::with_capacity(layers);
-        for l in 0..layers {
-            let b = |n: &str| f(&format!("v.blk.{l}.{n}"));
-            blocks.push(Block { ln1: b("ln1.weight")?, qkv_w: b("attn_qkv.weight")?, qkv_b: b("attn_qkv.bias")?, out_w: b("attn_out.weight")?, out_b: b("attn_out.bias")?, ln2: b("ln2.weight")?, gate_w: b("ffn_gate.weight")?, up_w: b("ffn_up.weight")?, down_w: b("ffn_down.weight")? });
+        let shape = |n: &str| g.tensor(n).map(|t| t.elements() as usize).ok_or_else(|| anyhow!("the projector file has no tensor {n}"));
+        if shape("v.patch_embd.weight")? != dim * 3 * patch * patch || shape("mm.1.weight")? != out_dim * dim * merge * merge || shape("v.blk.0.attn_qkv.weight")? != 3 * dim * dim || shape("v.blk.0.ffn_gate.weight")? != ffn * dim || dim % heads != 0 || (dim / heads) % 4 != 0 {
+            bail!("{}: tensor shapes do not fit the header", path.display());
         }
-        let me = Self {
+        Ok(Self {
             dim, out_dim, heads, ffn, patch, merge, eps,
             // (the reference's vision_rope_theta; the GGUF does not carry it and llama.cpp sets the same constant)
             theta: 10000.0,
             min_pixels,
             // vision_max_n_token of the model's config: the whole block, delimiters and newlines included
             max_tokens: 1024,
-            patch_w: f("v.patch_embd.weight")?, patch_b: f("v.patch_embd.bias")?, blocks, post_ln: f("v.post_ln.weight")?,
-            mm1_w: f("mm.1.weight")?, mm1_b: f("mm.1.bias")?, mm2_w: f("mm.2.weight")?, mm2_b: f("mm.2.bias")?,
+            layers,
             start: f("v.token_embd.img_start")?, end: f("v.token_embd.img_end")?, newline: f("v.image_newline")?,
-        };
-        if me.patch_w.len() != dim * 3 * patch * patch || me.mm1_w.len() != out_dim * dim * merge * merge || me.blocks[0].qkv_w.len() != 3 * dim * dim || me.blocks[0].gate_w.len() != ffn * dim || dim % heads != 0 || (dim / heads) % 4 != 0 {
-            bail!("{}: tensor shapes do not fit the header", path.display());
-        }
-        Ok(me)
+            path: path.to_path_buf(),
+            w: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The CPU tower's weights (read once).
+    fn weights(&self) -> &Weights {
+        self.w.get_or_init(|| {
+            let g = Gguf::open(&self.path).expect("the projector file");
+            let f = |n: &str| tensor_f32(&g, n).map(|t| t.0).unwrap_or_else(|e| panic!("{e:#}"));
+            let mut blocks = Vec::with_capacity(self.layers);
+            for l in 0..self.layers {
+                let b = |n: &str| f(&format!("v.blk.{l}.{n}"));
+                blocks.push(Block { ln1: b("ln1.weight"), qkv_w: b("attn_qkv.weight"), qkv_b: b("attn_qkv.bias"), out_w: b("attn_out.weight"), out_b: b("attn_out.bias"), ln2: b("ln2.weight"), gate_w: b("ffn_gate.weight"), up_w: b("ffn_up.weight"), down_w: b("ffn_down.weight") });
+            }
+            Weights { patch_w: f("v.patch_embd.weight"), patch_b: f("v.patch_embd.bias"), blocks, post_ln: f("v.post_ln.weight"), mm1_w: f("mm.1.weight"), mm1_b: f("mm.1.bias"), mm2_w: f("mm.2.weight"), mm2_b: f("mm.2.bias") }
+        })
+    }
+
+    /// The learned embeddings that delimit a block: (start, end, newline).
+    pub fn delimiters(&self) -> (&[f32], &[f32], &[f32]) {
+        (&self.start, &self.end, &self.newline)
+    }
+
+    /// (heads, feed-forward width, norm epsilon, rotary base, blocks)
+    pub fn shape(&self) -> (usize, usize, f32, f32, usize) {
+        (self.heads, self.ffn, self.eps, self.theta, self.layers)
     }
 
     /// The LLM grid (rows, columns) of a fitted image of `h` x `w` pixels.
@@ -233,6 +261,7 @@ impl Vision {
 
     /// The block of a fitted image: (rows of `out_dim` floats, LLM grid rows, columns).
     pub fn encode(&self, im: &Fitted) -> (Vec<f32>, usize, usize) {
+        let wt = self.weights();
         let (p, d) = (self.patch, self.dim);
         let (nh, nw) = (im.h / p, im.w / p);
         let n = nh * nw;
@@ -254,7 +283,7 @@ impl Vision {
                 }
             }
         });
-        let mut x = linear(&patches, n, pin, &self.patch_w, d, Some(&self.patch_b));
+        let mut x = linear(&patches, n, pin, &wt.patch_w, d, Some(&wt.patch_b));
         // 2D rotary angles per patch: head_dim / 4 frequencies for the row, then as many for the column
         let hd = d / self.heads;
         let nf = hd / 4;
@@ -268,7 +297,7 @@ impl Vision {
                 cs[i * 2 * nf + nf + j] = (b.cos(), b.sin());
             }
         }
-        for b in &self.blocks {
+        for b in &wt.blocks {
             let h = rms_norm(&x, d, &b.ln1, self.eps);
             let a = self.attention(b, &h, n, &cs);
             x.par_iter_mut().zip(a.par_iter()).for_each(|(v, a)| *v += a);
@@ -279,7 +308,7 @@ impl Vision {
             let m = linear(&gate, n, self.ffn, &b.down_w, d, None);
             x.par_iter_mut().zip(m.par_iter()).for_each(|(v, a)| *v += a);
         }
-        let x = rms_norm(&x, d, &self.post_ln, self.eps);
+        let x = rms_norm(&x, d, &wt.post_ln, self.eps);
         // the aligner: the grid zero-padded to a multiple of the merge, each merge x merge cell flattened as
         // F.unfold does (feature-major: feature c of cell patch (ky, kx) at c * merge^2 + ky * merge + kx)
         let r = self.merge;
@@ -300,9 +329,9 @@ impl Vision {
                 }
             }
         });
-        let mut h1 = linear(&cells, gh * gw, cin, &self.mm1_w, self.out_dim, Some(&self.mm1_b));
+        let mut h1 = linear(&cells, gh * gw, cin, &wt.mm1_w, self.out_dim, Some(&wt.mm1_b));
         h1.par_iter_mut().for_each(|v| *v = (0.5 * *v as f64 * (1.0 + unsafe { erf(*v as f64 / std::f64::consts::SQRT_2) })) as f32);
-        let feat = linear(&h1, gh * gw, self.out_dim, &self.mm2_w, self.out_dim, Some(&self.mm2_b));
+        let feat = linear(&h1, gh * gw, self.out_dim, &wt.mm2_w, self.out_dim, Some(&wt.mm2_b));
         let e = self.out_dim;
         let mut out = Vec::with_capacity(Self::block_tokens(gh, gw) * e);
         out.extend_from_slice(&self.start);

@@ -37,6 +37,8 @@ struct App {
     /// The vision tower's own threads: free to run on every CPU the process may use (the engine pins its threads,
     /// and a thread started from a pinned one inherits its one CPU: the tower then took 14 s where it takes 2).
     vis_pool: Option<Arc<rayon::ThreadPool>>,
+    /// The tower on the GPU (the default when the device has room for its buffers; QX_VISION=cpu: never).
+    vis_gpu: Option<Arc<qx_engine::vision_gpu::GpuTower>>,
 }
 
 /// The chat template's image placeholder (one token).
@@ -146,17 +148,25 @@ async fn image_block(app: &Arc<App>, bytes: Vec<u8>) -> std::result::Result<(u64
         }
         let t0 = std::time::Instant::now();
         let pool = app.vis_pool.clone().expect("vision pool");
-        let (rows, gh, gw, w, h) = tokio::task::spawn_blocking(move || -> std::result::Result<_, String> {
+        let gpu = app.vis_gpu.clone();
+        let (rows, gh, gw, w, h, how) = tokio::task::spawn_blocking(move || -> std::result::Result<_, String> {
             pool.install(|| {
                 let im = vision.preprocess(&bytes).map_err(|e| format!("{e:#}"))?;
+                // the GPU tower; the CPU one when there is none or it refuses the image
+                if let Some(g) = &gpu {
+                    match g.encode(&vision, &im) {
+                        Ok((rows, gh, gw)) => return Ok((rows, gh, gw, im.w, im.h, "GPU")),
+                        Err(e) => eprintln!("vision: the GPU tower gave up on an image ({e:#}); the CPU tower takes it"),
+                    }
+                }
                 let (rows, gh, gw) = vision.encode(&im);
-                Ok((rows, gh, gw, im.w, im.h))
+                Ok((rows, gh, gw, im.w, im.h, "CPU"))
             })
         })
         .await
         .map_err(|e| format!("vision tower: {e}"))??;
         if std::env::var("QX_SCHED_STATS").is_ok() {
-            eprintln!("vision: an image fitted to {w}x{h}, grid {gh}x{gw}, {} positions in {:.2} s", qx_vision::Vision::block_tokens(gh, gw), t0.elapsed().as_secs_f64());
+            eprintln!("vision: an image fitted to {w}x{h}, grid {gh}x{gw}, {} positions in {:.2} s ({how})", qx_vision::Vision::block_tokens(gh, gw), t0.elapsed().as_secs_f64());
         }
         let rows = Arc::new(rows);
         let mut c = app.vis_cache.lock().unwrap();
@@ -591,7 +601,7 @@ fn main() -> Result<()> {
                     if width.is_some_and(|w| w != v.out_dim) {
                         return Err(anyhow!("{}: the projector's rows are {} wide, the model's embeddings {}", p.display(), v.out_dim, width.unwrap()));
                     }
-                    eprintln!("quixiinfer: vision tower from {} (images of up to {} positions, encoded on the CPU)", p.display(), v.max_tokens);
+                    eprintln!("quixiinfer: vision tower from {} (images of up to {} positions)", p.display(), v.max_tokens);
                     Some(Arc::new(v))
                 }
                 _ => {
@@ -608,7 +618,39 @@ fn main() -> Result<()> {
                 }
                 None => None,
             };
-            let app = Arc::new(App { jobs: Mutex::new(jobs), tok, tpl, api_key, max_ctx: ctx, model_id, vision, image_tok, vis_cache: Mutex::new(Vec::new()), vis_lock: tokio::sync::Mutex::new(()), vis_pool });
+            // the tower on the GPU: now, with the engine loaded (its tiers took their memory) and idle; the device's
+            // headroom holds the tower's buffers or the CPU tower stays
+            if vision.is_some() && !std::env::var("QX_VISION").is_ok_and(|x| x == "cpu") {
+                // (the warm-up is 12 s, or many minutes when the driver's kernel cache is cold; the process exits if
+                // the engine thread dies in it)
+                let t0 = std::time::Instant::now();
+                let mut said = 0;
+                while !worker_ds::warmed() {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if t0.elapsed().as_secs() / 60 > said {
+                        said = t0.elapsed().as_secs() / 60;
+                        eprintln!("quixiinfer: waiting for the engine's warm-up before the vision tower's GPU set-up ({said} min)");
+                    }
+                }
+            }
+            let vis_gpu = match (&vision, &mmproj) {
+                (Some(v), Some(p)) if !std::env::var("QX_VISION").is_ok_and(|x| x == "cpu") && worker_ds::warmed() => match qx_engine::vision_gpu::GpuTower::new(p, v, std::env::var("QX_VISION_HEADROOM_MIB").ok().and_then(|x| x.parse::<usize>().ok()).unwrap_or(512) << 20) {
+                    Ok(t) => {
+                        eprintln!("quixiinfer: the vision tower runs on the GPU ({:.0} MB of device memory, {:.0} MB left free; QX_VISION=cpu for the CPU tower)", t.device_bytes() as f64 / 1048576.0, qx_gpu::mem::mem_info().0 as f64 / 1048576.0);
+                        Some(Arc::new(t))
+                    }
+                    Err(e) => {
+                        eprintln!("quixiinfer: the vision tower stays on the CPU: {e:#}");
+                        None
+                    }
+                },
+                (Some(_), _) => {
+                    eprintln!("quixiinfer: the vision tower runs on the CPU (QX_VISION=cpu)");
+                    None
+                }
+                _ => None,
+            };
+            let app = Arc::new(App { jobs: Mutex::new(jobs), tok, tpl, api_key, max_ctx: ctx, model_id, vision, image_tok, vis_cache: Mutex::new(Vec::new()), vis_lock: tokio::sync::Mutex::new(()), vis_pool, vis_gpu });
             let router = Router::new()
                 .route("/v1/models", get(models))
                 .route("/v1/chat/completions", post(chat_completions))

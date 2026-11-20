@@ -12,6 +12,7 @@ qx-quant = { path = "../qx-quant" }
 qx-cpu = { path = "../qx-cpu" }
 qx-ref = { path = "../qx-ref" }
 qx-tok = { path = "../qx-tok" }
+qx-vision = { path = "../qx-vision" }
 cubecl = { version = "0.11", features = ["cuda", "cuda-cpp"] }
 cubecl-runtime = "0.11.3"
 rayon = "1.10"

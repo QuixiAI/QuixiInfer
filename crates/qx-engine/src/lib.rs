@@ -8,6 +8,7 @@ pub mod mailbox;
 pub mod ple_io;
 pub mod routing;
 pub mod tiers;
+pub mod vision_gpu;
 pub mod ops;
 
 /// The model to load when none is named: the pack if it has been made, else the GGUF.

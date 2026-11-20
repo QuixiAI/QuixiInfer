@@ -4612,6 +4612,7 @@ dependencies = [
  "qx-quant",
  "qx-ref",
  "qx-tok",
+ "qx-vision",
  "rayon",
 ]
 

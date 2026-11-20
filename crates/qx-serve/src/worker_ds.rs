@@ -339,6 +339,14 @@ impl Yielder {
     }
 }
 
+/// Set once the engine thread has warmed up and sealed its kernel set.
+static WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the engine thread has finished its warm-up (false for good if it died in it).
+pub fn warmed() -> bool {
+    WARMED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc::Sender<Job>> {
     let (tx, rx) = mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
@@ -403,6 +411,8 @@ pub fn start(_g: &'static Gguf, tok: &'static Tok, opt: Options) -> Result<mpsc:
             eng.chunk_release();
         }
         qx_gpu::kernel::seal();
+        // (the engine is idle from here until its first request: the moment for the vision tower's GPU set-up)
+        WARMED.store(true, std::sync::atomic::Ordering::Release);
             let (free, total) = qx_gpu::mem::mem_info();
             eprintln!(
                 "quixiinfer: warm-up {:.1}s (graphs for windows of {widths:?}); device memory free after warm-up: {:.2} GiB of {:.2}",

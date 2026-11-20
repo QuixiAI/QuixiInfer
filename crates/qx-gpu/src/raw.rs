@@ -128,6 +128,16 @@ fn ensure(l: &mut Launcher, module: &crate::kernel::Module) {
     }
 }
 
+/// The driver's function handle of `entry` in `module` (compiled and loaded once, as for `launch`), for a caller
+/// that launches on a stream of its own with its own info words: the vision tower's thread. Call it before the
+/// kernel set is sealed and before anything waits on the engine's stream.
+pub fn function(module: &crate::kernel::Module, entry: &'static str) -> usize {
+    let mut g = launcher();
+    let l = g.as_mut().unwrap();
+    ensure(l, module);
+    *l.modules[&module.source_hash].funcs.get(entry).unwrap_or_else(|| panic!("raw: {}.cu has no entry {entry}", module.name)) as usize
+}
+
 /// Loads `module` now (so a later launch from it allocates nothing): the chunk path loads its own modules before
 /// cuBLAS takes memory for its handle and kernel libraries.
 pub fn preload(module: &crate::kernel::Module) {

@@ -11,6 +11,13 @@ from PIL import Image, ImageOps
 sys.path.insert(0, os.environ.get("GGUF_PY", os.path.expanduser("~/git/llama.cpp-dsv41/gguf-py")))
 from gguf import GGUFReader
 
+# VISION_REF_F16=1: activations rounded to float16 where the GPU tower (crates/qx-engine/src/vision_gpu.rs) feeds
+# them to a product (norm outputs, q, k, v, the probabilities times 4096, the attention's output, the SwiGLU's
+# middle, the aligner's GELU): what that rounding alone does to the block, to compare with the GPU tower's
+# deviation from the CPU tower.
+F16 = os.environ.get("VISION_REF_F16") == "1"
+h16 = (lambda t: t.astype(np.float16).astype(np.float32)) if F16 else (lambda t: t)
+
 P, R, MAXTOK, MINPIX, THETA, EPS = 14, 3, 1024, 544 * 544, 10000.0, 1e-6
 
 def plan(width, height):
@@ -76,23 +83,26 @@ def main():
         return np.concatenate([a * cos - c * sin, c * cos + a * sin], axis=-1)
     def rms(t, g):
         return g * (t / np.sqrt((t * t).mean(-1, keepdims=True) + np.float32(EPS)))
+    peak = 0.0
     for l in range(32):
         p = f"v.blk.{l}."
-        y = rms(h, w(p + "ln1.weight"))
+        y = h16(rms(h, w(p + "ln1.weight")))
         qkv = y @ w(p + "attn_qkv.weight").T + w(p + "attn_qkv.bias")
         q, k, v = (t.reshape(n, heads, hd) for t in np.split(qkv, 3, axis=-1))
-        q, k = rot(q), rot(k)
+        q, k, v = h16(rot(q)), h16(rot(k)), h16(v)
         o = np.empty((n, heads, hd), dtype=np.float32)
         for hh in range(heads):
             s = (q[:, hh] @ k[:, hh].T) / np.float32(math.sqrt(hd))
             s = np.exp(s - s.max(-1, keepdims=True))
             s /= s.sum(-1, keepdims=True)
-            o[:, hh] = s @ v[:, hh]
-        h = h + (o.reshape(n, dim) @ w(p + "attn_out.weight").T + w(p + "attn_out.bias"))
-        y = rms(h, w(p + "ln2.weight"))
+            o[:, hh] = (h16(s * np.float32(4096)) @ v[:, hh]) / np.float32(4096) if F16 else s @ v[:, hh]
+        h = h + (h16(o).reshape(n, dim) @ w(p + "attn_out.weight").T + w(p + "attn_out.bias"))
+        y = h16(rms(h, w(p + "ln2.weight")))
         g, u = y @ w(p + "ffn_gate.weight").T, y @ w(p + "ffn_up.weight").T
-        h = h + ((g / (1 + np.exp(-g))) * u) @ w(p + "ffn_down.weight").T
-    h = rms(h, w("v.post_ln.weight"))
+        mid = (g / (1 + np.exp(-g))) * u
+        peak = max(peak, float(np.abs(mid).max()), float(np.abs(y).max()), float(np.abs(o).max()))
+        h = h + h16(mid) @ w(p + "ffn_down.weight").T
+    h = h16(rms(h, w("v.post_ln.weight")))
     # the aligner: pad, unfold 3x3 (feature-major), two linears with an erf GELU
     grid = h.reshape(nh, nw, dim)
     gh, gw = math.ceil(nh / R), math.ceil(nw / R)
@@ -101,7 +111,7 @@ def main():
     cells = pad.reshape(gh, R, gw, R, dim).transpose(0, 2, 4, 1, 3).reshape(gh * gw, dim * R * R)
     a = cells @ w("mm.1.weight").T + w("mm.1.bias")
     erf = np.vectorize(math.erf)
-    a = (0.5 * a.astype(np.float64) * (1 + erf(a.astype(np.float64) / math.sqrt(2)))).astype(np.float32)
+    a = h16((0.5 * a.astype(np.float64) * (1 + erf(a.astype(np.float64) / math.sqrt(2)))).astype(np.float32))
     feat = (a @ w("mm.2.weight").T + w("mm.2.bias")).reshape(gh, gw, -1)
     rows = [w("v.token_embd.img_start")]
     for yy in range(gh):
@@ -116,6 +126,10 @@ def main():
     d = np.abs(got - ref)
     cosr = (got * ref).sum(-1) / (np.linalg.norm(got, axis=-1) * np.linalg.norm(ref, axis=-1) + 1e-30)
     print(f"block {ref.shape[0]} rows (grid {gh}x{gw}): max |d| {d.max():.3e}, mean |d| {d.mean():.3e}, reference mean |x| {np.abs(ref).mean():.3e}, row cosine min {cosr.min():.7f}")
+    if F16:
+        low = np.argsort(cosr)[:3]
+        print(f"float16 activations: rows with cosine under 0.999: {int((cosr < 0.999).sum())}, under 0.99: {int((cosr < 0.99).sum())}; the three lowest (row, cosine): {[(int(i), round(float(cosr[i]), 5)) for i in low]}; mean |d| / mean |x| {d.mean() / np.abs(ref).mean():.3e}; the largest activation fed to a product {peak:.1f} (float16 holds 65504)")
+        return 0
     ok = same and cosr.min() > 0.9999 and d.max() < 0.05 * np.abs(ref).max()
     print("ok" if ok else "MISMATCH")
     return 0 if ok else 1
