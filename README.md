@@ -214,7 +214,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
   still read; small text will not be. The prompt work of an image is the same as of that many text tokens: of a
   1,000-position chunk's 2.5 s about half is the layers' own work and half is fetching experts from RAM and
   disk, and it falls little with fewer positions (207 positions: 1.8 s).
-- **`QX_DS_CHUNK_RES=1e6`** (lossy, off by default) leaves out the disk-only experts that few positions ask for:
+- **`QX_DS_CHUNK_RES=1e6`** (lossy, off by default; on in the production unit since 2026-11-20) leaves out the disk-only experts that few positions ask for:
   a photograph's prompt work went from 2.4-2.6 s to 1.9-2.0 s (2.1-2.3 to 1.9-2.0 s once the server had seen a
   few photographs), a request from about 4 s to about 3.5 s; the descriptions opened in other words for three
   of four photographs. See

@@ -11,6 +11,9 @@
   of a 512-2,048-row chunk: -16 to -20% in `qx-ds-check`, photographs in the server 2.4-2.6 -> 1.9-2.0 s (2.1-2.3 -> 1.9-2.0 once it has seen a few), mean KL
   0.0121 -> 0.0161 against the exact kernels. Knob off is bit-identical to the build before it. Replies of such
   prompts then depend on the tiers' state, so the identity check cannot cover them: opt-in.
+  **On in production since 2026-11-20 19:12** (the user's decision): `Environment=QX_DS_CHUNK_RES=1e6` in
+  `/etc/systemd/system/quixiinfer.service` (the unit before it: `quixiinfer.service.bak-2026-11-20-pre-chunkres`);
+  smoke: three 980-token photo requests 4.1, 3.6, 3.4 s. Benchmarks and checks still run with the knob off.
 - **Next**: the dense work of a mid-size chunk (what a 128-row slab pass does for 3.8 ms); see the backlog's
   queue of 2026-11-20, later.
 - **Scripts**: `~/qx-chains/chain-x171.sh TAG TEXT ROWS TAIL "ENV"...` (a chunk and the steps after it under each
