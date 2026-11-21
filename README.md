@@ -96,7 +96,7 @@ no concurrent comparison. Quality, teacher-forced on the same ids against the f3
 
 Requirements:
 
-- Linux x86-64 with AVX-512 VNNI;
+- Linux x86-64 with AVX2 or better (the CPU pool uses AVX-512 VNNI when present, else AVX2, else scalar);
 - an NVIDIA GPU: developed and measured on an RTX 5090 (sm_120); the kernels also build for the RTX 40 series
   (sm_89) and the RTX 30 series (sm_86), see "Other GPUs" below;
 - CUDA 13 (`nvcc` at `/usr/local/cuda-13.3/bin`, or set `QX_NVCC`);
@@ -261,6 +261,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
 | `QX_DS_VRAM`, `QX_DS_RAM` | The tiers in GiB (`--vram-gib` 21, `--ram-gib` 100; the VRAM figure is a cap, the context and slots come first). |
 | `QX_DS_PROMOS` | Expert promotions into VRAM per token (4; the benchmarked configuration uses 32). |
 | `QX_DS_TOPK_KERNEL=1`, `QX_DS_IDX_KERNEL=1`, `QX_MGEMV_ZGROUPS=0` | The previous indexer top-k, scorer and dense-GEMV kernels, for A/B runs. |
+| `QX_CPU_ISA` | Kernel set for the CPU expert pool: `scalar`, `avx2` or `avx512`; a set the CPU does not support falls back to the detected one, for A/B runs and bisecting a wrong answer. |
 
 ## How it works
 
@@ -268,7 +269,8 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
   driver thread ranks experts by decayed routing frequency and promotes hot records over cold ones, NVMe to RAM
   and RAM to VRAM; `--profile` seeds the ranking at start.
 - **One decode step.** The GPU posts each layer's experts that are not in VRAM to a mapped mailbox. A share of
-  those in RAM is copied into a VRAM staging area by DMA; the CPU pool (AVX-512 VNNI) computes the rest from
+  those in RAM is copied into a VRAM staging area by DMA; the CPU pool (AVX-512 VNNI when present, else AVX2, else
+  scalar) computes the rest from
   pinned memory; records on NVMe are read with io_uring and O_DIRECT into pinned landing places first. Steps and
   windows are CUDA graphs.
 - **Prompts.** Long prompts run in chunks of up to 8,192 rows, layer by layer, each needed expert streamed once
@@ -283,7 +285,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
 |---|---|
 | `qx-gpu` | CubeCL runtime glue and device memory. Its build script flattens `kernels/*.cu` and checks them with nvcc; at run time each module is also checked once with NVRTC, so a kernel that fails to compile fails loudly. |
 | `qx-engine` | The engine (`dsv41/`): the forward pass, the expert tiers and their driver thread, sequence slots, windows and prompt chunks, rewind and park. Also the check and bench binaries. |
-| `qx-cpu` | The CPU expert pool: AVX-512 VNNI kernels. |
+| `qx-cpu` | The CPU expert pool: AVX-512 VNNI when present, else AVX2, else scalar kernels. |
 | `qx-quant`, `qx-pack` | Dequantizers, the GGUF reader, and the pack writer and verifier. |
 | `qx-ref` | The f32 CPU reference, which the engine is checked against. |
 | `qx-tok` | The tokenizer, which matches llama.cpp token for token. |

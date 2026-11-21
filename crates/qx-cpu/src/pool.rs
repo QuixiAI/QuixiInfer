@@ -10,7 +10,7 @@
 //! whichever tier computed each; the arithmetic matches the GPU expert kernels bit for bit.
 //! The calling thread is worker 0, so a job costs no wake-up latency on the caller's side.
 use crate::act::{quantize_q8_0, quantize_q8_k, Q80, Q8K};
-use crate::dot::avx512;
+use crate::dot;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -93,6 +93,9 @@ struct Job {
 
 struct Shared {
     job: UnsafeCell<Job>,
+    /// The kernel table this pool calls. `Pool::new` takes the detected one; tests take a forced one to prove
+    /// every set gives the same output.
+    kernels: dot::Kernels,
     /// Incremented by the caller to post a job; workers run the job whose number they have not yet seen.
     seq: AtomicU64,
     /// Arrivals at each barrier, never reset: job number s is past barrier k once bar[k] reaches s * n_threads.
@@ -132,6 +135,7 @@ impl Shared {
     /// Worker `t`'s share of the posted job.
     unsafe fn run(&self, t: usize, seq: u64) {
         let job = &mut *self.job.get();
+        let k = &self.kernels;
         let nt = self.n_threads;
         let target = seq * nt as u64;
         let (ff, n) = (job.ff, job.n_embd);
@@ -146,14 +150,14 @@ impl Shared {
             for j in a..b {
                 let xq = &job.xq[job.experts[j].tok];
                 let v = match job.fmt.gate {
-                    WType::Iq2S => avx512::iq2s_q8k_gather(row, xq),
-                    WType::Iq3S => avx512::iq3s_q8k(row, xq),
-                    WType::Nvfp4 => avx512::nvfp4_q8k(row, xq) * e.scale[if rr < ff { 0 } else { 1 }],
-                    WType::Iq2Xxs => avx512::iq2xxs_q8k(row, xq),
-                    WType::Iq2Xs => avx512::iq2xs_q8k(row, xq),
-                    WType::Iq3Xxs => avx512::iq3xxs_q8k(row, xq),
-                    WType::Iq1S => avx512::iq1s_q8k(row, xq),
-                    WType::Q2K => avx512::q2k_q8k(row, xq),
+                    WType::Iq2S => (k.iq2s_q8k)(row, xq),
+                    WType::Iq3S => (k.iq3s_q8k)(row, xq),
+                    WType::Nvfp4 => (k.nvfp4_q8k)(row, xq) * e.scale[if rr < ff { 0 } else { 1 }],
+                    WType::Iq2Xxs => (k.iq2xxs_q8k)(row, xq),
+                    WType::Iq2Xs => (k.iq2xs_q8k)(row, xq),
+                    WType::Iq3Xxs => (k.iq3xxs_q8k)(row, xq),
+                    WType::Iq1S => (k.iq1s_q8k)(row, xq),
+                    WType::Q2K => (k.q2k_q8k)(row, xq),
                     WType::Iq4Nl => panic!("IQ4_NL gate rows are not supported"),
                 };
                 *job.gu.as_ptr().add(j * 2 * ff + rr).cast_mut() = v;
@@ -184,15 +188,15 @@ impl Shared {
                 let row = std::slice::from_raw_parts(job.experts[a].down.add(r * job.down_row_bytes), job.down_row_bytes);
                 for j in a..b {
                     let v = match job.fmt.down {
-                        WType::Nvfp4 => avx512::nvfp4_q80(row, &job.hq[j]) * job.experts[a].scale[2],
-                        WType::Iq4Nl => avx512::iq4nl_q80(row, &job.hq[j]),
-                        WType::Iq2S => avx512::iq2s_q8k_gather(row, &job.hqk[j]),
-                        WType::Iq3S => avx512::iq3s_q8k(row, &job.hqk[j]),
-                        WType::Iq2Xxs => avx512::iq2xxs_q8k(row, &job.hqk[j]),
-                        WType::Iq2Xs => avx512::iq2xs_q8k(row, &job.hqk[j]),
-                        WType::Iq3Xxs => avx512::iq3xxs_q8k(row, &job.hqk[j]),
-                        WType::Iq1S => avx512::iq1s_q8k(row, &job.hqk[j]),
-                        WType::Q2K => avx512::q2k_q8k(row, &job.hqk[j]),
+                        WType::Nvfp4 => (k.nvfp4_q80)(row, &job.hq[j]) * job.experts[a].scale[2],
+                        WType::Iq4Nl => (k.iq4nl_q80)(row, &job.hq[j]),
+                        WType::Iq2S => (k.iq2s_q8k)(row, &job.hqk[j]),
+                        WType::Iq3S => (k.iq3s_q8k)(row, &job.hqk[j]),
+                        WType::Iq2Xxs => (k.iq2xxs_q8k)(row, &job.hqk[j]),
+                        WType::Iq2Xs => (k.iq2xs_q8k)(row, &job.hqk[j]),
+                        WType::Iq3Xxs => (k.iq3xxs_q8k)(row, &job.hqk[j]),
+                        WType::Iq1S => (k.iq1s_q8k)(row, &job.hqk[j]),
+                        WType::Q2K => (k.q2k_q8k)(row, &job.hqk[j]),
                     };
                     *job.y.add(job.experts[j].out * n + r) = v;
                 }
@@ -205,6 +209,11 @@ impl Shared {
 impl Pool {
     /// `cpus`: the cores to run on; the caller becomes worker 0 and is pinned to `cpus[0]`.
     pub fn new(cpus: &[usize]) -> Self {
+        Self::with_kernels(cpus, *dot::kernels())
+    }
+
+    /// `new` with a fixed kernel table; the tests force each set and compare the outputs.
+    fn with_kernels(cpus: &[usize], kernels: dot::Kernels) -> Self {
         let n_threads = cpus.len();
         let empty = Expert { gate: std::ptr::null(), up: std::ptr::null(), down: std::ptr::null(), out: 0, tok: 0, scale: [1.0; 3] };
         let shared = Arc::new(Shared {
@@ -223,6 +232,7 @@ impl Pool {
                 hqk: vec![Vec::new(); MAX_EXPERTS],
                 y: std::ptr::null_mut(),
             }),
+            kernels,
             seq: AtomicU64::new(0),
             bar: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             n_threads,
@@ -341,33 +351,58 @@ mod tests {
         v
     }
 
-    /// DeepSeek-style experts (IQ2_XXS gate and up, IQ3_XXS down, clamped SwiGLU, Q8_K hidden activations):
-    /// the pool's output for several tokens equals the scalar dots applied token by token.
-    #[test]
-    fn pool_deepseek_formats_exact() {
+    /// The DeepSeek-format job the exact test checks (IQ2_XXS gate and up, IQ3_XXS down, clamped SwiGLU, Q8_K
+    /// hidden activations, every expert for every token, in a scrambled order), kept so a run can be repeated
+    /// with another kernel set.
+    struct DeepseekJob {
+        n: usize,
+        ff: usize,
+        ne: usize,
+        nt: usize,
+        gb: usize,
+        db: usize,
+        recs: Vec<Vec<u8>>,
+        xs: Vec<Vec<f32>>,
+    }
+
+    fn deepseek_job() -> DeepseekJob {
         let (n, ff, ne, nt) = (512usize, 256usize, 5usize, 3usize);
         let (gb, db) = (66 * n / 256, 98 * ff / 256);
         let mut s = 0x1111_2222_3333_4444u64;
         let recs: Vec<Vec<u8>> = (0..ne).map(|_| [blocks(ff * n / 256, 66, &mut s), blocks(ff * n / 256, 66, &mut s), blocks(n * ff / 256, 98, &mut s)].concat()).collect();
         let xs: Vec<Vec<f32>> = (0..nt).map(|_| (0..n).map(|_| ((rng(&mut s) % 20001) as f32 - 10000.0) * 1e-3).collect()).collect();
+        DeepseekJob { n, ff, ne, nt, gb, db, recs, xs }
+    }
+
+    /// The job through one pool whose kernel table is `k`.
+    fn deepseek_run(j: &DeepseekJob, k: dot::Kernels) -> Vec<f32> {
         let fmt = ExpertFmt { gate: WType::Iq2Xxs, down: WType::Iq3Xxs, clamp: 10.0 };
-        // every expert for every token, in a scrambled order
         let mut experts = Vec::new();
-        for t in 0..nt {
-            for e in (0..ne).rev() {
-                let r = recs[e].as_ptr();
-                experts.push(Expert { gate: r, up: unsafe { r.add(ff * gb) }, down: unsafe { r.add(2 * ff * gb) }, out: t * ne + e, tok: t, scale: [1.0; 3] });
+        for t in 0..j.nt {
+            for e in (0..j.ne).rev() {
+                let r = j.recs[e].as_ptr();
+                experts.push(Expert { gate: r, up: unsafe { r.add(j.ff * j.gb) }, down: unsafe { r.add(2 * j.ff * j.gb) }, out: t * j.ne + e, tok: t, scale: [1.0; 3] });
             }
         }
-        let pool = Pool::new(&[0, 1, 2, 3]);
-        let mut y = vec![0f32; nt * ne * n];
-        let xr: Vec<&[f32]> = xs.iter().map(|v| v.as_slice()).collect();
-        pool.run_multi(fmt, &xr, ff, gb, db, &experts, &mut y);
+        let pool = Pool::with_kernels(&[0, 1, 2, 3], k);
+        let mut y = vec![0f32; j.nt * j.ne * j.n];
+        let xr: Vec<&[f32]> = j.xs.iter().map(|v| v.as_slice()).collect();
+        pool.run_multi(fmt, &xr, j.ff, j.gb, j.db, &experts, &mut y);
+        y
+    }
+
+    /// DeepSeek-style experts: the pool's output for several tokens equals the scalar dots applied token by
+    /// token.
+    #[test]
+    fn pool_deepseek_formats_exact() {
+        let j = deepseek_job();
+        let (n, ff, ne, nt, gb, db) = (j.n, j.ff, j.ne, j.nt, j.gb, j.db);
+        let y = deepseek_run(&j, *dot::kernels());
         for t in 0..nt {
             let mut xq = Vec::new();
-            quantize_q8_k(&xs[t], &mut xq);
+            quantize_q8_k(&j.xs[t], &mut xq);
             for e in 0..ne {
-                let r = &recs[e];
+                let r = &j.recs[e];
                 let h: Vec<f32> = (0..ff)
                     .map(|i| {
                         let g = iq2xxs_q8k_scalar(&r[i * gb..(i + 1) * gb], &xq);
@@ -383,6 +418,28 @@ mod tests {
                     assert!(want.to_bits() == got.to_bits(), "token {t} expert {e} row {row}: {got} vs {want}");
                 }
             }
+        }
+    }
+
+    /// The same job through the scalar, AVX2 and (when the CPU has it) AVX-512 kernel tables gives bit-identical
+    /// outputs, so a `QX_CPU_ISA` A/B run or a bisect compares kernels, not the pool around them.
+    #[test]
+    fn pool_kernel_sets_are_bit_identical() {
+        let j = deepseek_job();
+        let base = deepseek_run(&j, *dot::kernels());
+        let mut sets = vec![("scalar", dot::kernels_for(dot::Isa::Scalar))];
+        if dot::cpu_has_avx2() {
+            sets.push(("avx2", dot::kernels_for(dot::Isa::Avx2)));
+        }
+        if dot::cpu_has_avx512() {
+            sets.push(("avx512", dot::kernels_for(dot::Isa::Avx512)));
+        }
+        for (name, k) in sets {
+            let y = deepseek_run(&j, k);
+            for (i, (a, b)) in y.iter().zip(&base).enumerate() {
+                assert!(a.to_bits() == b.to_bits(), "{name}: output {i} {a} vs detected {b}");
+            }
+            eprintln!("{name}: {} pool outputs bit-identical to the detected set", y.len());
         }
     }
 }
